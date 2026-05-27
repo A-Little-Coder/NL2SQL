@@ -14,6 +14,9 @@
 # Hugging Face 数据集
 datasets>=2.14.0
 
+# LSH 索引 - 局部敏感哈希库
+datasketch>=1.6.0
+
 # LLM 相关 - Qwen API
 dashscope>=1.14.0
 
