@@ -163,16 +163,57 @@ class SchemaVectorizer:
         """
         格式化列的描述文本，用于向量化
 
+        优先级策略：
+        1. 优先使用 column["description"]（从 CSV 加载的完整描述）
+        2. 回退到拼接基本信息（列名 + 类型）
+
         Args:
-            column: 列信息字典 {"name": "user_id", "type": "INT", ...}
+            column: 列信息字典
+                   {
+                       "name": "user_id",
+                       "type": "INT",
+                       "description": "用户唯一标识",  # 可选
+                       "data_format": "integer"        # 可选
+                   }
             table_name: 所属表名（可选，增加上下文）
 
         Returns:
             str: 格式化的描述文本
-                例如："用户表中的 user_id 字段，类型为 INT，表示用户唯一标识"
+                - 有 description 时："raceId，the unique identification number identifying the race"
+                - 无 description 时："races 表中的 raceId 字段，类型为 INTEGER"
 
-        TODO:
-        - 根据是否有 description 字段选择不同的格式化方式
-        - 添加必要的上下文信息帮助语义理解
+        使用示例:
+        ```python
+        # 有完整描述的情况（推荐）
+        col = {
+            "name": "raceId",
+            "type": "INTEGER",
+            "description": "the unique identification number identifying the race"
+        }
+        desc = SchemaVectorizer.format_column_description(col, "races")
+        # 输出："races 表中的 the unique identification number identifying the race"
+
+        # 只有基本信息的情况
+        col = {"name": "id", "type": "INTEGER"}
+        desc = SchemaVectorizer.format_column_description(col, "users")
+        # 输出："users 表中的 id 字段，类型为 INTEGER"
+        ```
         """
-        pass
+        # 优先使用已有的 description（从 CSV 加载）
+        if column.get("description"):
+            desc = column["description"]
+            if table_name:
+                return f"{table_name}表中的{desc}"
+            return desc
+
+        # 回退到基本信息拼接
+        col_name = column.get("name", "")
+        col_type = column.get("type", "TEXT")
+
+        parts = []
+        if table_name:
+            parts.append(f"{table_name}表")
+        parts.append(f"{col_name}字段")
+        parts.append(f"类型为{col_type}")
+
+        return "，".join(parts)

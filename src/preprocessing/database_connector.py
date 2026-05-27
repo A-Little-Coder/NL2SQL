@@ -16,8 +16,12 @@
 
 
 import sqlite3
+import os
 from typing import List, Dict, Any, Tuple, Optional
 from contextlib import contextmanager
+
+# 本地导入（避免循环依赖）
+# from .description_loader import DescriptionLoader
 
 
 class DatabaseConnector:
@@ -234,13 +238,15 @@ class DatabaseConnector:
             print(f"[错误] 获取表列表失败：{e}")
             return []
 
-    def get_table_schema(self, table_name: str, sample_size: int = 5) -> Dict[str, Any]:
+    def get_table_schema(self, table_name: str, sample_size: int = 5,
+                        include_description: bool = True) -> Dict[str, Any]:
         """
         获取指定表的 schema 信息
 
         Args:
             table_name: 表名
             sample_size: 每个列采样的样本数量，默认 5 个
+            include_description: 是否包含描述信息（从 database_description/*.csv），默认 True
 
         Returns:
             dict: 包含列信息的字典
@@ -252,36 +258,32 @@ class DatabaseConnector:
                         "type": "INTEGER",
                         "primary_key": True,
                         "nullable": False,
-                        "default": None
+                        "default": None,
+                        "description": "用户唯一标识",      # 新增：从 CSV 加载
+                        "data_format": "integer"            # 新增：从 CSV 加载
                     },
-                    {
-                        "name": "name",
-                        "type": "TEXT",
-                        "primary_key": False,
-                        "nullable": True,
-                        "default": None
-                    }
+                    ...
                 ],
-                "foreign_keys": [
-                    {
-                        "column": "department_id",
-                        "references_table": "departments",
-                        "references_column": "id"
-                    }
-                ],
-                "sample_values": {
-                    "id": [1, 2, 3, 4, 5],
-                    "name": ["Alice", "Bob", "Charlie", "David", "Eve"]
-                },
+                "foreign_keys": [...],
+                "sample_values": {...},
                 "row_count": 1000
             }
 
         用法:
         ```python
+        # 基础用法（不包含描述）
         schema = connector.get_table_schema("users")
+
+        # 包含描述信息（推荐）
+        schema = connector.get_table_schema("races", include_description=True)
         for col in schema["columns"]:
-            print(f"{col['name']} ({col['type']})")
+            print(f"{col['name']}: {col.get('description', '无描述')}")
         ```
+
+        注意:
+            - 描述信息来自数据库目录下的 database_description/*.csv 文件
+            - 如果描述文件不存在或加载失败，会优雅降级，不影响基础 schema
+            - include_description=False 可跳过 CSV 加载提升性能
         """
         schema = {
             "table_name": table_name,
@@ -290,6 +292,18 @@ class DatabaseConnector:
             "sample_values": {},
             "row_count": 0
         }
+
+        # 可选：加载描述信息
+        descriptions = {}
+        if include_description:
+            try:
+                from .description_loader import DescriptionLoader
+                db_dir = os.path.dirname(self.db_path) or self.db_path
+                loader = DescriptionLoader(db_dir)
+                descriptions = loader.load_tables_description()
+            except Exception:
+                # 描述加载失败不影响基础功能
+                pass
 
         try:
             if self.db_type == "sqlite":
@@ -306,6 +320,17 @@ class DatabaseConnector:
                             "nullable": not bool(row[3]),
                             "default": row[4]
                         }
+
+                        # 整合描述信息
+                        if descriptions:
+                            table_desc = descriptions.get(table_name.lower(), {})
+                            col_lower = column["name"].lower()
+                            desc_info = table_desc.get(col_lower, {})
+
+                            if desc_info:
+                                column["description"] = desc_info.get("column_description", "")
+                                column["data_format"] = desc_info.get("data_format", "")
+
                         schema["columns"].append(column)
 
                 # 获取外键信息
