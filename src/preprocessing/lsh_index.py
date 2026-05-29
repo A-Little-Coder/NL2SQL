@@ -3,25 +3,27 @@
 # ============================================================================
 # 功能说明:
 #   为数据库中各字段的唯一值创建 LSH 索引，用于快速近似值匹配检索
-#   LSH 能够在大规模数据集上高效查找相似值
+#   基于 datasketch 库的 MinHashLSH 实现，参考 CHESS 项目的 LSH 方案
 #
-# 输入:
-#   - data: 需要建立索引的字符串值列表
-#   - num_hashes: hash 函数数量（影响精度和性能）
-#   - num_bands: band 数量（影响召回率和精确率）
+# 使用方法:
+#   # 预处理：为整个数据库构建 LSH 索引
+#   LSHIndexer.build_db_lsh("data/formula_1/")
 #
-# 输出:
-#   - LSHIndex 对象，包含完整的索引结构
-#   - 可序列化为文件用于持久化存储
+#   # 查询：加载索引并搜索相似值
+#   lsh, minhashes = LSHIndexer.load_db_lsh("data/formula_1/")
+#   results = LSHIndexer.query_lsh(lsh, minhashes, "Hamilton")
 #
-# 待您补充的细节:
-#   1. MinHash 算法实现或使用现成库（如 datasketch）
-#   2. 相似度阈值设置（Jaccard 相似度）
-#   3. 索引的序列化和反序列化
 # ============================================================================
 
 
-from typing import List, Dict, Any
+import os
+import pickle
+import sqlite3
+from pathlib import Path
+from typing import List, Dict, Any, Tuple, Optional
+from tqdm import tqdm
+
+from datasketch import MinHash, MinHashLSH
 
 
 class LSHIndexer:
@@ -30,166 +32,453 @@ class LSHIndexer:
 
     用于对字段值进行快速近似匹配，特别适合处理：
     - 拼写变体（"Apple" vs "apple"）
-    - 同义词（"USA" vs "United States"）
+    - 部分匹配（"Hamilton" vs "Lewis Hamilton"）
     - 格式差异（"2023-01" vs "Jan 2023"）
 
+    基于 datasketch 的 MinHashLSH 实现，核心流程：
+    1. 从数据库提取 TEXT 列的唯一值
+    2. 对每个值计算 MinHash 签名（n-gram 方式）
+    3. 将签名插入 MinHashLSH 索引
+    4. 查询时计算查询值的 MinHash，在 LSH 中找相似候选
+
     Attributes:
-        num_hashes (int): Hash 函数数量，越多越精确但占用更多内存
-        num_bands (int): Band 数量，影响召回率和精确率的平衡
-        index (dict): 索引数据结构
-        signature_store (dict): 存储每个值的 MinHash 签名
+        signature_size (int): MinHash 签名长度，默认 128
+        n_gram (int): n-gram 大小，默认 3
+        threshold (float): LSH 相似度阈值，默认 0.5
     """
 
-    def __init__(self, num_hashes: int = 128, num_bands: int = 32):
+    # 构建索引时跳过的列名关键词（参考 CHESS）
+    SKIP_KEYWORDS = ["_id", " id", "url", "email", "web", "time", "phone", "date", "address"]
+
+    def __init__(self, signature_size: int = 128, n_gram: int = 3, threshold: float = 0.5):
         """
         初始化 LSH 索引器
 
         Args:
-            num_hashes: Hash 函数数量，默认 128
-                       - 增加可提高精确度
-                       - 减少可提高性能
-            num_bands: Band 数量，默认 32
-                      - bands = hashes / rows_per_band
-                      - 影响相似度阈值曲线
-
-        TODO: 您可以调整这些参数来平衡性能和精度
-        - 小数据集：num_hashes=64, num_bands=16
-        - 中等数据集：num_hashes=128, num_bands=32
-        - 大数据集：num_hashes=256, num_bands=64
+            signature_size: MinHash 签名长度（num_perm）
+                          - 128: 平衡精度和性能（推荐）
+                          - 256: 更高精度，更多内存
+            n_gram: n-gram 大小，用于将字符串转为集合
+                   - 3: 适合英文（默认）
+                   - 2: 适合短字符串或中文
+            threshold: LSH 相似度阈值（Jaccard）
+                      - 0.5: 平衡召回率和精确率（推荐）
+                      - 0.3: 更高召回率，更多误报
+                      - 0.7: 更高精确率，可能漏检
         """
-        self.num_hashes = num_hashes
-        self.num_bands = num_bands
-        self.index = {}
-        self.signature_store = {}
+        self.signature_size = signature_size
+        self.n_gram = n_gram
+        self.threshold = threshold
 
-    def build_index(self, values: List[str], metadata: Dict[str, Any] = None) -> 'LSHIndexer':
+    # ========================================================================
+    # MinHash 相关
+    # ========================================================================
+
+    @staticmethod
+    def create_minhash(value: str, signature_size: int = 128, n_gram: int = 3) -> MinHash:
         """
-        构建 LSH 索引
+        为单个值创建 MinHash 签名
+
+        使用 n-gram 方式将字符串转换为集合，再计算 MinHash。
 
         Args:
-            values: 需要建立索引的值列表
-                   例如：["北京", "上海", "广州", "深圳", ...]
-            metadata: 可选的元数据
-                     {
-                         "table_name": "cities",
-                         "column_name": "city_name",
-                         "source_db": "bird_sql_db_001"
-                     }
+            value: 输入字符串
+            signature_size: 签名长度
+            n_gram: n-gram 大小
 
         Returns:
-            self: 返回当前实例以支持链式调用
+            MinHash: 计算好的 MinHash 对象
 
-        TODO: 您需要实现的步骤
-        1. 对每个值计算 MinHash 签名
-           - 使用多个 hash 函数对值进行 hashing
-           - 每个 hash 取最小值作为签名向量
-        2. 将签名按照 band 分组
-        3. 对于每个 band，将具有相同签名的值放入同一个 bucket
-        4. 存储完整签名用于后续精确比较
-
-        伪代码参考:
-        ```
-        for value in values:
-            # 计算 MinHash 签名
-            signature = self._compute_minhash(value)
-
-            # 按 band 分组并添加到索引
-            for band_idx in range(self.num_bands):
-                band_signature = signature[band_idx * rows_per_band : ...]
-                bucket_key = (band_idx, band_signature)
-                self.index[bucket_key].append(value_id)
-
-            # 存储完整签名
-            self.signature_store[value_id] = signature
+        示例:
+        ```python
+        mh = LSHIndexer.create_minhash("Hamilton", signature_size=128, n_gram=3)
+        # n-grams: ["Ham", "ami", "mit", "ilt", "lto", "ton"]
         ```
         """
-        pass
+        m = MinHash(num_perm=signature_size)
+        for d in [value[i:i + n_gram] for i in range(max(len(value) - n_gram + 1, 1))]:
+            m.update(d.encode('utf8'))
+        return m
 
-    def _compute_minhash(self, value: str) -> List[int]:
+    @staticmethod
+    def jaccard_similarity(mh1: MinHash, mh2: MinHash) -> float:
         """
-        计算单个值的 MinHash 签名
+        计算两个 MinHash 之间的 Jaccard 相似度估计值
 
         Args:
-            value: 输入值（通常是字符串）
+            mh1: 第一个 MinHash
+            mh2: 第二个 MinHash
 
         Returns:
-            List[int]: MinHash 签名向量，长度为 num_hashes
-
-        TODO:
-        - 将值转换为 n-gram 集合（用于处理子串匹配）
-        - 应用多个 hash 函数
-        - 取每个 hash 函数的最小值
+            float: 相似度（0-1 之间），1.0 表示完全相同
         """
-        pass
+        return mh1.jaccard(mh2)
 
-    def query(self, query_value: str, top_k: int = 10, threshold: float = 0.6) -> List[tuple]:
+    # ========================================================================
+    # 从数据库提取唯一值
+    # ========================================================================
+
+    @staticmethod
+    def get_unique_values(db_path: str) -> Dict[str, Dict[str, List[str]]]:
         """
-        查询与给定值相似的所有值
+        从 SQLite 数据库中提取 TEXT 列的唯一值
+
+        参考 CHESS 的 _get_unique_values 实现，会自动跳过：
+        - 主键列
+        - ID/URL/Email/时间等低价值列
+        - 值过长或过多的高基数列
 
         Args:
-            query_value: 查询值
-                        例如："北京市"
-            top_k: 返回最相似的前 k 个结果
-            threshold: 相似度阈值（0-1 之间）
-                      - Jaccard 相似度 >= threshold 被视为相似
-                      - 越低召回率越高，但可能有更多误报
+            db_path: SQLite 数据库文件路径
 
         Returns:
-            List[tuple]: 相似值列表 [(value, similarity_score), ...]
-                        例如：[("北京", 0.95), ("北京市", 1.0), ...]
-
-        TODO:
-        1. 计算查询值的 MinHash 签名
-        2. 在所有 band 中查找候选值
-        3. 去重并按候选值出现的频次排序
-        4. 对候选值进行精确相似度计算
-        5. 过滤掉低于阈值的并返回前 top_k 个
+            Dict[str, Dict[str, List[str]]]: 唯一值字典
+                {
+                    "circuits": {
+                        "name": ["Silverstone", "Monaco", ...],
+                        "location": ["Northamptonshire", ...],
+                        "country": ["UK", "Monaco", ...]
+                    },
+                    "drivers": {
+                        "forename": ["Lewis", "Max", ...],
+                        ...
+                    }
+                }
         """
-        pass
+        unique_values: Dict[str, Dict[str, List[str]]] = {}
 
-    def save(self, filepath: str):
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+
+            # 获取所有表名
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence'")
+            table_names = [row[0] for row in cursor.fetchall()]
+
+            # 收集主键列名
+            primary_keys = []
+            for table_name in table_names:
+                cursor.execute(f"PRAGMA table_info('{table_name}')")
+                for col in cursor.fetchall():
+                    if col[5] > 0:  # pk 标志
+                        if col[1].lower() not in [c.lower() for c in primary_keys]:
+                            primary_keys.append(col[1])
+
+            # 逐表逐列提取值
+            for table_name in table_names:
+                cursor.execute(f"PRAGMA table_info('{table_name}')")
+                columns = cursor.fetchall()
+
+                table_values: Dict[str, List[str]] = {}
+
+                for col in columns:
+                    col_name = col[1]
+                    col_type = col[2] or ""
+
+                    # 只处理 TEXT 列，跳过主键
+                    if "TEXT" not in col_type.upper():
+                        continue
+                    if col_name.lower() in [c.lower() for c in primary_keys]:
+                        continue
+
+                    # 跳过低价值列（ID、URL 等）
+                    if any(kw in col_name.lower() for kw in LSHIndexer.SKIP_KEYWORDS):
+                        continue
+                    if col_name.endswith("Id"):
+                        continue
+
+                    # 检查列的值规模
+                    try:
+                        cursor.execute(f"""
+                            SELECT SUM(LENGTH(unique_values)), COUNT(unique_values)
+                            FROM (
+                                SELECT DISTINCT `{col_name}` AS unique_values
+                                FROM `{table_name}`
+                                WHERE `{col_name}` IS NOT NULL
+                            )
+                        """)
+                        result = cursor.fetchone()
+                        sum_lengths, count_distinct = result
+
+                        if sum_lengths is None or count_distinct == 0:
+                            continue
+
+                        avg_length = sum_lengths / count_distinct
+
+                        # 筛选策略（参考 CHESS）
+                        is_name_col = "name" in col_name.lower()
+                        if is_name_col and sum_lengths < 5_000_000:
+                            pass  # name 列放宽限制
+                        elif sum_lengths > 2_000_000 or avg_length > 25:
+                            continue
+                        if count_distinct > 10000:
+                            continue
+
+                    except Exception:
+                        continue
+
+                    # 提取唯一值
+                    try:
+                        cursor.execute(
+                            f"SELECT DISTINCT `{col_name}` FROM `{table_name}` "
+                            f"WHERE `{col_name}` IS NOT NULL"
+                        )
+                        values = [str(row[0]) for row in cursor.fetchall()]
+                        table_values[col_name] = values
+                    except Exception:
+                        continue
+
+                if table_values:
+                    unique_values[table_name] = table_values
+
+            conn.close()
+
+        except Exception as e:
+            print(f"[错误] 提取唯一值失败：{e}")
+
+        return unique_values
+
+    # ========================================================================
+    # 构建 LSH 索引
+    # ========================================================================
+
+    def build_index(self, unique_values: Dict[str, Dict[str, List[str]]],
+                    verbose: bool = True) -> Tuple[MinHashLSH, Dict[str, Tuple[MinHash, str, str, str]]]:
         """
-        保存 LSH 索引到文件
+        从唯一值字典构建 MinHashLSH 索引
 
         Args:
-            filepath: 保存路径
-                    例如："indexes/cities_lsh.pkl"
-
-        TODO:
-        - 使用 pickle 或 json 序列化索引
-        - 同时保存配置参数（num_hashes, num_bands）
-        """
-        pass
-
-    def load(self, filepath: str):
-        """
-        从文件加载 LSH 索引
-
-        Args:
-            filepath: 索引文件路径
+            unique_values: 唯一值字典，格式同 get_unique_values() 返回
+            verbose: 是否显示进度条
 
         Returns:
-            self: 返回加载了索引的实例
+            Tuple[MinHashLSH, Dict]: (LSH 索引, minhashes 字典)
+                minhashes 字典格式:
+                {
+                    "circuits_name_0": (MinHash, "circuits", "name", "Silverstone"),
+                    "circuits_name_1": (MinHash, "circuits", "name", "Monaco"),
+                    ...
+                }
 
-        TODO:
-        - 反序列化索引数据
-        - 验证索引完整性
+        示例:
+        ```python
+        indexer = LSHIndexer(signature_size=128, threshold=0.5)
+        unique_values = indexer.get_unique_values("data/formula_1/formula_1.sqlite")
+        lsh, minhashes = indexer.build_index(unique_values)
+        ```
         """
-        pass
+        lsh = MinHashLSH(threshold=self.threshold, num_perm=self.signature_size)
+        minhashes: Dict[str, Tuple[MinHash, str, str, str]] = {}
 
-    def get_similarity(self, value1: str, value2: str) -> float:
+        total_values = sum(
+            len(col_values)
+            for table_values in unique_values.values()
+            for col_values in table_values.values()
+        )
+
+        progress_bar = tqdm(total=total_values, desc="构建 LSH 索引") if verbose else None
+
+        for table_name, table_values in unique_values.items():
+            for column_name, column_values in table_values.items():
+                for idx, value in enumerate(column_values):
+                    try:
+                        mh = self.create_minhash(value, self.signature_size, self.n_gram)
+                        key = f"{table_name}_{column_name}_{idx}"
+                        minhashes[key] = (mh, table_name, column_name, value)
+                        lsh.insert(key, mh)
+                    except Exception:
+                        continue
+
+                    if progress_bar:
+                        progress_bar.update(1)
+
+        if progress_bar:
+            progress_bar.close()
+
+        return lsh, minhashes
+
+    # ========================================================================
+    # 查询
+    # ========================================================================
+
+    def query(self, lsh: MinHashLSH, minhashes: Dict[str, Tuple[MinHash, str, str, str]],
+              keyword: str, top_k: int = 10) -> Dict[str, Dict[str, List[str]]]:
         """
-        计算两个值的精确相似度
+        在 LSH 索引中查询与关键词相似的值
 
         Args:
-            value1, value2: 要比较的两个值
+            lsh: MinHashLSH 索引
+            minhashes: minhashes 字典
+            keyword: 查询关键词，例如 "Hamilton"
+            top_k: 返回前 k 个最相似的结果
 
         Returns:
-            float: Jaccard 相似度（0-1 之间）
-                  1.0 表示完全相同，0.0 表示完全不同
+            Dict[str, Dict[str, List[str]]]: 按表和列分组的结果
+                {
+                    "drivers": {
+                        "forename": ["Lewis"],
+                        "surname": ["Hamilton"]
+                    }
+                }
 
-        TODO:
-        - 将值转换为集合（n-gram）
-        - 计算 Jaccard 相似度 = |A ∩ B| / |A ∪ B|
+        示例:
+        ```python
+        indexer = LSHIndexer()
+        results = indexer.query(lsh, minhashes, "Hamilton", top_k=10)
+        for table, columns in results.items():
+            for col, values in columns.items():
+                print(f"  {table}.{col}: {values}")
+        ```
         """
-        pass
+        query_mh = self.create_minhash(keyword, self.signature_size, self.n_gram)
+
+        # 在 LSH 中查找候选
+        results = lsh.query(query_mh)
+
+        if not results:
+            return {}
+
+        # 计算精确相似度并排序
+        similarities = []
+        for result_key in results:
+            if result_key in minhashes:
+                mh, table_name, column_name, value = minhashes[result_key]
+                sim = self.jaccard_similarity(query_mh, mh)
+                similarities.append((result_key, table_name, column_name, value, sim))
+
+        # 按相似度降序排序，取 top_k
+        similarities.sort(key=lambda x: x[4], reverse=True)
+        similarities = similarities[:top_k]
+
+        # 按表和列分组
+        grouped: Dict[str, Dict[str, List[str]]] = {}
+        for _, table_name, column_name, value, sim in similarities:
+            if table_name not in grouped:
+                grouped[table_name] = {}
+            if column_name not in grouped[table_name]:
+                grouped[table_name][column_name] = []
+            grouped[table_name][column_name].append(value)
+
+        return grouped
+
+    # ========================================================================
+    # 持久化：构建整个数据库的 LSH 索引并保存
+    # ========================================================================
+
+    def build_db_lsh(self, db_directory_path: str, verbose: bool = True) -> None:
+        """
+        为整个数据库构建 LSH 索引并保存到文件
+
+        生成的文件保存在 db_directory_path/preprocessed/ 目录下：
+        - {db_id}_lsh.pkl: MinHashLSH 索引
+        - {db_id}_minhashes.pkl: MinHash 签名字典
+        - {db_id}_unique_values.pkl: 唯一值字典
+
+        Args:
+            db_directory_path: 数据库目录路径
+                             例如 "data/formula_1/"
+            verbose: 是否显示进度条
+
+        示例:
+        ```python
+        indexer = LSHIndexer(signature_size=128, threshold=0.5)
+        indexer.build_db_lsh("data/formula_1/")
+        # 生成文件:
+        #   data/formula_1/preprocessed/formula_1_lsh.pkl
+        #   data/formula_1/preprocessed/formula_1_minhashes.pkl
+        #   data/formula_1/preprocessed/formula_1_unique_values.pkl
+        ```
+        """
+        db_dir = Path(db_directory_path)
+        db_id = db_dir.name
+
+        # 查找 sqlite 文件
+        db_file = db_dir / f"{db_id}.sqlite"
+        if not db_file.exists():
+            # 尝试 .db 后缀
+            db_file = db_dir / f"{db_id}.db"
+        if not db_file.exists():
+            raise FileNotFoundError(f"未找到数据库文件：{db_dir}/{db_id}.sqlite 或 .db")
+
+        print(f"[INFO] 正在为 {db_id} 构建 LSH 索引...")
+
+        # 1. 提取唯一值
+        unique_values = self.get_unique_values(str(db_file))
+        total_values = sum(
+            len(v) for tv in unique_values.values() for v in tv.values()
+        )
+        print(f"[INFO] 提取到 {total_values} 个唯一值（{len(unique_values)} 张表）")
+
+        # 2. 构建 LSH 索引
+        lsh, minhashes = self.build_index(unique_values, verbose=verbose)
+        print(f"[INFO] LSH 索引构建完成，共 {len(minhashes)} 个条目")
+
+        # 3. 保存到文件
+        preprocessed_dir = db_dir / "preprocessed"
+        preprocessed_dir.mkdir(exist_ok=True)
+
+        with open(preprocessed_dir / f"{db_id}_lsh.pkl", "wb") as f:
+            pickle.dump(lsh, f)
+        with open(preprocessed_dir / f"{db_id}_minhashes.pkl", "wb") as f:
+            pickle.dump(minhashes, f)
+        with open(preprocessed_dir / f"{db_id}_unique_values.pkl", "wb") as f:
+            pickle.dump(unique_values, f)
+
+        print(f"[INFO] 索引已保存到 {preprocessed_dir}")
+
+    @staticmethod
+    def load_db_lsh(db_directory_path: str) -> Tuple[MinHashLSH, Dict[str, Tuple[MinHash, str, str, str]]]:
+        """
+        从文件加载已构建的 LSH 索引
+
+        Args:
+            db_directory_path: 数据库目录路径
+
+        Returns:
+            Tuple[MinHashLSH, Dict]: (LSH 索引, minhashes 字典)
+
+        示例:
+        ```python
+        lsh, minhashes = LSHIndexer.load_db_lsh("data/formula_1/")
+        results = LSHIndexer().query(lsh, minhashes, "Hamilton")
+        ```
+        """
+        db_dir = Path(db_directory_path)
+        db_id = db_dir.name
+        preprocessed_dir = db_dir / "preprocessed"
+
+        lsh_path = preprocessed_dir / f"{db_id}_lsh.pkl"
+        minhashes_path = preprocessed_dir / f"{db_id}_minhashes.pkl"
+
+        if not lsh_path.exists() or not minhashes_path.exists():
+            raise FileNotFoundError(
+                f"LSH 索引文件不存在，请先运行 build_db_lsh()\n"
+                f"缺少: {lsh_path} 或 {minhashes_path}"
+            )
+
+        with open(lsh_path, "rb") as f:
+            lsh = pickle.load(f)
+        with open(minhashes_path, "rb") as f:
+            minhashes = pickle.load(f)
+
+        return lsh, minhashes
+
+    @staticmethod
+    def is_lsh_built(db_directory_path: str) -> bool:
+        """
+        检查 LSH 索引是否已构建
+
+        Args:
+            db_directory_path: 数据库目录路径
+
+        Returns:
+            bool: 索引是否存在
+        """
+        db_dir = Path(db_directory_path)
+        db_id = db_dir.name
+        preprocessed_dir = db_dir / "preprocessed"
+
+        lsh_path = preprocessed_dir / f"{db_id}_lsh.pkl"
+        minhashes_path = preprocessed_dir / f"{db_id}_minhashes.pkl"
+
+        return lsh_path.exists() and minhashes_path.exists()
