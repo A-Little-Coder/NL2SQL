@@ -131,7 +131,7 @@ def build_schema_index_for_db(db_id: str, data_dir: str = None,
         data_dir = str(Path(__file__).parent.parent.parent / "data")
 
     if bge_model_path is None:
-        bge_model_path = os.getenv("BGE_M3_MODEL_PATH", "D:/Models/bge-m3")
+        bge_model_path = os.getenv("BGE_M3_MODEL_PATH", "BAAI/bge-m3")
 
     db_map = find_bird_databases(data_dir)
     if db_id not in db_map:
@@ -205,7 +205,7 @@ def build_all_schema_index(data_dir: str = None, bge_model_path: str = None,
         data_dir = str(Path(__file__).parent.parent.parent / "data")
 
     if bge_model_path is None:
-        bge_model_path = os.getenv("BGE_M3_MODEL_PATH", "D:/Models/bge-m3")
+        bge_model_path = os.getenv("BGE_M3_MODEL_PATH", "BAAI/bge-m3")
 
     db_map = find_bird_databases(data_dir)
     logger.info(f"找到 {len(db_map)} 个数据库")
