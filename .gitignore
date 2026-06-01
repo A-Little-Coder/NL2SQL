@@ -37,10 +37,7 @@ conda-env.yaml
 *.local.json
 
 # Data files
-data/*.db
-data/*.sqlite
-data/*.sqlite3
-data/*.sql
+data/
 
 # Vector store
 vector_store/

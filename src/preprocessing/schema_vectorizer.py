@@ -34,7 +34,7 @@ class SchemaVectorizer:
         device (str): 运行设备 ('cuda' | 'cpu')
     """
 
-    def __init__(self, model_name: str = "BAAI/bge-m3", device: str = None):
+    def __init__(self, model_name: str = "D:/Models/bge-m3", device: str = None):
         """
         初始化向量化器
 
