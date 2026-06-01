@@ -307,8 +307,8 @@ class DatabaseConnector:
 
         try:
             if self.db_type == "sqlite":
-                # 获取列信息
-                pragma_query = f"PRAGMA table_info({table_name})"
+                # 获取列信息（PRAGMA 标识符也用双引号转义，兼容保留字表名）
+                pragma_query = f'PRAGMA table_info("{table_name}")'
                 with self._get_cursor() as cursor:
                     cursor.execute(pragma_query)
                     for row in cursor.fetchall():
@@ -333,8 +333,8 @@ class DatabaseConnector:
 
                         schema["columns"].append(column)
 
-                # 获取外键信息
-                fk_query = f"PRAGMA foreign_key_list({table_name})"
+                # 获取外键信息（PRAGMA 也用双引号转义）
+                fk_query = f'PRAGMA foreign_key_list("{table_name}")'
                 with self._get_cursor() as cursor:
                     cursor.execute(fk_query)
                     for row in cursor.fetchall():
@@ -345,10 +345,10 @@ class DatabaseConnector:
                             "references_column": row[4]
                         })
 
-                # 获取样本值
+                # 获取样本值（SQLite 用双引号转义标识符，兼容保留字）
                 for col in schema["columns"]:
                     col_name = col["name"]
-                    sample_query = f"SELECT DISTINCT `{col_name}` FROM `{table_name}` LIMIT {sample_size}"
+                    sample_query = f'SELECT DISTINCT "{col_name}" FROM "{table_name}" LIMIT {sample_size}'
                     with self._get_cursor() as cursor:
                         cursor.execute(sample_query)
                         samples = [row[0] for row in cursor.fetchall()]
@@ -356,7 +356,7 @@ class DatabaseConnector:
                             schema["sample_values"][col_name] = samples
 
                 # 获取行数
-                count_query = f"SELECT COUNT(*) FROM `{table_name}`"
+                count_query = f'SELECT COUNT(*) FROM "{table_name}"'
                 with self._get_cursor() as cursor:
                     cursor.execute(count_query)
                     schema["row_count"] = cursor.fetchone()[0]

@@ -4,34 +4,19 @@
 # 功能说明:
 #   使用 ChromaDB 管理 schema 嵌入向量的存储和检索
 #   提供持久化、增量更新和高效相似性搜索能力
-#
-# 输入:
-#   - collection_name: 集合名称（用于区分不同数据集）
-#   - persist_directory: 持久化存储目录
-#
-# 输出:
-#   - 可向量化数据并存储到 ChromaDB
-#   - 可执行相似性检索
-#
-# 待您补充的细节:
-#   1. ChromaDB 客户端初始化（本地模式）
-#   2. Collection 的创建和管理
-#   3. 向量的增删改查操作
 # ============================================================================
 
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+from loguru import logger
+
+import chromadb
+from chromadb.config import Settings
 
 
 class VectorStoreManager:
     """
     向量存储管理器 - 基于 ChromaDB 实现
-
-    ChromaDB 特性:
-    - 轻量级，无需独立服务（本地模式）
-    - 支持持久化存储
-    - 内置相似性搜索（cosine, l2, ip）
-    - 支持元数据过滤
 
     Attributes:
         client: ChromaDB 客户端实例
@@ -46,64 +31,69 @@ class VectorStoreManager:
 
         Args:
             collection_name: 集合名称
-                           用于区分不同的向量集合
-                           例如："bird_sql_schemas", "custom_db_schemas"
             persist_directory: 持久化存储目录
-                            向量数据会保存在此目录
-                            建议使用绝对路径
-
-        TODO: 您需要实现的细节
-        - 初始化 ChromaDB 客户端（PersistentClient）
-        - 获取或创建 collection
-        - 设置合适的 distance_metric（推荐 cosine）
         """
         self.collection_name = collection_name
         self.persist_directory = persist_directory
         self.client = None
         self.collection = None
+        self._init_client()
 
-        # TODO: 初始化客户端和 collection
-        # import chromadb
-        # from chromadb.config import Settings
-        # self.client = chromadb.PersistentClient(
-        #     path=persist_directory,
-        #     settings=Settings(anonymized_telemetry=False)
-        # )
-        # self.collection = self.client.get_or_create_collection(
-        #     name=collection_name,
-        #     metadata={"hnsw:space": "cosine"}
-        # )
+    def _init_client(self):
+        """初始化 ChromaDB 客户端和 collection"""
+        try:
+            self.client = chromadb.PersistentClient(
+                path=self.persist_directory,
+                settings=Settings(anonymized_telemetry=False),
+            )
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+            logger.info(
+                f"ChromaDB 初始化成功: collection={self.collection_name}, "
+                f"现有条目={self.collection.count()}"
+            )
+        except Exception as e:
+            logger.error(f"ChromaDB 初始化失败: {e}")
+            raise
 
     def add_embeddings(self, embeddings: List[Dict[str, Any]]) -> bool:
         """
         添加向量 embedding 到存储
 
         Args:
-            embeddings: Embedding 列表
-                       [
-                           {
-                               "id": "table_orders_col_id",
-                               "embedding": [0.1, 0.2, ...],  # 向量
-                               "metadata": {
-                                   "table_name": "orders",
-                                   "column_name": "id",
-                                   "column_type": "INT",
-                                   "database": "bird_sql_001"
-                               },
-                               "document": "订单表中的 id 字段，INT 类型，表示订单 ID"
-                           },
-                           ...
-                       ]
+            embeddings: Embedding 列表，每项包含 id, embedding, metadata, document
 
         Returns:
-            bool: 添加成功返回 True，失败返回 False
-
-        TODO:
-        - 分批添加避免单次请求过大
-        - 检查 ID 是否重复，重复则更新
-        - 添加进度显示
+            bool: 添加成功返回 True
         """
-        pass
+        if not embeddings:
+            return True
+
+        try:
+            batch_size = 500
+            for i in range(0, len(embeddings), batch_size):
+                batch = embeddings[i : i + batch_size]
+                ids = [e["id"] for e in batch]
+                vectors = [e["embedding"] for e in batch]
+                metas = [e.get("metadata", {}) for e in batch]
+                docs = [e.get("document", "") for e in batch]
+
+                # upsert 实现「重复则更新」
+                self.collection.upsert(
+                    ids=ids,
+                    embeddings=vectors,
+                    metadatas=metas,
+                    documents=docs,
+                )
+
+            logger.info(f"添加 {len(embeddings)} 条 embedding 成功")
+            return True
+
+        except Exception as e:
+            logger.error(f"添加 embedding 失败: {e}")
+            return False
 
     def query(self, query_embedding: List[float],
               n_results: int = 10,
@@ -114,27 +104,49 @@ class VectorStoreManager:
         Args:
             query_embedding: 查询向量
             n_results: 返回结果数量
-            where_filter: 元数据过滤条件（可选）
-                         例如：{"table_name": "orders", "database": "bird_sql_001"}
+            where_filter: 元数据过滤条件
 
         Returns:
-            List[Dict[str, Any]]: 相似结果列表
-                                 [
-                                     {
-                                         "id": "...",
-                                         "metadata": {...},
-                                         "document": "...",
-                                         "distance": 0.15  # 相似度距离（越小越相似）
-                                     },
-                                     ...
-                                 ]
-
-        TODO:
-        - 执行向量相似性搜索
-        - 应用元数据过滤
-        - 按距离排序返回结果
+            List[Dict]: 相似结果列表
         """
-        pass
+        try:
+            kwargs = {
+                "query_embeddings": [query_embedding],
+                "n_results": n_results,
+            }
+            if where_filter:
+                kwargs["where"] = where_filter
+
+            results = self.collection.query(**kwargs)
+
+            items = []
+            if results and results["ids"] and results["ids"][0]:
+                for i in range(len(results["ids"][0])):
+                    item = {
+                        "id": results["ids"][0][i],
+                        "metadata": (
+                            results["metadatas"][0][i]
+                            if results["metadatas"]
+                            else {}
+                        ),
+                        "document": (
+                            results["documents"][0][i]
+                            if results["documents"]
+                            else ""
+                        ),
+                        "distance": (
+                            results["distances"][0][i]
+                            if results["distances"]
+                            else None
+                        ),
+                    }
+                    items.append(item)
+
+            return items
+
+        except Exception as e:
+            logger.error(f"向量查询失败: {e}")
+            return []
 
     def delete_by_database(self, database_name: str) -> bool:
         """
@@ -145,13 +157,16 @@ class VectorStoreManager:
 
         Returns:
             bool: 删除成功返回 True
-
-        用途：当某个数据库被移除时清理向量存储
-
-        TODO:
-        - 使用 where 条件过滤并删除
         """
-        pass
+        try:
+            self.collection.delete(
+                where={"database": database_name}
+            )
+            logger.info(f"已删除数据库 {database_name} 的所有向量")
+            return True
+        except Exception as e:
+            logger.error(f"删除向量失败: {e}")
+            return False
 
     def get_all_tables(self, database_name: str = None) -> List[str]:
         """
@@ -162,22 +177,41 @@ class VectorStoreManager:
 
         Returns:
             List[str]: 表名列表
-
-        TODO:
-        - 遍历 collection 中的所有条目
-        - 提取唯一的 table_name
         """
-        pass
+        try:
+            where = {}
+            if database_name:
+                where["database"] = database_name
+
+            kwargs = {"include": ["metadatas"]}
+            if where:
+                kwargs["where"] = where
+
+            results = self.collection.get(**kwargs)
+
+            tables = set()
+            if results and results["metadatas"]:
+                for meta in results["metadatas"]:
+                    if meta and "table_name" in meta:
+                        tables.add(meta["table_name"])
+
+            return sorted(tables)
+
+        except Exception as e:
+            logger.error(f"获取表名列表失败: {e}")
+            return []
 
     def clear(self):
-        """
-        清空当前集合中的所有数据
-
-        TODO:
-        - 删除当前 collection
-        - 重新创建空 collection
-        """
-        pass
+        """清空当前集合中的所有数据"""
+        try:
+            self.client.delete_collection(self.collection_name)
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+            logger.info(f"集合 {self.collection_name} 已清空")
+        except Exception as e:
+            logger.error(f"清空集合失败: {e}")
 
     def get_stats(self) -> Dict[str, Any]:
         """
@@ -185,14 +219,27 @@ class VectorStoreManager:
 
         Returns:
             Dict[str, Any]: 统计信息
-                           {
-                               "total_embeddings": 1234,
-                               "unique_tables": 56,
-                               "databases": ["db1", "db2", ...],
-                               ...
-                           }
-
-        TODO:
-        - 计算各种统计指标
         """
-        pass
+        try:
+            total = self.collection.count()
+            results = self.collection.get(include=["metadatas"])
+
+            tables = set()
+            databases = set()
+            if results and results["metadatas"]:
+                for meta in results["metadatas"]:
+                    if meta:
+                        if "table_name" in meta:
+                            tables.add(meta["table_name"])
+                        if "database" in meta:
+                            databases.add(meta["database"])
+
+            return {
+                "total_embeddings": total,
+                "unique_tables": len(tables),
+                "databases": sorted(databases),
+                "collection_name": self.collection_name,
+            }
+        except Exception as e:
+            logger.error(f"获取统计信息失败: {e}")
+            return {"total_embeddings": 0}
