@@ -28,25 +28,27 @@
 并且它应该保留未变表的现有索引
 并且它应该更新元数据以反映新状态
 
-#### Scenario: 构建列级 Schema 向量索引（每库独立 collection）
+#### Scenario: 构建列级 Schema 向量索引（全局单 collection，全小写 document）
 给定一个 BIRD-SQL 数据库目录（如 `data/california_schools/`）
 当离线脚本执行 schema 向量索引构建时
-则它应该为该数据库创建一个 ChromaDB collection，命名为 `columns_{db_id}`
+则所有数据库的列向量应存放在**同一个** ChromaDB collection 中，命名为 `nl2sql_columns`
 并且它应该遍历数据库所有表的所有列
 并且对每列生成一条记录，包含：
-  - id: `"{table_name}.{original_column_name}"`
-  - document: 按"表名 + 原列名 + 人类可读名 + 数据类型 + 列描述 + 值描述 + 数据格式 + 列名（boost 一次）"顺序拼接的文本（空字段跳过、换行符替换为空格）
+  - id: `"{db_id}.{table_name}.{original_column_name}"`
+  - document: 三段式格式 `{table_name} | {original_column_name} | {desc}`，全小写
+  - desc 优先级：column_description → value_description → column_name（首个非空者）
   - embedding: BGE-M3 dense 向量（1024 维）
-  - metadata: 完整列上下文（database、table_name、original_column_name、column_name、data_type、column_description、value_description、data_format、is_primary_key、is_foreign_key、references、sample_values）
+  - metadata: 完整列上下文（database、table_name、original_column_name、column_name、data_type、column_description、value_description、data_format、is_primary_key、is_foreign_key、references、sample_values），其中 `database` 字段用于区分不同数据库
 并且 sample_values 应以 `"|"` 分隔字符串保存（不进入 embed 文本）
-并且 ChromaDB 持久化目录应为 `data/{db_id}/preprocessed/chroma/`
+并且查询时通过 `where_filter={"database": db_id}` 实现隔离
+并且 ChromaDB 持久化目录应为 `data/preprocessed/chroma/`（全局统一，不再按库分散）
 
-#### Scenario: 列名权重 boost 提升直接命中召回
-给定一个列其 `column_name` 为 "AvgScrMath"
+#### Scenario: document 全小写保证 N-gram 匹配归一化
+给定一个列其 `column_description` 为 "average scores in Reading"
 当构建该列的 embed 文档时
-则文档文本中 `column_name` 应出现两次（普通位置 + 末尾 boost 位置）
-并且当用户 query 直接含 "AvgScrMath" 时该列的检索相似度应高于不 boost 的版本
-并且 boost 不应导致描述类 query（如 "average math score"）的召回明显下降
+则文档文本应为全小写：`satscores | avgscrread | average scores in reading`
+并且 "score" 的 3-gram 能匹配文档中 "scores" 的 3-gram
+使得 N-gram 投票精排时字面匹配不受大小写干扰
 
 #### Scenario: 离线 Embedding 全流程使用本地 CPU BGE-M3
 给定本地环境无 GPU

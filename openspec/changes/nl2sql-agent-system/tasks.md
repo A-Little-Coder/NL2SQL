@@ -1,28 +1,30 @@
 ## 1. 环境设置和依赖安装
 
-- [ ] 1.1 配置 conda 虚拟环境 NL2SQL 并安装核心依赖包
-- [ ] 1.2 下载并验证 BIRD-SQL 数据集的完整性和数据库格式
-- [ ] 1.3 配置 Qwen API 和 LangSmith 环境变量
-- [ ] 1.4 安装和测试 BGE-M3 embedding 模型
-- [ ] 1.5 在 `requirements.txt` 中新增依赖：`tavily-python>=0.3.0`、`langgraph>=0.2.0`
-- [ ] 1.6 在 `.env.example` 中新增 `TAVILY_API_KEY=` 配置项
-- [ ] 1.7 创建 `data/user_memory/` 目录并加入 `.gitkeep`，在 `.gitignore` 中排除 `data/user_memory/*.json`
+- [x] 1.1 配置 conda 虚拟环境 NL2SQL 并安装核心依赖包
+- [x] 1.2 下载并验证 BIRD-SQL 数据集的完整性和数据库格式
+- [x] 1.3 配置 Qwen API 和 LangSmith 环境变量
+- [x] 1.4 安装和测试 BGE-M3 embedding 模型
+- [x] 1.5 在 `requirements.txt` 中新增依赖：`tavily-python>=0.3.0`、`langgraph>=0.2.0`
+- [x] 1.6 在 `.env.example` 中新增 `TAVILY_API_KEY=` 配置项
+- [x] 1.7 创建 `data/user_memory/` 目录并加入 `.gitkeep`，在 `.gitignore` 中排除 `data/user_memory/*.json`
 
 ## 2. 预处理模块开发
 
-- [ ] 2.1 实现数据库连接管理器（支持 SQLite 和 MySQL）
-- [ ] 2.2 开发 LSH 索引生成器，为所有字段唯一值创建哈希索引
+- [x] 2.1 实现数据库连接管理器（支持 SQLite 和 MySQL）
+- [x] 2.2 开发 LSH 索引生成器，为所有字段唯一值创建哈希索引
 - [x] 2.3 实现 schema 向量化模块，使用 BGE-M3 生成表/列描述嵌入
 - [x] 2.4 集成 ChromaDB 向量存储，保存和检索 schema 嵌入
-- [ ] 2.5 实现 schema 列文档生成器：
-  - 按 决策 19 的顺序拼装 `document` 文本（含 `column_name` 末尾 boost）
+- [x] 2.5 实现 schema 列文档生成器：
+  - 按 决策 19 的三段式格式拼装 `document` 文本：`{table_name} | {original_column_name} | {desc}`（全小写）
+  - desc 优先级：`column_description` → `value_description` → `column_name`
   - metadata 包含 database/table_name/original_column_name/column_name/data_type/column_description/value_description/data_format/is_primary_key/is_foreign_key/references/sample_values
   - sample_values 用 `"|"` 分隔成字符串（适配 Chroma metadata 限制）
-- [ ] 2.6 实现离线索引构建脚本 `scripts/build_schema_index.py`：
+- [x] 2.6 实现离线索引构建脚本 `src/preprocessing/build_schema_index.py`（实际路径为 `src/preprocessing/`，原 tasks.md 中 `scripts/` 为误写）：
   - 命令行参数：`--db_id`（支持 `all`）、`--force-rebuild`、`--data_dir`
   - 加载 BGE-M3（本地 CPU）批量 embed
   - 写入 `data/preprocessed/chroma/nl2sql_columns/`（全局单 collection，通过 metadata.database 区分）
-- [ ] 2.7 为 schema 列文档生成器和构建脚本编写单元测试（含 boost 文本断言、metadata 完整性）
+  - document 全小写，与决策 19 一致
+- [x] 2.7 为 schema 列文档生成器和构建脚本编写单元测试（含三段式格式断言、metadata 完整性、全小写验证）
 
 ## 3. 信息检索 (IR) 模块开发
 
@@ -35,18 +37,45 @@
   - LSH 命中数量统计
   - 向量检索 top_k 分数列表
 - [x] 3.6 更新 `tests/retrieval/test_information_retriever.py` 验证新字段
-- [ ] 3.7 改写 `retrieve_schema()` 为「每 keyword 独立检索 + 合并去重」：
+- [x] 3.7 改写 `retrieve_schema()` 为「每 keyword 独立检索 + 合并去重」：
   - 输入 keywords 列表，对每个 keyword 调一次 `vector_store.query(top_k=5)`
   - 合并时同 `table.column` 多次命中取最高 score
   - 按 score 降序返回；新增可配参数 `column_top_k_per_keyword`
-- [ ] 3.8 升级 `retrieve_values()` 为「LSH + 语义精排」两阶段：
+- [x] 3.8 升级 `retrieve_values()` 为「LSH + 语义精排」两阶段：
   - LSH top N 候选 → BGE-M3 embedding 计算 (keyword, value) 余弦相似度
   - 过滤 < `value_semantic_threshold`（默认 0.6）
   - 返回结果同时附带 LSH Jaccard 和 embedding 分数
-- [ ] 3.9 修改 `tests/test_e2e_live.py` 接入真实 schema 检索：
+- [x] 3.9 修改 `tests/e2e_live.py` 接入真实 schema 检索：
   - 启动时调用 `prepare_schema_index(db_dir)`（未建则报错或提示运行 build 脚本）
   - IR 步骤展示每 keyword 的列检索 top 5 与分数
   - 移除"全表全列直接塞入 context"的旧逻辑
+
+## 3.10 IR 召回优化（决策 18/19/21/25 改造）
+
+- [x] 3.10.1 重写关键词提取 prompt（决策 21）：
+  - 输出格式改为 `{"keywords": [{"phrase": str, "zh_synonyms": [str], "en_synonyms": [str]}]}`
+  - 四向扩写：中文同义词 + 英文翻译 + 英文同义词 + 中文翻译
+  - 短语保留规则：名词前的描述性定语、量词不单独切分（如"各科score"作为一个短语）
+  - 所有输出全小写
+- [x] 3.10.2 修改 `extract_keywords()` 解析新格式，返回结构化的关键词 + 同义词列表
+- [ ] 3.10.3 修改 `extract_keywords()` 返回结构化分组（决策 18 改造）：
+  - 返回 `List[KeywordGroup]`，每个 KeywordGroup 包含 `phrase`（原生关键词）和 `terms`（phrase + zh_synonyms + en_synonyms 扁平列表）
+  - 下游 `retrieve_schema()` 按分组独立召回
+- [ ] 3.10.4 修改 `retrieve_schema()` 为按关键词分组独立召回（决策 18/25 改造）：
+  - 输入改为 `List[KeywordGroup]`
+  - 每个关键词组：组内所有 terms 各自查 top50 → 取并集 → 组内 n-gram 投票 → 取 top5
+  - 返回 `Dict[str, List[RetrievedItem]]`，key 为原生关键词 phrase，value 为该组的 top5 列
+- [ ] 3.10.5 修改 `retrieve()` 流程适配分组返回结构：
+  - 跨组汇总所有列，重复列去重但标注来源关键词
+  - `RetrievedContext` 中保留关键词→列的映射关系（新增 `keyword_columns_map` 字段）
+- [x] 3.10.6 修改 `schema_doc_generator.py` 的 `format_column_document()` 输出全小写（决策 19）
+- [x] 3.10.7 重建 ChromaDB 索引（document 全小写 + 三段式格式）
+- [ ] 3.10.8 更新 `tests/retrieval/test_information_retriever.py`：
+  - 测试 KeywordGroup 结构化返回
+  - 测试分组独立召回（组内投票、组间不干扰）
+  - 测试 N-gram 投票函数
+  - 测试综合排序逻辑（vector 权重 ≤ 0.2）
+  - 测试全小写 document 匹配
 
 
 ## 4. Schema 选择器 (SS) 模块开发
@@ -62,6 +91,35 @@
 - [x] 5.3 实现多 SQL 生成器，最多生成 5 个候选 SQL
 - [x] 5.4 集成 sqlglot 安全验证，过滤危险操作和语法错误 (基础版已实现)
 
+## 5.5 可回答性检查（Answerability Check，决策 23）
+
+- [x] 5.5.1 创建 `src/verification/__init__.py`
+- [x] 5.5.2 实现 `src/verification/answerability.py` 的 `AnswerabilityChecker` 类：
+  - `__init__(llm_client, strictness="loose")`
+  - `check(user_query, mschema, ir_context) -> AnswerabilityResult`
+  - `AnswerabilityResult` 包含：answerable(true/false/uncertain)、confidence、reason、missing_info、granularity_match
+  - Prompt 模板：宽松原则，只要有合理可能性就放行，只有明确缺少关键实体/粒度严重不匹配才拦截
+  - Prompt 中包含完整的 MSchema 信息（表名、列名、数据类型、description、sample_values、PK/FK）
+- [x] 5.5.3 编写 `tests/verification/test_answerability.py`：
+  - 测试明确不可回答（如"每个学生的成绩"但只有学校级别数据）→ false
+  - 测试可能可回答（uncertain）→ 放行
+  - 测试明确可回答 → true
+  - 测试 reason 和 missing_info 字段正确返回
+
+## 5.6 结果可信度验证（Result Verification，决策 24）
+
+- [x] 5.6.1 实现 `src/verification/result_verifier.py` 的 `ResultVerifier` 类：
+  - `__init__(llm_client, strictness="strict")`
+  - `verify(user_query, selected_sql, result_sample, mschema) -> VerificationResult`
+  - `VerificationResult` 包含：trustworthy(true/false)、reason、granularity_match、semantic_alignment
+  - Prompt 模板：严格原则，检查粒度匹配、维度覆盖、硬凑检测三个维度
+  - `result_sample` 为 SQL 执行结果的列名 + 前 5 行
+- [x] 5.6.2 编写 `tests/verification/test_result_verifier.py`：
+  - 测试答非所问（SQL 查学校但问学生）→ 不可信
+  - 测试正常对齐 → 可信
+  - 测试粒度不匹配 → 不可信
+  - 测试 reason 字段给出有用的拒答原因
+
 ## 6. 执行引擎开发
 
 - [x] 6.1 开发安全 SQL 执行器，支持 EXPLAIN 验证
@@ -73,6 +131,10 @@
 - [x] 7.1 实现结果一致性检测，比较多个 SQL 执行结果
 - [x] 7.2 开发投票决策逻辑：多数一致选最快，全不同调用 LLM
 - [x] 7.3 集成 LLM 最终决策功能，提供候选 SQL 和执行上下文
+- [x] 7.4 在 `SelfConsistencyDecision.decide()` 中集成 `ResultVerifier`：
+  - 选定最终 SQL 后调用 `verifier.verify()`
+  - 不可信时覆盖 `decision_result` 为拒答，填入 `rejection_reason`
+  - 可信时正常返回结果
 
 ## 8. 监控和用户界面集成
 
@@ -142,9 +204,12 @@
 
 ## 15. NL2SQLState 与主图集成
 
-- [ ] 15.1 在主 state 定义中新增字段：`clarification_count`、`clarification_history`、`clarified_keywords`、`web_search_cache`、`user_id`
-- [ ] 15.2 在 LangGraph 主图中插入 `clarification` 节点（IR 之后、SS 之前）
-- [ ] 15.3 配置条件边：`clarification_done == True` → SS；否则循环回 `clarification`
+- [x] 15.1 在主 state 定义中新增字段：`clarification_count`、`clarification_history`、`clarified_keywords`、`web_search_cache`、`user_id`、`answerability_result`、`result_verification`、`rejection_reason`
+- [x] 15.2 在 LangGraph 主图中插入 `clarification` 节点（IR 之后、SS 之前）
+- [x] 15.3 配置条件边：`clarification_done == True` → SS；否则循环回 `clarification`
+- [x] 15.4 在 LangGraph 主图中插入 `answerability_check` 节点（SS 之后、CG 之前）
+- [x] 15.5 配置条件边：`answerable != "false"` → CG；否则 → END（拒答 + 原因）
+- [x] 15.6 修改 `decision` 节点集成结果验证：不可信时写入 `rejection_reason` 并跳转 END
 
 ## 16. 文档与示例
 
@@ -195,5 +260,5 @@
   - 验证状态在节点间正确流动
   - 验证条件边（如全部 SQL 失败时主图正确终止）
 - [x] 18.11 编写 `tests/graph/test_subgraphs.py`：每个 Agent 子图独立可调用 + 状态契约验证
-- [x] 18.12 修改 `tests/test_e2e_live.py` 使用 `build_main_graph()` 代替手写流程（当前先外部流程展示，未来完整接入子图条件边）
+- [x] 18.12 修改 `tests/e2e_live.py` 使用 `build_main_graph()` 代替手写流程（当前先外部流程展示，未来完整接入子图条件边）
 

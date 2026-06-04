@@ -301,9 +301,10 @@ class DatabaseConnector:
                 db_dir = os.path.dirname(self.db_path) or self.db_path
                 loader = DescriptionLoader(db_dir)
                 descriptions = loader.load_tables_description()
-            except Exception:
-                # 描述加载失败不影响基础功能
-                pass
+            except Exception as e:
+                # 描述加载失败不影响基础功能，但需要打印警告便于排查
+                import warnings
+                warnings.warn(f"DescriptionLoader 加载失败 ({type(e).__name__}): {e}")
 
         try:
             if self.db_type == "sqlite":
@@ -328,8 +329,10 @@ class DatabaseConnector:
                             desc_info = table_desc.get(col_lower, {})
 
                             if desc_info:
+                                column["column_name"] = desc_info.get("column_name", "")
                                 column["description"] = desc_info.get("column_description", "")
                                 column["data_format"] = desc_info.get("data_format", "")
+                                column["value_description"] = desc_info.get("value_description", "")
 
                         schema["columns"].append(column)
 

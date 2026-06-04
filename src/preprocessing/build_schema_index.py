@@ -31,10 +31,10 @@ load_dotenv()
 
 from loguru import logger
 
-from database_connector import DatabaseConnector
-from schema_vectorizer import SchemaVectorizer
-from schema_doc_generator import SchemaColumnDocGenerator
-from vector_store import VectorStoreManager
+from src.preprocessing.database_connector import DatabaseConnector
+from src.preprocessing.schema_vectorizer import SchemaVectorizer
+from src.preprocessing.schema_doc_generator import SchemaColumnDocGenerator
+from src.preprocessing.vector_store import VectorStoreManager
 
 
 # 全局常量

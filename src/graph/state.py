@@ -83,6 +83,11 @@ class NL2SQLState(TypedDict, total=False):
     final_sql: str
     final_result: Any
 
+    # ===== Verification（决策 23/24）=====
+    answerability_result: Optional[Dict[str, Any]]  # 可回答性检查结果
+    result_verification: Optional[Dict[str, Any]]    # 结果可信度验证结果
+    rejection_reason: Optional[str]                   # 拒答原因
+
     # ===== 辅助 =====
     error: Optional[str]
     trace_log: List[str]
@@ -121,6 +126,9 @@ def create_initial_state(
         final_decision=None,
         final_sql="",
         final_result=None,
+        answerability_result=None,
+        result_verification=None,
+        rejection_reason=None,
         error=None,
         trace_log=[],
     )

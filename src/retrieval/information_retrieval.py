@@ -14,6 +14,46 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 from loguru import logger
 
+
+# ============================================================================
+# N-gram 工具函数
+# ============================================================================
+
+def _char_ngrams(text: str, n: int = 3) -> set:
+    """生成文本的字符级 n-gram 集合"""
+    if len(text) < n:
+        return {text} if text else set()
+    return {text[i:i + n] for i in range(len(text) - n + 1)}
+
+
+def ngram_vote_score(document: str, query_terms: list, n: int = 3) -> float:
+    """
+    计算 N-gram 投票得分
+
+    只对 query_terms 做 n-gram 拆解，在 document 原文中统计每个 n-gram 的出现次数。
+    document 不拆解，避免 '|' 分隔符产生噪声 n-gram。
+
+    计分方式：累加所有 term 的所有 n-gram 在 document 中的出现次数。
+    例如 "school" 的 "sch" 在 document 中出现 2 次 → 贡献 2 分。
+
+    Args:
+        document: 候选列的 document 文本（全小写，不拆解）
+        query_terms: 所有检索词（全小写）
+        n: n-gram 的 n 值，默认 3
+
+    Returns:
+        float: 所有 n-gram 在 document 中的累计出现次数
+    """
+    if not document:
+        return 0.0
+
+    total_hits = 0
+    for term in query_terms:
+        term_ngrams = _char_ngrams(term, n)
+        for ng in term_ngrams:
+            total_hits += document.count(ng)
+    return float(total_hits)
+
 # 模块级导入：测试时方便 patch
 try:
     from src.preprocessing.lsh_index import LSHIndexer
@@ -36,12 +76,25 @@ class RetrievedItem:
 
 
 @dataclass
+class KeywordGroup:
+    """关键词分组 — 一个原生关键词及其同义词扩写"""
+    phrase: str                    # 原生关键词（如"各科score"）
+    terms: List[str] = None        # phrase + zh_synonyms + en_synonyms（全小写，去重）
+
+    def __post_init__(self):
+        if self.terms is None:
+            self.terms = []
+
+
+@dataclass
 class RetrievedContext:
     """检索上下文 - 整合所有检索结果"""
     tables: List[RetrievedItem] = None
     columns: List[RetrievedItem] = None
     values: List[RetrievedItem] = None
     keywords: List[str] = None
+    keyword_groups: List[KeywordGroup] = None       # 关键词分组（保留结构化信息）
+    keyword_columns_map: Dict[str, List[str]] = None  # 关键词→召回列映射 {"各科score": ["satscores.AvgScrRead", ...]}
     # 3.5 新增：检索元数据
     lsh_hit_count: int = 0           # LSH 命中数量
     vector_top_scores: List[float] = field(default_factory=list)  # 向量检索 top_k 分数列表
@@ -55,6 +108,10 @@ class RetrievedContext:
             self.values = []
         if self.keywords is None:
             self.keywords = []
+        if self.keyword_groups is None:
+            self.keyword_groups = []
+        if self.keyword_columns_map is None:
+            self.keyword_columns_map = {}
 
     def get_all_table_names(self) -> List[str]:
         """获取所有涉及的表名（去重）"""
@@ -75,25 +132,28 @@ class RetrievedContext:
 # 关键词提取 Prompt
 # ============================================================================
 
-KEYWORD_EXTRACTION_PROMPT = """你是一个专业的数据库查询分析专家。请从用户查询中提取用于数据库检索的关键词。
+KEYWORD_EXTRACTION_PROMPT = """你是一个专业的数据库查询分析专家。请从用户查询中提取用于数据库检索的关键词，并为每个关键词提供同义词扩写。
 
 提取规则：
 1. 提取可能与数据库字段名或值匹配的关键词
-2. 时间表达式保留原样（如"去年"、"2023年"）
-3. 度量词保留（如"销售额"、"利润"）
-4. 实体名称保留（如"苹果"、"北京"）
-5. 不要提取常见停用词（如"显示"、"查询"、"找出"等动词）
-6. 返回 JSON 格式：{{"keywords": ["关键词1", "关键词2", ...]}}
+2. 名词前的描述性定语、量词不单独切分，保留为短语（如"各科成绩"不拆成"各科"+"成绩"）
+3. 时间表达式保留原样（如"去年"、"2023年"）
+4. 度量词保留（如"销售额"、"利润"）
+5. 实体名称保留（如"苹果"、"北京"）
+6. 不要提取常见停用词（如"显示"、"查询"、"找出"等动词）
+7. 为每个关键词提供中文同义词和英文同义词/翻译
+8. 所有输出全小写
+9. 返回 JSON 格式：{{"keywords": [{{"phrase": "关键词", "zh_synonyms": ["同义词1"], "en_synonyms": ["synonym1"]}}]}}
 
 示例：
+输入："各个学校的各科score"
+输出：{{"keywords": [{{"phrase": "学校", "zh_synonyms": ["学校", "院校"], "en_synonyms": ["school", "schools"]}}, {{"phrase": "各科score", "zh_synonyms": ["各科成绩", "每科分数"], "en_synonyms": ["subject score", "course score", "each subject score"]}}]}}
+
 输入："显示去年北京地区的销售额"
-输出：{{"keywords": ["去年", "北京", "销售额"]}}
+输出：{{"keywords": [{{"phrase": "去年", "zh_synonyms": ["去年"], "en_synonyms": ["last year", "previous year"]}}, {{"phrase": "北京", "zh_synonyms": ["北京", "北京市"], "en_synonyms": ["beijing"]}}, {{"phrase": "销售额", "zh_synonyms": ["销售额", "营收"], "en_synonyms": ["sales", "revenue", "sales amount"]}}]}}
 
 输入："找出销售额超过100万的客户"
-输出：{{"keywords": ["销售额", "100万", "客户"]}}
-
-输入："苹果公司的营收增长情况"
-输出：{{"keywords": ["苹果公司", "营收", "增长"]}}
+输出：{{"keywords": [{{"phrase": "销售额", "zh_synonyms": ["销售额", "营收"], "en_synonyms": ["sales", "revenue", "sales amount"]}}, {{"phrase": "100万", "zh_synonyms": ["100万", "一百万"], "en_synonyms": ["1 million", "1000000"]}}, {{"phrase": "客户", "zh_synonyms": ["客户", "顾客"], "en_synonyms": ["customer", "client"]}}]}}
 
 输入："{query}"
 输出："""
@@ -127,19 +187,20 @@ class InformationRetrieval:
         self.lsh_threshold = lsh_threshold
         self.vector_top_k = vector_top_k
 
-    def extract_keywords(self, query: str) -> List[str]:
+    def extract_keywords(self, query: str) -> List[KeywordGroup]:
         """
-        从自然语言查询中提取关键词
+        从自然语言查询中提取关键词（含同义词扩写，按原生关键词分组）
 
         Args:
             query: 用户查询
 
         Returns:
-            List[str]: 提取的关键词列表
+            List[KeywordGroup]: 关键词分组列表，每组含 phrase 和 terms
         """
         if not self.llm_client:
             logger.warning("LLM 客户端未设置，使用简单分词回退")
-            return self._simple_keyword_extract(query)
+            simple_kws = self._simple_keyword_extract(query)
+            return [KeywordGroup(phrase=kw, terms=[kw.lower()]) for kw in simple_kws]
 
         try:
             prompt = KEYWORD_EXTRACTION_PROMPT.format(query=query)
@@ -148,13 +209,34 @@ class InformationRetrieval:
                 {"role": "user", "content": prompt},
             ]
             result = self.llm_client.chat_json(messages, temperature=0.0)
-            keywords = result.get("keywords", [])
-            logger.info(f"关键词提取结果: {keywords}")
-            return keywords
+            keywords_raw = result.get("keywords", [])
+
+            groups = []
+            for kw in keywords_raw:
+                if isinstance(kw, str):
+                    # 兼容旧格式
+                    groups.append(KeywordGroup(phrase=kw, terms=[kw.lower()]))
+                elif isinstance(kw, dict):
+                    phrase = kw.get("phrase", "")
+                    if not phrase:
+                        continue
+                    # 扁平化：phrase + zh_synonyms + en_synonyms，全小写，去重保序
+                    terms = []
+                    seen = set()
+                    for t in [phrase] + kw.get("zh_synonyms", []) + kw.get("en_synonyms", []):
+                        t_lower = t.lower()
+                        if t_lower not in seen:
+                            seen.add(t_lower)
+                            terms.append(t_lower)
+                    groups.append(KeywordGroup(phrase=phrase.lower(), terms=terms))
+
+            logger.info(f"关键词提取结果: {[(g.phrase, g.terms) for g in groups]}")
+            return groups
 
         except Exception as e:
             logger.warning(f"LLM 关键词提取失败，使用回退方案: {e}")
-            return self._simple_keyword_extract(query)
+            simple_kws = self._simple_keyword_extract(query)
+            return [KeywordGroup(phrase=kw, terms=[kw.lower()]) for kw in simple_kws]
 
     @staticmethod
     def _simple_keyword_extract(query: str) -> List[str]:
@@ -333,111 +415,140 @@ class InformationRetrieval:
         logger.info(f"值检索: LSH + 语义精排共 {len(all_items)} 个结果")
         return all_items
 
-    def retrieve_schema(self, keywords: List[str], database_filter: str = None,
-                      column_top_k_per_keyword: int = 5) -> Dict[str, List[RetrievedItem]]:
+    def retrieve_schema(self, keyword_groups: List[KeywordGroup], database_filter: str = None,
+                      column_top_k_per_keyword: int = 50) -> Dict[str, List[RetrievedItem]]:
         """
-        使用向量相似性检索相关的 schema（每个 keyword 独立查询后合并）
+        按关键词分组独立召回 schema，每组组内 N-gram 投票精排
+
+        流程：
+        1. 每个关键词组：组内所有 terms 各查 top50 → 取并集
+        2. 组内 N-gram 投票精排（只用本组 terms）
+        3. 每组返回 top 5 列
 
         Args:
-            keywords: 关键词列表（每个 keyword 独立查询一次）
+            keyword_groups: 关键词分组列表
             database_filter: 可选的数据库过滤条件
-            column_top_k_per_keyword: 每个 keyword 查 top_k 个列（默认 5）
+            column_top_k_per_keyword: 每个 term 查 top_k 个列（默认 50）
 
         Returns:
-            Dict[str, List[RetrievedItem]]: 检索到的表和列
+            Dict[str, List[RetrievedItem]]: key 为原生关键词 phrase，value 为该组的 top5 列
         """
         if not self.vector_store:
             logger.warning("向量存储未设置，跳过 schema 检索")
-            return {"tables": [], "columns": []}
+            return {}
 
         if not hasattr(self, "_vectorizer") or self._vectorizer is None:
             logger.warning("向量化器未设置，跳过 schema 检索")
-            return {"tables": [], "columns": []}
+            return {}
 
-        if not keywords:
-            return {"tables": [], "columns": []}
+        if not keyword_groups:
+            return {}
+
+        where_filter = None
+        if database_filter:
+            where_filter = {"database": database_filter}
+
+        group_results = {}
 
         try:
-            # 1. 逐个 keyword 查询向量
-            all_results = []
-            for kw in keywords:
-                # 向量化单个 keyword
-                embedding_result = self._vectorizer.embed_texts([kw], return_dense=True)
-                query_vec = embedding_result["dense"][0]
-
-                where_filter = None
-                if database_filter:
-                    where_filter = {"database": database_filter}
-
-                # 查询
-                results_for_kw = self.vector_store.query(
-                    query_embedding=query_vec,
-                    n_results=column_top_k_per_keyword,
-                    where_filter=where_filter,
-                )
-                all_results.extend(results_for_kw)
-
-            # 2. 合并去重（同一 table.column 多次命中取最高 score）
-            column_score_map = {}
-            for r in all_results:
-                meta = r.get("metadata", {})
-                dist = r.get("distance", 1.0)
-                score = 1.0 - dist if dist is not None else 0.0
-
-                table_name = meta.get("table_name", "")
-                col_name = meta.get("original_column_name", meta.get("column_name", ""))
-                if not table_name or not col_name:
+            for group in keyword_groups:
+                if not group.terms:
                     continue
 
-                key = f"{table_name}.{col_name}"
-                if key not in column_score_map or score > column_score_map[key]["score"]:
-                    column_score_map[key] = {
-                        "score": score,
+                # 1. 组内所有 terms 各自查 top50，取并集（不去重，全部保留）
+                group_raw_results = []
+                for term in group.terms:
+                    try:
+                        embedding_result = self._vectorizer.embed_texts([term], return_dense=True)
+                        query_vec = embedding_result["dense"][0]
+
+                        results_for_term = self.vector_store.query(
+                            query_embedding=query_vec,
+                            n_results=column_top_k_per_keyword,
+                            where_filter=where_filter,
+                        )
+                        group_raw_results.extend(results_for_term)
+                    except Exception as e:
+                        logger.warning(f"组 '{group.phrase}' 检索词 '{term}' 失败: {e}")
+                        continue
+
+                if not group_raw_results:
+                    group_results[group.phrase] = []
+                    continue
+
+                # 2. 组内 N-gram 投票精排
+                candidates = []
+                for r in group_raw_results:
+                    meta = r.get("metadata", {})
+                    dist = r.get("distance", 1.0)
+                    vector_score = 1.0 - dist if dist is not None else 0.0
+
+                    table_name = meta.get("table_name", "")
+                    col_name = meta.get("original_column_name", meta.get("column_name", ""))
+                    if not table_name or not col_name:
+                        continue
+
+                    key = f"{table_name}.{col_name}"
+                    document = r.get("document", "")
+
+                    # 组内投票：只用本组的 terms
+                    vote = ngram_vote_score(document, group.terms, n=3)
+
+                    candidates.append({
+                        "key": key,
                         "metadata": meta,
-                        "document": r.get("document", ""),
-                        "distance": dist,
-                    }
+                        "document": document,
+                        "vector_score": vector_score,
+                        "ngram_vote": vote,
+                    })
 
-            # 3. 转成 RetrievedItem 列表，按 score 降序
-            sorted_items = sorted(column_score_map.items(), key=lambda x: x[1]["score"], reverse=True)
-            columns = []
-            seen_tables = set()
-            tables = []
+                if not candidates:
+                    group_results[group.phrase] = []
+                    continue
 
-            for key, info in sorted_items:
-                table_name = info["metadata"].get("table_name", "")
-                col_name = info["metadata"].get("original_column_name",
-                                                 info["metadata"].get("column_name", ""))
+                # 3. 计算综合分并去重（同 key 取最高 final_score）
+                max_ngram = max(c["ngram_vote"] for c in candidates)
+                max_ngram = max(max_ngram, 1.0)
 
-                # 列 item
-                col_item = RetrievedItem(
-                    item_type="column",
-                    name=col_name,
-                    table_name=table_name,
-                    score=info["score"],
-                    metadata=info["metadata"],
-                )
-                columns.append(col_item)
+                dedup_map = {}
+                for c in candidates:
+                    normalized_ngram = c["ngram_vote"] / max_ngram
+                    final_score = c["vector_score"] * 0.2 + normalized_ngram * 0.8
 
-                # 所属的表也加入（score 取该列 score）
-                if table_name and table_name not in seen_tables:
-                    seen_tables.add(table_name)
-                    tables.append(RetrievedItem(
-                        item_type="table",
-                        name=table_name,
+                    if c["key"] not in dedup_map or final_score > dedup_map[c["key"]]["final_score"]:
+                        dedup_map[c["key"]] = {
+                            "final_score": final_score,
+                            "metadata": c["metadata"],
+                        }
+
+                # 4. 按 final_score 降序，取 top 10
+                sorted_items = sorted(dedup_map.items(), key=lambda x: x[1]["final_score"], reverse=True)
+                group_columns = []
+                for key, info in sorted_items[:10]:
+                    col_name = info["metadata"].get("original_column_name",
+                                                     info["metadata"].get("column_name", ""))
+                    table_name = info["metadata"].get("table_name", "")
+                    group_columns.append(RetrievedItem(
+                        item_type="column",
+                        name=col_name,
                         table_name=table_name,
-                        score=info["score"],
-                        metadata={"database": info["metadata"].get("database", "")},
+                        score=info["final_score"],
+                        metadata=info["metadata"],
                     ))
 
-            logger.info(f"语义 schema 检索: {len(tables)} 个表, {len(columns)} 个列（关键词数: {len(keywords)}）")
-            return {"tables": tables, "columns": columns}
+                group_results[group.phrase] = group_columns
+                logger.info(
+                    f"组 '{group.phrase}': 粗召回 {len(group_raw_results)}, "
+                    f"去重 {len(dedup_map)}, top10: {[c.name for c in group_columns]}"
+                )
+
+            return group_results
 
         except Exception as e:
             logger.error(f"语义 schema 检索失败: {e}")
             import traceback
             logger.debug(traceback.format_exc())
-            return {"tables": [], "columns": []}
+            return {}
 
     def retrieve(self, query: str, database_filter: str = None) -> RetrievedContext:
         """
@@ -452,33 +563,75 @@ class InformationRetrieval:
         """
         logger.info(f"开始检索: query='{query}'")
 
-        # 1. 关键词提取
-        keywords = self.extract_keywords(query)
-        logger.info(f"提取关键词: {keywords}")
+        # 1. 关键词提取（返回分组）
+        keyword_groups = self.extract_keywords(query)
+        # 扁平化关键词列表（兼容旧接口）
+        all_keywords = []
+        for g in keyword_groups:
+            all_keywords.extend(g.terms)
+        logger.info(f"提取关键词: {[(g.phrase, g.terms) for g in keyword_groups]}")
 
-        # 2. LSH 值检索
-        value_items = self.retrieve_values(keywords)
+        # 2. LSH 值检索（用扁平化关键词）
+        value_items = self.retrieve_values(all_keywords)
 
-        # 3. 语义 schema 检索（用 keywords 逐个查询）
-        schema_results = self.retrieve_schema(keywords, database_filter)
+        # 3. 语义 schema 检索（按分组独立召回）
+        group_schema_results = self.retrieve_schema(keyword_groups, database_filter)
 
-        # 4. 合并结果
+        # 4. 跨组汇总：合并所有列，去重但标注来源
+        seen_columns = {}  # key → RetrievedItem
+        keyword_columns_map = {}  # phrase → [column_key, ...]
+
+        for phrase, columns in group_schema_results.items():
+            col_keys = []
+            for col in columns:
+                col_key = f"{col.table_name}.{col.name}"
+                col_keys.append(col_key)
+                if col_key not in seen_columns:
+                    # 首次出现，记录
+                    seen_columns[col_key] = col
+                else:
+                    # 重复列：保留分数更高的
+                    if col.score > seen_columns[col_key].score:
+                        seen_columns[col_key] = col
+            keyword_columns_map[phrase] = col_keys
+
+        all_columns = list(seen_columns.values())
+        all_columns.sort(key=lambda c: c.score, reverse=True)
+
+        # 提取表信息
+        seen_tables = set()
+        all_tables = []
+        for col in all_columns:
+            if col.table_name and col.table_name not in seen_tables:
+                seen_tables.add(col.table_name)
+                all_tables.append(RetrievedItem(
+                    item_type="table",
+                    name=col.table_name,
+                    table_name=col.table_name,
+                    score=col.score,
+                    metadata={"database": col.metadata.get("database", "")},
+                ))
+
+        # 5. 合并结果
         context = RetrievedContext(
-            tables=schema_results.get("tables", []),
-            columns=schema_results.get("columns", []),
+            tables=all_tables,
+            columns=all_columns,
             values=value_items,
-            keywords=keywords,
+            keywords=all_keywords,
+            keyword_groups=keyword_groups,
+            keyword_columns_map=keyword_columns_map,
             lsh_hit_count=len(value_items),
-            vector_top_scores=[c.score for c in schema_results.get("columns", [])],
+            vector_top_scores=[c.score for c in all_columns[:10]],
         )
 
-        # 5. 根据检索到的值补充 schema
+        # 6. 根据检索到的值补充 schema
         context = self.enhance_with_schema(context)
 
         logger.info(
             f"检索完成: {len(context.tables)} 个表, "
             f"{len(context.columns)} 个列, "
-            f"{len(context.values)} 个值"
+            f"{len(context.values)} 个值, "
+            f"关键词组: {len(keyword_groups)}"
         )
         return context
 

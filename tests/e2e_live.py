@@ -37,9 +37,11 @@ from src.retrieval.information_retrieval import (
     InformationRetrieval, RetrievedContext, RetrievedItem
 )
 from src.schema_selection.schema_selector import SchemaSelector
-from src.sql_generation.sql_generator import SQLGenerator
+from src.sql_generation.sql_generator import SQLGenerator, SQLStatus
 from src.execution.executor import SQLExecutor, SQLFixLoop
 from src.decision.self_consistency import SelfConsistencyDecision
+from src.verification.answerability import AnswerabilityChecker
+from src.verification.result_verifier import ResultVerifier
 from src.graph import build_main_graph, create_initial_state
 from utils.llm_client import LLMClient
 
@@ -98,14 +100,13 @@ def prepare_schema_index(db_id: str, data_dir: str, bge_model_path: str) -> tupl
     """
     persist_dir = Path(data_dir) / "preprocessed" / "chroma"
     collection_name = "nl2sql_columns"
-    expected_path = persist_dir / collection_name
 
-    if not expected_path.exists():
+    if not persist_dir.exists() or not (persist_dir / "chroma.sqlite3").exists():
         logger.error("=" * 60)
         logger.error("未找到 schema 向量索引！")
         logger.error("=" * 60)
         logger.error(f"请先运行索引构建:")
-        logger.error(f"  python tests/preprocessing/build_schema_index.py")
+        logger.error(f"  python scripts/build_schema_index.py")
         logger.error("=" * 60)
         return None, None
 
@@ -233,6 +234,11 @@ def main():
     fix_loop = SQLFixLoop(executor=executor, llm_client=llm_client, max_retries=2)
     decider = SelfConsistencyDecision(llm_client=llm_client)
 
+    # 可回答性检查器（决策 23）和结果验证器（决策 24）
+    answerability_checker = AnswerabilityChecker(llm_client=llm_client, strictness="loose")
+    result_verifier = ResultVerifier(llm_client=llm_client, strictness="strict")
+    decider = SelfConsistencyDecision(llm_client=llm_client, result_verifier=result_verifier)
+
     # 构建主图
     graph = build_main_graph(
         retriever=retriever,
@@ -240,6 +246,7 @@ def main():
         generator=generator,
         fix_loop=fix_loop,
         decider=decider,
+        answerability_checker=answerability_checker,
     )
 
     print(f"\n{'=' * 60}")
@@ -279,7 +286,7 @@ def main():
             # ==========================================
 
             # 1. IR
-            print("\n[1/5] 信息检索 (IR)")
+            print("\n[1/6] 信息检索 (IR)")
             context = retriever.retrieve(query, database_filter=selected_db_id)
             print(f"  关键词: {context.keywords}")
             if context.tables:
@@ -290,14 +297,34 @@ def main():
                 print(f"  值命中: {[v.name for v in context.values[:10]]}" + (f" + {len(context.values)-10} 更多" if len(context.values) > 10 else ""))
 
             # 2. SS
-            print("\n[2/5] Schema 选择 (SS)")
+            print("\n[2/6] Schema 选择 (SS)")
             selected_schema = selector.select(context, query)
             for tbl in selected_schema:
                 cols = [f"{c.name}" for c in tbl.columns]
                 print(f"  {tbl.name}: {cols}")
 
+            # 2.5 可回答性检查（决策 23）
+            print("\n[3/6] 可回答性检查")
+            answerability = answerability_checker.check(
+                user_query=query,
+                mschema=selected_schema,
+                ir_context=context,
+            )
+            print(f"  结果: {answerability.answerable} (置信度: {answerability.confidence:.2f})")
+            if answerability.answerable != "false":
+                print(f"  理由: {answerability.reason}")
+            else:
+                print(f"  拒答原因: {answerability.reason}")
+                print(f"  缺少信息: {answerability.missing_info}")
+                print(f"\n{'=' * 60}")
+                print(f"  拒答: 数据库无法回答此问题")
+                print(f"{'=' * 60}")
+                print(f"  原因: {answerability.reason}")
+                print()
+                continue
+
             # 3. CG
-            print("\n[3/5] SQL 生成 (CG)")
+            print("\n[4/6] SQL 生成 (CG)")
             candidates = generator.generate(selected_schema, query)
             if not candidates:
                 print("  未生成有效 SQL")
@@ -306,23 +333,33 @@ def main():
                 print(f"  [候选{i}] {cand.sql}")
 
             # 4. Execution
-            print("\n[4/5] 执行 (Execution)")
+            print("\n[5/6] 执行 (Execution)")
             from src.schema_selection.schema_selector import MSchemaFormat
             schema_text = MSchemaFormat.format_for_llm(MSchemaFormat.create_mschema_schema(selected_schema))
             for cand in candidates:
                 result = fix_loop.run(cand.sql, query, schema_text)
                 cand.result = result.result_data
                 cand.execution_time = result.execution_time
-                cand.status = result.success
+                cand.status = SQLStatus.SUCCESS if result.success else SQLStatus.FAILED
                 cand.error_message = result.error.original_message if result.error else None
                 icon = "[OK]" if result.success else "[ERR]"
                 print(f"  {icon} {cand.sql}")
 
             # 5. Decision
-            print("\n[5/5] 自洽决策 (Decision)")
-            decision = decider.decide(candidates, query)
+            print("\n[6/6] 自洽决策 (Decision)")
+            decision = decider.decide(candidates, query, mschema=selected_schema)
 
             elapsed = time.time() - start
+
+            # 检查结果验证拒答
+            voting = decision.voting_summary or {}
+            if voting.get("rejected"):
+                print(f"\n{'=' * 60}")
+                print(f"  拒答: 结果不可信")
+                print(f"{'=' * 60}")
+                print(f"  原因: {decision.decision_reason}")
+                print()
+                continue
 
             print(f"\n{'=' * 60}")
             print(f"  最终结果")

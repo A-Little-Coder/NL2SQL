@@ -36,15 +36,19 @@ class SelfConsistencyDecision:
     1. 多数结果一致 → 选择执行时间最短的 SQL
     2. 所有结果不同 → 调用 LLM 进行最终决策
     3. 全部失败 → 返回错误
+    4. 选定 SQL 后 → 调用 ResultVerifier 验证结果可信度（决策 24）
 
     Attributes:
         llm_client: LLM 客户端
         num_candidates: 候选数量（默认 5）
+        result_verifier: 结果可信度验证器（决策 24）
     """
 
-    def __init__(self, llm_client=None, num_candidates: int = 5):
+    def __init__(self, llm_client=None, num_candidates: int = 5,
+                 result_verifier=None):
         self.llm_client = llm_client
         self.num_candidates = num_candidates
+        self.result_verifier = result_verifier
 
     def compute_result_hash(self, result: Any) -> str:
         """
@@ -213,13 +217,15 @@ class SelfConsistencyDecision:
             return successful[0] if successful else None
 
     def decide(self, candidates: List[SQLCandidate],
-               user_query: str) -> DecisionResult:
+               user_query: str,
+               mschema: List[Any] = None) -> DecisionResult:
         """
         完整的决策流程
 
         Args:
             candidates: SQLCandidate 列表
             user_query: 用户查询
+            mschema: MSchema 表列表（可选，用于结果验证）
 
         Returns:
             DecisionResult: 决策结果
@@ -245,7 +251,7 @@ class SelfConsistencyDecision:
         if has_majority:
             # 多数一致 → 选最快的
             best = self.select_fastest_from_group(majority_group)
-            return DecisionResult(
+            decision = DecisionResult(
                 selected_sql=best.sql,
                 selected_result=best.result,
                 execution_time=best.execution_time,
@@ -267,7 +273,7 @@ class SelfConsistencyDecision:
                     voting_summary={"total_groups": len(successful_groups)},
                 )
 
-            return DecisionResult(
+            decision = DecisionResult(
                 selected_sql=best.sql,
                 selected_result=best.result,
                 execution_time=best.execution_time,
@@ -278,6 +284,27 @@ class SelfConsistencyDecision:
                     "llm_decided": True,
                 },
             )
+
+        # 4. 结果可信度验证（决策 24）
+        if self.result_verifier is not None and decision.selected_sql:
+            verification = self.result_verifier.verify(
+                user_query=user_query,
+                selected_sql=decision.selected_sql,
+                result_sample=decision.selected_result,
+                mschema=mschema,
+            )
+            if verification.should_reject:
+                logger.warning(f"结果验证不可信: {verification.reason}")
+                return DecisionResult(
+                    decision_reason=f"结果不可信: {verification.reason}",
+                    voting_summary={
+                        **(decision.voting_summary or {}),
+                        "verification": verification.to_dict(),
+                        "rejected": True,
+                    },
+                )
+
+        return decision
 
     # ------------------------------------------------------------------
     # LangGraph 子图接口（§18.7 / §18.8）

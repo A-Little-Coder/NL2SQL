@@ -1,7 +1,7 @@
 """
-NL2SQL 主图：串联 IR → (Clarification) → SS → CG → Execution → Decision
+NL2SQL 主图：串联 IR → (Clarification) → SS → AnswerabilityCheck → CG → Execution → Decision
 
-依据 决策 22 / §18.2。
+依据 决策 22 / §18.2，决策 23 / §15.4-15.5，决策 24 / §15.6。
 
 设计要点：
 1. 节点是「适配器」，把主图 NL2SQLState 的字段映射到 Agent 子图的内部 State，
@@ -14,8 +14,10 @@ NL2SQL 主图：串联 IR → (Clarification) → SS → CG → Execution → De
 3. 条件边覆盖兜底：
      - IR 后无任何候选 → 主图直接 END（带 error）
      - SS 后无表 → END
+     - AnswerabilityCheck 后不可回答 → END（拒答 + 原因）
      - CG 后无候选 SQL → END
      - Execution 后无成功结果时仍进入 Decision（Decision 会输出"全部失败"）
+     - Decision 后结果不可信 → END（拒答 + 原因）
 
 Clarification 节点本期占位（pass-through），Phase 2 接入。
 """
@@ -83,6 +85,34 @@ def make_ss_node(selector) -> Callable[[NL2SQLState], Dict[str, Any]]:
             "selected_schema": result.get("selected_schema", []),
             "trace_log": state.get("trace_log", []) + ["[SS] done"],
         }
+
+    return node
+
+
+def make_answerability_check_node(checker) -> Callable[[NL2SQLState], Dict[str, Any]]:
+    """
+    构造可回答性检查节点（决策 23）：SS 之后、CG 之前
+
+    宽松原则：只有 answerable="false" 才拦截，uncertain 放行。
+    """
+
+    def node(state: NL2SQLState) -> Dict[str, Any]:
+        schema = state.get("selected_schema", [])
+        ir_ctx = state.get("retrieved_context")
+        result = checker.check(
+            user_query=state["user_query"],
+            mschema=schema,
+            ir_context=ir_ctx,
+        )
+        out: Dict[str, Any] = {
+            "answerability_result": result.to_dict(),
+            "trace_log": state.get("trace_log", [])
+                         + [f"[AnswerabilityCheck] {result.answerable}"],
+        }
+        if result.should_reject:
+            out["rejection_reason"] = result.reason
+            out["error"] = f"不可回答: {result.reason}"
+        return out
 
     return node
 
@@ -167,7 +197,11 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
 
 
 def make_decision_node(decider) -> Callable[[NL2SQLState], Dict[str, Any]]:
-    """构造 Decision 节点：调用 Decision 子图，输出 final_decision"""
+    """
+    构造 Decision 节点：调用 Decision 子图，输出 final_decision
+
+    决策 24：选定 SQL 后进行结果可信度验证，不可信时写入 rejection_reason。
+    """
 
     def node(state: NL2SQLState) -> Dict[str, Any]:
         cands = state.get("sql_candidates", [])
@@ -184,6 +218,22 @@ def make_decision_node(decider) -> Callable[[NL2SQLState], Dict[str, Any]]:
         if decision is not None:
             out["final_sql"] = decision.selected_sql or ""
             out["final_result"] = decision.selected_result
+
+            # 结果可信度验证（决策 24）
+            if decider.result_verifier is not None and decision.selected_sql:
+                mschema = state.get("selected_schema", [])
+                verification = decider.result_verifier.verify(
+                    user_query=state["user_query"],
+                    selected_sql=decision.selected_sql,
+                    result_sample=decision.selected_result,
+                    mschema=mschema,
+                )
+                out["result_verification"] = verification.to_dict()
+                if verification.should_reject:
+                    out["rejection_reason"] = f"结果不可信: {verification.reason}"
+                    out["final_sql"] = ""
+                    out["final_result"] = None
+
         return out
 
     return node
@@ -200,6 +250,7 @@ def build_main_graph(
     fix_loop,
     decider,
     *,
+    answerability_checker=None,
     enable_clarification: bool = False,
 ):
     """
@@ -211,6 +262,7 @@ def build_main_graph(
         generator: SQLGenerator 实例
         fix_loop: SQLFixLoop 实例
         decider: SelfConsistencyDecision 实例
+        answerability_checker: AnswerabilityChecker 实例（决策 23，可选）
         enable_clarification: 是否启用 Clarification 节点（Phase 2）
 
     Returns:
@@ -221,6 +273,14 @@ def build_main_graph(
     graph.add_node("ir", make_ir_node(retriever))
     graph.add_node("clarification", make_clarification_node())
     graph.add_node("ss", make_ss_node(selector))
+
+    # 可回答性检查节点（决策 23）：SS 之后、CG 之前
+    if answerability_checker is not None:
+        graph.add_node(
+            "answerability_check",
+            make_answerability_check_node(answerability_checker),
+        )
+
     graph.add_node("cg", make_cg_node(generator))
     graph.add_node("execution", make_execution_node(fix_loop))
     graph.add_node("decision", make_decision_node(decider))
@@ -239,13 +299,37 @@ def build_main_graph(
         {"ss": "ss", "clarification": "clarification"},
     )
 
-    # SS 后：无 schema 直接结束
-    def route_after_ss(state: NL2SQLState) -> str:
-        return "cg" if state.get("selected_schema") else END
+    # SS 后：无 schema → END；有 schema → answerability_check 或 CG
+    if answerability_checker is not None:
+        def route_after_ss(state: NL2SQLState) -> str:
+            if not state.get("selected_schema"):
+                return END
+            return "answerability_check"
 
-    graph.add_conditional_edges(
-        "ss", route_after_ss, {"cg": "cg", END: END}
-    )
+        graph.add_conditional_edges(
+            "ss", route_after_ss,
+            {"answerability_check": "answerability_check", END: END},
+        )
+
+        # 可回答性检查条件分支（决策 23）：false → END（拒答），否则 → CG
+        def route_after_answerability(state: NL2SQLState) -> str:
+            check = state.get("answerability_result")
+            if check and check.get("answerable") == "false":
+                return END
+            return "cg"
+
+        graph.add_conditional_edges(
+            "answerability_check",
+            route_after_answerability,
+            {"cg": "cg", END: END},
+        )
+    else:
+        def route_after_ss(state: NL2SQLState) -> str:
+            return "cg" if state.get("selected_schema") else END
+
+        graph.add_conditional_edges(
+            "ss", route_after_ss, {"cg": "cg", END: END},
+        )
 
     # CG 后：无候选直接结束
     def route_after_cg(state: NL2SQLState) -> str:

@@ -195,28 +195,54 @@
 
 ---
 
-### 决策 18：表/列 schema 检索采用「纯语义相似性，每个 keyword 取 top K」
+### 决策 18：表/列 schema 检索采用「按关键词分组召回 + 组内 N-gram 投票精排」
 
-**决策**：放弃此前讨论过的 BM25 / Hybrid RRF 方案。schema 检索逻辑简化为：
+**决策**：schema 检索按原生关键词分组独立召回，每个关键词返回自己的 top 5 列。
 
-- 只检索**列**（不单建表级 collection）。表名作为列文档的附带说明，自然出现在 metadata 中。
-- 对每个 keyword 单独在「列级 collection」做语义向量相似度查询，top K=5。
-- 所有 keyword 的结果合并去重（同 `table.column` 保留最高 score），按 score 排序返回。
-- 不引入 BM25 / RRF / tokenize 等额外组件。
+**流程**：
+
+1. **关键词提取 + 同义词扩写**：LLM 提取若干原生关键词，每个关键词附带中英文同义词（详见决策 21）。关键词按原生 phrase 分组，每组包含 `[phrase, zh_synonyms..., en_synonyms...]`。
+2. **按组独立向量粗召回**：每个关键词组内，对组内所有检索词分别做向量查询 top_k=50，组内取并集（去重）。
+3. **组内 N-gram 投票精排**：在每组并集内，用该组自己的检索词列表做 3-gram 投票，综合向量分数和关键词命中数排序，取 top 5 列。
+4. **跨组汇总**：所有关键词组的 top 5 汇总，重复列只保留一份 M-Schema，但标注来源关键词。
+
+**关键设计**：每个关键词独立返回自己的 top 5 列，保留"哪个关键词召回了哪些列"的来源信息。这使下游 Prompt 能清晰说明每列的召回来源，帮助 LLM 理解用户意图与 schema 的对应关系。
+
+**Prompt 呈现策略**：
+- **关键词召回映射**：列出每个关键词召回的列，让 LLM 知道列的来源
+- **M-Schema**：重复列只出现一次，不重复展示
+
+**示例**：
+```
+关键词召回映射:
+  "学校" → schools.School, schools.CDSCode, schools.City, schools.County, schools.District
+  "各科score" → satscores.AvgScrRead, satscores.AvgScrMath, satscores.AvgScrWrite, satscores.NumTstTakr, satscores.enroll12
+
+M-Schema（去重）:
+  schools: [School, CDSCode, City, County, District]
+  satscores: [AvgScrRead, AvgScrMath, AvgScrWrite, NumTstTakr, enroll12]
+```
 
 **理由**：
-- 用户明确"表列检索就只采用关键词和列描述之间的语义相似性排序"。
-- BIRD schema 描述都是英文且较短，单一向量召回的精度对当前规模足够。
-- 简化架构，减少依赖（无需 rank_bm25 / jieba），降低维护成本。
-- 表的召回通过"列 → 所属表"反推（`enhance_with_schema`），保证表覆盖率。
+- 纯向量检索对字面匹配弱——"score" 应直接命中含 "scores" 的文档，但向量空间偏向语义泛化到 "School"。
+- 扩大 top_k（5→50）保证相关列进入候选集，再通过 n-gram 投票把真正匹配的列提上来。
+- 按关键词分组独立召回，避免不同关键词的召回结果互相干扰（如"学校"的大量召回淹没"score"的结果）。
+- 保留来源信息，下游 LLM 能更准确判断用户意图。
+
+**加权公式**：
+```
+final_score = vector_score × 0.2 + normalized_ngram_vote × 0.8
+```
+其中 `vector_score = 1.0 - distance`，`normalized_ngram_vote` = 该列的 ngram_vote / 组内最大 ngram_vote。
 
 **参数**：
-- `column_top_k_per_keyword = 5`
-- 检索 query：纯 keyword（不拼接原 query 整句），与用户口径一致。
+- `column_top_k_per_keyword = 50`
+- 每组返回 top 10 列
+- 检索词：keyword phrase + 中文同义词 + 英文同义词（全小写），详见决策 21
 
 ---
 
-### 决策 19：列级文档结构 — 全局单 Collection + 字段拼接 + 列名 boost
+### 决策 19：列级文档结构 — 全局单 Collection + 精简 document + 全小写
 
 **决策**：所有数据库的列向量存在**同一个** ChromaDB collection（命名 `nl2sql_columns`），不按库拆分。每列一条记录，通过 `metadata.database` 字段区分归属。
 
@@ -231,22 +257,26 @@
 | 字段       | 内容                                                                          |
 |------------|-------------------------------------------------------------------------------|
 | `id`       | `"{db_id}.{table_name}.{original_column_name}"`                               |
-| `document` | embed 用文本（见下方拼装规则）                                                 |
+| `document` | embed 用文本（见下方拼装规则），**全小写**                                     |
 | `embedding`| BGE-M3 dense 向量（1024 维）                                                  |
 | `metadata` | 完整列上下文：database、表名、原列名、人类可读名、数据类型、描述、值描述、格式、PK/FK 标记、引用关系、样本值字符串 |
 
-**document 拼装规则**（按顺序拼接，空字段跳过，连续空格压缩）：
+**document 拼装规则**（精简三段式，`|` 分隔，全小写）：
 
 ```
-{table_name} {original_column_name} {column_name} {data_type}
-{column_description} {value_description} {data_format}
-{column_name}    ← 末尾再重复一次：boost 列名权重
+{table_name} | {original_column_name} | {desc}
 ```
 
-**`column_name` boost 说明**：
-- BGE-M3 等 dense embedding 模型本质是 token 语义的加权聚合，重复词项会增加该词对最终向量的影响。
-- 重复 `column_name` 一次相当于轻微"加权"，使得用户 query 直接提及列名（如 "AvgScrMath"）时召回更稳。
-- 开销可忽略（仅多 1-3 个 token），最坏退化为中性。
+**desc 优先级**：`column_description` → `value_description` → `column_name`（逐级回退，首个非空者）
+
+**全小写原因**：N-gram 匹配需大小写归一化，"score" 与 "Score" 应视为相同子串。
+
+**示例**：
+```
+satscores | avgscrread | average scores in reading
+schools | cdscode | california department schools
+satscores | rtype | rtype
+```
 
 **metadata 注意事项**：
 - ChromaDB metadata value 只允许 str/int/float/bool，列表必须拼成字符串。
@@ -280,29 +310,52 @@ data/
 
 ---
 
-### 决策 21：检索 query 构造采用「每 keyword 独立检索」
+### 决策 21：检索 query 构造采用「四向同义词扩写 + 每检索词独立检索」
 
-**决策**：列检索时，对 `keywords` 列表中每个 keyword 单独发起一次 `vector_store.query()`，不拼接原始 query 整句。
+**决策**：列检索时，先通过 LLM 对关键词做四向同义词扩写（中文同义词 + 英文翻译 + 英文同义词 + 中文翻译），再对每个检索词独立发起 `vector_store.query(top_k=50)`，中间不去重。
 
-**伪代码**：
+**四向扩写规则**：
+- 中文 phrase → 中文同义词 + 英文翻译
+- 英文 phrase → 英文同义词 + 中文翻译
+- 所有输出全小写
 
+**LLM 输出格式**：
+```json
+{
+  "keywords": [
+    {
+      "phrase": "各科score",
+      "zh_synonyms": ["各科成绩", "每科分数"],
+      "en_synonyms": ["subject score", "course score", "each subject score"]
+    }
+  ]
+}
+```
+
+**扁平化后的检索词列表**（全小写）：
 ```python
-results_pool = []
+query_terms = []
 for kw in keywords:
-    kw_emb = embed(kw)
-    hits = chroma.query(kw_emb, n_results=5)
-    results_pool.extend(hits)
+    query_terms.append(kw["phrase"].lower())
+    query_terms.extend(s.lower() for s in kw["zh_synonyms"])
+    query_terms.extend(s.lower() for s in kw["en_synonyms"])
+```
 
-# 去重：同一 column 多次命中取最高分
-dedup_by_max_score(results_pool)
+**检索逻辑**：
+```python
+all_results = []  # 不去重，全部保留
+for term in query_terms:
+    emb = embed(term)
+    hits = chroma.query(emb, n_results=50)
+    all_results.extend(hits)
 ```
 
 **理由**：
-- 用户明确"每个关键词取前 K 个"。
-- 关键词是 LLM 已提炼出的有效信号，单独检索可避免长 query 中无关词稀释语义。
-- 不同 keyword 对应不同列时，分别检索召回率高于合并检索。
+- 关键词切太碎会丢失语义（"各科score" 拆成 "各科" + "score" 后语义断裂），保留短语 + 同义词扩写可覆盖更多表达。
+- 跨语言扩写解决中文查询 vs 英文描述的语义鸿沟——"成绩" ↔ "score" ↔ "scores"。
+- 全小写确保 n-gram 匹配时大小写不干扰。
 
-**Trade-off**：丢失了 keyword 之间的语境（如否定、量级修饰）。若后续验证发现问题，可叠加一次"原 query 整句"检索作为兜底。
+**短语保留规则**：名词前面的描述性定语、量词等不单独切分。例如"各科score"作为一个整体短语输出，不拆成"各科"和"score"。
 
 ---
 
@@ -317,38 +370,44 @@ dedup_by_max_score(results_pool)
 **主图节点示意**：
 
 ```
-                ┌─────┐
-                │START│
-                └──┬──┘
+                    ┌─────┐
+                    │START│
+                    └──┬──┘
+                       ▼
+                  ┌─────────┐
+                  │ ir_node │  ← InformationRetrievalAgent.run()
+                  └────┬────┘
+                       ▼
+                ┌──────────────┐
+                │clarification │  ← ClarificationAgent.run()（子图）
+                │   _node      │     条件边：clarification_done → ss_node
+                └────┬─────────┘                  否则循环回 clarification
+                     ▼
+                  ┌─────────┐
+                  │ ss_node │  ← SchemaSelectorAgent.run()（子图）
+                  └────┬────┘
+                       ▼
+              ┌─────────────────────┐
+              │answerability_check  │  ← 决策 23：可回答性检查（宽松）
+              │        _node       │     false → END（拒答 + 原因）
+              └────┬────────────────┘     true/uncertain → 继续
                    ▼
-              ┌─────────┐
-              │ ir_node │  ← InformationRetrievalAgent.run()
-              └────┬────┘
-                   ▼
-            ┌──────────────┐
-            │clarification │  ← ClarificationAgent.run()（子图）
-            │   _node      │     条件边：clarification_done → ss_node
-            └────┬─────────┘                  否则循环回 clarification
-                 ▼
-              ┌─────────┐
-              │ ss_node │  ← SchemaSelectorAgent.run()（子图）
-              └────┬────┘
-                   ▼
-              ┌─────────┐
-              │ cg_node │  ← CandidateGeneratorAgent.run()（子图）
-              └────┬────┘
-                   ▼
-              ┌──────────────┐
-              │execution_node│  ← ExecutionAgent.run()
-              └────┬─────────┘     内含错误修正循环子图
-                   ▼
-              ┌─────────────┐
-              │decision_node│  ← SelfConsistencyDecisionAgent.run()
-              └────┬────────┘
-                   ▼
-                ┌─────┐
-                │ END │
-                └─────┘
+                  ┌─────────┐
+                  │ cg_node │  ← CandidateGeneratorAgent.run()（子图）
+                  └────┬────┘
+                       ▼
+                  ┌──────────────┐
+                  │execution_node│  ← ExecutionAgent.run()
+                  └────┬─────────┘     内含错误修正循环子图
+                       ▼
+                  ┌─────────────┐
+                  │decision_node│  ← SelfConsistencyDecisionAgent.run()
+                  │  + 结果验证  │     内含决策 24：结果可信度验证（严格）
+                  └────┬────────┘     不可信 → END（拒答 + 原因）
+                       ▼
+                    ┌─────┐
+                    │ END │
+                    └─────┘
 ```
 
 **典型子图示例：IR Agent 内部**
@@ -419,6 +478,172 @@ dedup_by_max_score(results_pool)
 
 ---
 
+### 决策 23：可回答性检查节点（Answerability Check）— SS 后、CG 前
+
+**决策**：在 SS 与 CG 之间新增 `answerability_check` 节点，用 LLM 判断当前 schema 是否有足够信息回答用户问题。
+
+**宽松原则**：宁可放过，不误杀。只有在**明确**缺少关键实体或粒度严重不匹配时才拦截。`uncertain` 一律放行。
+
+**输入**：
+- 用户原始问题 (`user_query`)
+- SS 输出的 MSchema（表名、列名、数据类型、description、sample_values、PK/FK 关系）
+- IR 的 keywords、lsh_hit_count、vector_top_scores
+
+**LLM 返回结构**：
+```json
+{
+  "answerable": "true" | "false" | "uncertain",
+  "confidence": 0.0-1.0,
+  "reason": "判断理由",
+  "missing_info": "缺少什么信息（如果 false/uncertain）",
+  "granularity_match": "粒度是否匹配的说明"
+}
+```
+
+**路由规则**：
+- `answerable == "true"` 或 `"uncertain"` → 继续 CG
+- `answerable == "false"` → 拒答，将 `reason` 写入 `rejection_reason`，流程跳转到 END
+
+**理由**：
+- NL2SQL 系统中 LLM 在信息不足时会"硬凑"——用近似字段替代用户真正要的字段，导致答非所问。
+- 提前拦截可省去后续 CG + Exec 阶段的 LLM 调用成本（~30-120s），用一次轻量判断（~2-3s）替代。
+- 宽松原则降低误拒风险：`uncertain` 放行是因为 LLM 有时过度谨慎，实际生成 SQL 时可能发现可行方案。
+
+**风险与缓解**：
+- **误拒（false negative）**：LLM 判断不可回答但实际可以 → 宽松原则 + uncertain 放行降低此风险。
+- **漏判（false positive）**：LLM 判断可回答但实际不行 → 由下游决策 B（结果验证）兜底。
+
+---
+
+### 决策 24：结果可信度验证（Result Verification）— 增强决策节点
+
+**决策**：在决策节点选定最终 SQL 后，增加一步严格的"结果可信度验证"。检查生成的 SQL 是否真正在回答用户的问题，而非答非所问。
+
+**严格原则**：宁可多拒，不放过答非所问。这是最后一道防线。
+
+**输入**：
+- 用户原始问题 (`user_query`)
+- 最终选定的 SQL (`selected_sql`)
+- SQL 执行结果的列名 + 前 5 行样例
+- 原始 MSchema（用于对照）
+
+**LLM 检查维度**：
+1. **粒度匹配**：SQL 查询的粒度是否与问题匹配（如问"每个学生"但 SQL 查的是"每个学校"）
+2. **维度覆盖**：结果列是否覆盖了问题中请求的维度（如问"姓名+分数"但结果只有分数）
+3. **硬凑检测**：是否存在用近似字段替代了用户真正要的字段（如用"School"替代"学生姓名"）
+
+**LLM 返回结构**：
+```json
+{
+  "trustworthy": "true" | "false",
+  "reason": "验证理由",
+  "granularity_match": "粒度对齐说明",
+  "semantic_alignment": "语义对齐说明"
+}
+```
+
+**路由规则**：
+- `trustworthy == "true"` → 正常返回结果
+- `trustworthy == "false"` → 拒答，将 `reason` 写入 `rejection_reason`，流程跳转到 END
+
+**理由**：
+- 方案 A（可回答性检查）宽松放行后，部分"看起来能答但实际答非所问"的情况需要兜底。
+- 这是用户能看到的最后一道关卡，必须严格。答非所问比拒答对用户伤害更大——拒答至少诚实，答非所问会误导。
+- 基于实际执行结果判断，信息比方案 A 更充分，准确率更高。
+
+**与方案 A 的关系**：
+- A 是"快筛"：低成本早期拦截明显的不可回答
+- B 是"精验"：高成本严格验证，兜底 A 漏过的情况
+- 两者互补，形成双重保障
+
+---
+
+### 决策 25：N-gram 投票精排 — 按关键词组内独立投票
+
+**决策**：在向量粗召回之后，按原生关键词分组进行 3-gram 子串匹配投票，每组独立排序返回 top 5。
+
+**问题背景**：纯向量检索对字面匹配弱——"score" 查询时，`schools | school | school` 的向量距离（0.405）反而比 `satscores | avgscrmath | average scores in math`（0.440）更近，因为短文档向量更集中。但 "score" 应直接命中含 "scores" 的文档。
+
+**分组投票逻辑**：
+
+```python
+for keyword_group in keyword_groups:
+    # keyword_group = {"phrase": "各科score", "terms": ["各科score", "各科成绩", "subject score", ...]}
+    
+    # 1. 该组所有 terms 各自查 top50，取并集
+    candidates = union_of_all_term_results(keyword_group["terms"])
+    
+    # 2. 组内 N-gram 投票（只用本组的 terms）
+    for candidate in candidates:
+        vote = ngram_vote_score(candidate.document, keyword_group["terms"], n=3)
+        final_score = candidate.vector_score * 0.2 + normalized_vote * 0.8
+    
+    # 3. 该组 top 5 列
+    group_top5 = sorted(candidates, by=final_score)[:5]
+```
+
+**N-gram 投票函数**：
+
+```python
+def ngram_vote_score(document: str, query_terms: list, n: int = 3) -> float:
+    """
+    只对 query_terms 做 n-gram 拆解，在 document 原文中统计每个 n-gram 的出现次数。
+    document 不拆解，避免 '|' 分隔符产生噪声 n-gram。
+
+    计分方式：累加所有 term 的所有 n-gram 在 document 中的出现次数。
+    例如 "school" 的 "sch" 在 document 中出现 2 次 → 贡献 2 分。
+    """
+    total_hits = 0
+    for term in query_terms:
+        term_ngrams = _char_ngrams(term, n)
+        for ng in term_ngrams:
+            total_hits += document.count(ng)
+    return float(total_hits)
+```
+
+**不除以 terms 总数**：当前架构按关键词分组独立召回，组内排序时除以常数不影响排序结果，跨组汇总时也不做排名比较，因此无需归一化。
+
+**综合排序**：
+```python
+final_score = vector_score * 0.2 + normalized_ngram_vote * 0.8
+```
+
+- `vector_score = 1.0 - distance`
+- `normalized_ngram_vote = ngram_vote / max_ngram_vote_in_group`
+- 向量相似度权重不超过 0.2，关键词匹配为主导信号
+
+**跨组汇总**：
+- 所有组的 top 5 汇总
+- 重复列（被多个关键词召回）只保留一份 M-Schema，但标注来源关键词
+- Prompt 中同时展示"关键词→列"映射关系和去重后的 M-Schema
+
+**示例**：
+
+```
+查询: "各个学校的各科score"
+关键词组:
+  "学校" → terms: [学校, 院校, school, schools]
+  "各科score" → terms: [各科score, 各科成绩, subject score, course score]
+
+组1 "学校" 的 top5:
+  schools.School, schools.CDSCode, schools.City, schools.County, schools.District
+
+组2 "各科score" 的 top5:
+  satscores.AvgScrRead, satscores.AvgScrMath, satscores.AvgScrWrite,
+  satscores.NumTstTakr, satscores.enroll12
+
+→ 无重复列，两组结果直接合并
+→ Prompt 中分别标注来源关键词
+```
+
+**理由**：
+- 按关键词分组避免"学校"的大量召回淹没"score"的结果——这正是之前全局 top5 方案的核心问题。
+- 组内投票只用本组同义词，投票信号更精准（"school"不会干扰"score"组的投票）。
+- 每个关键词独立返回 top 5，保留来源信息，下游 LLM 能更好理解用户意图与 schema 的对应关系。
+- 全小写 + n-gram 归一化，避免大小写差异导致漏匹配。
+
+---
+
 ## 触发条件详细规约
 
 | 条件 ID | 名称 | 检测逻辑 | 是否触发搜索 |
@@ -445,6 +670,10 @@ src/
 │   ├── web_search.py           # WebSearchEnricher：Tavily 调用 + 会话缓存
 │   ├── question_generator.py   # QuestionGenerator：LLM 生成反问
 │   └── dialog.py               # UserDialog：interrupt + 循环
+├── verification/
+│   ├── __init__.py
+│   ├── answerability.py        # AnswerabilityChecker：可回答性检查（决策 23）
+│   └── result_verifier.py      # ResultVerifier：结果可信度验证（决策 24）
 └── memory/
     ├── __init__.py
     ├── user_memory.py          # UserMemory 主类
@@ -463,6 +692,7 @@ graph = StateGraph(NL2SQLState)
 graph.add_node("ir", retrieval_node)
 graph.add_node("clarification", clarification_node)  # 新增
 graph.add_node("ss", schema_selection_node)
+graph.add_node("answerability_check", answerability_check_node)  # 决策 23
 graph.add_node("cg", candidate_generation_node)
 
 graph.add_edge("ir", "clarification")
@@ -470,7 +700,17 @@ graph.add_conditional_edges(
     "clarification",
     lambda s: "ss" if s["clarification_done"] else "clarification",  # 反问循环
 )
-graph.add_edge("ss", "cg")
+graph.add_edge("ss", "answerability_check")
+graph.add_conditional_edges(
+    "answerability_check",
+    lambda s: "cg" if s.get("answerability_result", {}).get("answerable") != "false" else END,  # 拒答
+)
+graph.add_edge("cg", "execution")
+# decision 内含结果可信度验证（决策 24），不可信 → END
+graph.add_conditional_edges(
+    "decision",
+    lambda s: END,  # 无论可信/不可信都到 END，但不可信时 state 中有 rejection_reason
+)
 ```
 
 `NL2SQLState` 需新增字段：
@@ -482,6 +722,9 @@ class NL2SQLState(TypedDict):
     clarified_keywords: Dict[str, str]  # 澄清后的关键词映射
     web_search_cache: Dict[str, Any]    # 会话内搜索缓存
     user_id: str                        # 用户标识
+    answerability_result: Optional[Dict]  # 可回答性检查结果（决策 23）
+    result_verification: Optional[Dict]   # 结果可信度验证结果（决策 24）
+    rejection_reason: Optional[str]       # 拒答原因（A 或 B 填入）
 ```
 
 ---
@@ -519,3 +762,13 @@ class NL2SQLState(TypedDict):
 | 记忆文件损坏 | 写入采用「先写临时文件 + 原子 rename」+ 备份上次版本 |
 | LLM 误判触发条件 | TriggerDetector 提供配置开关，可逐项关闭 |
 | 反问粒度不自然 | QuestionGenerator 的 Prompt 中提供粗/细粒度示例，并要求 LLM 解释选择理由（日志记录） |
+
+**可回答性验证相关风险与缓解**：
+
+| 风险 | 缓解方案 |
+|------|----------|
+| 方案 A 误拒（false negative） | 宽松原则 + uncertain 放行；可配置 `answerability_strictness` 控制阈值 |
+| 方案 A 漏判（false positive） | 由方案 B（结果验证）兜底，双重保障 |
+| 方案 B 过严导致正常查询被拒 | Prompt 中强调"只有明确答非所问才判不可信"；可通过配置 `verification_strictness` 调整 |
+| 两次 LLM 调用增加延迟 | 方案 A 拦截时反而省时间（~2-3s vs ~30-120s）；方案 B 只在最终决策后调用一次 |
+| 拒答用户体验差 | 拒答时返回详细原因 + 缺失信息说明，让用户知道为什么无法回答 |

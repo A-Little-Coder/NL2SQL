@@ -39,6 +39,9 @@ conda-env.yaml
 # Data files
 data/
 
+# User memory files (persisted between sessions)
+data/user_memory/*.json
+
 # Vector store
 vector_store/
 

@@ -3,8 +3,9 @@
 
 验证：
 - 主图能从 START 跑到 END
-- 状态在节点间正确流动（IR → SS → CG → Execution → Decision）
-- 条件边：SS 无 schema 时短路、CG 无候选时短路
+- 状态在节点间正确流动（IR → SS → AnswerabilityCheck → CG → Execution → Decision）
+- 条件边：SS 无 schema 时短路、AnswerabilityCheck 拒答时短路、CG 无候选时短路
+- Decision 结果验证不可信时写入 rejection_reason
 """
 
 import sys
@@ -83,6 +84,7 @@ def _build_complete_mocks(success_path=True):
         ),
     })
     decider.build_graph = MagicMock(return_value=dec_graph)
+    decider.result_verifier = None  # 默认无结果验证器
 
     return retriever, selector, generator, fix_loop, decider
 
@@ -176,3 +178,132 @@ def test_main_graph_state_initial_values():
     assert s["clarification_count"] == 0
     assert s["clarification_done"] is True
     assert s["error"] is None
+
+
+# ============================================================================
+# 可回答性检查（决策 23）测试
+# ============================================================================
+
+def test_main_graph_with_answerability_check_pass():
+    """AnswerabilityCheck 放行时正常走完流程"""
+    from src.graph import build_main_graph, create_initial_state
+    from src.verification.answerability import AnswerabilityResult
+
+    retr, sel, gen, fix, dec = _build_complete_mocks(success_path=True)
+    checker = MagicMock()
+    checker.check = MagicMock(return_value=AnswerabilityResult(
+        answerable="true", confidence=0.9, reason="OK",
+    ))
+
+    graph = build_main_graph(retr, sel, gen, fix, dec,
+                             answerability_checker=checker)
+    state = create_initial_state(user_query="查询")
+    result = graph.invoke(state)
+
+    assert result["final_sql"] == "SELECT * FROM t"
+    assert result["answerability_result"]["answerable"] == "true"
+    log = " ".join(result.get("trace_log", []))
+    assert "AnswerabilityCheck" in log
+
+
+def test_main_graph_with_answerability_check_reject():
+    """AnswerabilityCheck 拒答时主图直接 END，不进 CG"""
+    from src.graph import build_main_graph, create_initial_state
+    from src.verification.answerability import AnswerabilityResult
+
+    retr, sel, gen, fix, dec = _build_complete_mocks(success_path=True)
+    checker = MagicMock()
+    checker.check = MagicMock(return_value=AnswerabilityResult(
+        answerable="false", confidence=0.9,
+        reason="数据粒度不匹配：问学生但只有学校级别数据",
+        missing_info="学生粒度数据",
+        granularity_match="mismatch",
+    ))
+
+    graph = build_main_graph(retr, sel, gen, fix, dec,
+                             answerability_checker=checker)
+    state = create_initial_state(user_query="每个学生的成绩")
+    result = graph.invoke(state)
+
+    # 不应进入 CG / Execution / Decision
+    gen.build_graph.assert_not_called()
+    fix.build_graph.assert_not_called()
+    dec.build_graph.assert_not_called()
+    # 拒答原因
+    assert result.get("rejection_reason") is not None
+    assert result["answerability_result"]["answerable"] == "false"
+
+
+def test_main_graph_answerability_uncertain_passes():
+    """AnswerabilityCheck 返回 uncertain 时放行"""
+    from src.graph import build_main_graph, create_initial_state
+    from src.verification.answerability import AnswerabilityResult
+
+    retr, sel, gen, fix, dec = _build_complete_mocks(success_path=True)
+    checker = MagicMock()
+    checker.check = MagicMock(return_value=AnswerabilityResult(
+        answerable="uncertain", confidence=0.5, reason="不确定",
+    ))
+
+    graph = build_main_graph(retr, sel, gen, fix, dec,
+                             answerability_checker=checker)
+    state = create_initial_state(user_query="可能能查")
+    result = graph.invoke(state)
+
+    # 应走完整个流程
+    assert result["final_sql"] == "SELECT * FROM t"
+
+
+# ============================================================================
+# 结果可信度验证（决策 24）测试
+# ============================================================================
+
+def test_main_graph_decision_result_verification_reject():
+    """Decision 结果验证不可信时写入 rejection_reason，清空最终结果"""
+    from src.graph import build_main_graph, create_initial_state
+    from src.verification.result_verifier import VerificationResult
+
+    retr, sel, gen, fix, dec = _build_complete_mocks(success_path=True)
+    verifier = MagicMock()
+    verifier.verify = MagicMock(return_value=VerificationResult(
+        trustworthy="false",
+        reason="SQL 查学校但问学生，粒度不匹配",
+        granularity_match="mismatch",
+        semantic_alignment="misaligned",
+    ))
+    dec.result_verifier = verifier
+
+    graph = build_main_graph(retr, sel, gen, fix, dec)
+    state = create_initial_state(user_query="每个学生的成绩")
+    result = graph.invoke(state)
+
+    # 结果被拒绝
+    assert result.get("rejection_reason") is not None
+    assert "不可信" in result["rejection_reason"]
+    assert result["final_sql"] == ""
+    assert result["final_result"] is None
+    assert result["result_verification"]["trustworthy"] == "false"
+
+
+def test_main_graph_decision_result_verification_pass():
+    """Decision 结果验证可信时正常返回"""
+    from src.graph import build_main_graph, create_initial_state
+    from src.verification.result_verifier import VerificationResult
+
+    retr, sel, gen, fix, dec = _build_complete_mocks(success_path=True)
+    verifier = MagicMock()
+    verifier.verify = MagicMock(return_value=VerificationResult(
+        trustworthy="true",
+        reason="SQL 与问题对齐",
+        granularity_match="aligned",
+        semantic_alignment="aligned",
+    ))
+    dec.result_verifier = verifier
+
+    graph = build_main_graph(retr, sel, gen, fix, dec)
+    state = create_initial_state(user_query="各校平均分")
+    result = graph.invoke(state)
+
+    assert result["final_sql"] == "SELECT * FROM t"
+    assert result["result_verification"]["trustworthy"] == "true"
+    assert result.get("rejection_reason") is None

@@ -29,53 +29,34 @@ class SchemaColumnDocGenerator:
     def format_column_document(
         table_name: str,
         original_column_name: str,
-        column_name: str,
-        data_type: str = None,
+        column_name: str = None,
         column_description: str = None,
         value_description: str = None,
-        data_format: str = None,
         **kwargs
     ) -> str:
         """
         生成列文档文本（用于向量化）
 
+        格式: {table_name} | {original_column_name} | {desc}
+        desc 优先级: column_description → value_description → column_name
+
         Args:
             table_name: 表名
             original_column_name: 原始列名
-            column_name: 人类可读列名（可能含中文）
-            data_type: 数据类型
+            column_name: 人类可读列名（回退用）
             column_description: 列描述
             value_description: 值描述
-            data_format: 数据格式
-            **kwargs: 其他（备用）
+            **kwargs: 其他（忽略）
 
         Returns:
             str: 拼接后的文档文本
         """
-        parts = []
+        # desc 优先级: column_description → value_description → column_name
+        desc = column_description or value_description or column_name or original_column_name or ""
+        desc = desc.replace("\n", " ").replace("\r", " ").strip()
 
-        # 按决策19顺序拼接
-        if table_name:
-            parts.append(table_name)
-        if original_column_name:
-            parts.append(original_column_name)
-        if column_name:
-            parts.append(column_name)
-        if data_type:
-            parts.append(data_type)
-        if column_description:
-            parts.append(column_description)
-        if value_description:
-            parts.append(value_description)
-        if data_format:
-            parts.append(data_format)
-
-        # 末尾 boost 再放一次 column_name
-        if column_name:
-            parts.append(column_name)
-
-        # 用空格连接，换行替换为空格
-        doc = " ".join(parts).replace("\n", " ").replace("\r", " ")
+        parts = [p for p in [table_name, original_column_name, desc] if p]
+        doc = " | ".join(parts).lower()
         return doc
 
     @staticmethod
@@ -163,6 +144,9 @@ class SchemaColumnDocGenerator:
         orig_col_name = original_column_name or col_name
         data_type = col_schema.get("type", "TEXT")
         desc = col_schema.get("description", "")
+        column_name = col_schema.get("column_name", "") or desc or col_name
+        value_desc = col_schema.get("value_description", "")
+        data_format = col_schema.get("data_format", "")
         is_pk = col_schema.get("primary_key", False)
 
         sample_vals = col_schema.get("sample_values", [])
@@ -176,20 +160,22 @@ class SchemaColumnDocGenerator:
         doc = SchemaColumnDocGenerator.format_column_document(
             table_name=table_name,
             original_column_name=orig_col_name,
-            column_name=desc or col_name,
+            column_name=column_name,
             data_type=data_type,
             column_description=desc,
-            value_description="",  # connector schema 暂时不带此字段
-            data_format="",
+            value_description=value_desc,
+            data_format=data_format,
         )
 
         meta = SchemaColumnDocGenerator.build_column_metadata(
             database=database,
             table_name=table_name,
             original_column_name=orig_col_name,
-            column_name=desc or col_name,
+            column_name=column_name,
             data_type=data_type,
             column_description=desc,
+            value_description=value_desc,
+            data_format=data_format,
             is_primary_key=is_pk,
             is_foreign_key=is_fk,
             references=references,
