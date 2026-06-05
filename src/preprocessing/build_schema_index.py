@@ -186,6 +186,12 @@ def build_schema_index_for_db(db_id: str, data_dir: str = None,
     ok = vector_store.add_embeddings(chroma_items)
     if ok:
         logger.success(f"{db_id} 追加完成: {len(chroma_items)} 个列")
+        # 构建完成后自动写入 Manifest
+        try:
+            from src.preprocessing.manifest import write_manifest_for_db
+            write_manifest_for_db(db_id, data_dir, module="schema_index")
+        except Exception as e:
+            logger.warning(f"写入 Manifest 失败 ({db_id}): {e}")
     return ok
 
 

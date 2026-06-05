@@ -644,6 +644,224 @@ final_score = vector_score * 0.2 + normalized_ngram_vote * 0.8
 
 ---
 
+### 决策 26：表关联图（Schema Relationship Graph）— 预处理阶段构建 + 召回时注入 JOIN 路径
+
+**决策**：在预处理阶段为每个数据库构建表关联图（JSON 邻接表），包含显式 FK 和隐式关联（向量相似度匹配 + 值命中率检测 + LLM 辅助）。IR 召回后，根据召回的表集合从图中提取 JOIN 路径和连接键，注入 Prompt。
+
+**问题背景**：IR 召回了多个表的列，但 LLM 不知道表之间如何关联。例如 `satscores.cds = schools.CDSCode` 这个 JOIN 条件，Prompt 里没有体现，LLM 可能生成错误的 JOIN 或直接笛卡尔积。
+
+**隐式关联检测流水线**：
+
+```
+Stage 1: 显式 FK（已有）
+  PRAGMA foreign_key_list → 直接提取
+
+Stage 2: 向量相似度匹配 + 值命中率检测
+  对每对未被 Stage 1 连接的表:
+  1. 利用已有 ChromaDB 向量库，计算跨表列的向量余弦相似度
+     - 每个列的 document 已有 embedding，无需重新编码
+     - 对表 A 的每个列，在表 B 的所有列中检索最相似的列
+  2. 取相似度最高的 top 3 列对作为候选
+  3. 对每个候选列对做值命中率检测：
+     - 从表 A 的列取 N 个 DISTINCT 值（默认 20）
+     - 检查这些值在表 B 的列中有多少能匹配到
+     - 命中率 = 匹配数 / 样本数
+     - 命中率超过阈值（默认 0.5）→ 确认为隐式关联，输出为 join_key
+  4. 支持多连接键：两个表间可存在多个 join_key
+     （如同时有 school_id 和 school_name 都匹配）
+
+Stage 3: LLM 辅助（覆盖死角）
+  对 Stage 1-2 都没发现关联的孤立表:
+  - 把两表的 schema + sample_values 喂给 LLM
+  - 让 LLM 判断是否可能存在 JOIN 关系
+  - LLM 返回的 join_keys 也需要经过命中率检测验证（防止 LLM 幻觉）
+  - 成本高但能发现规则漏掉的关系
+```
+
+**为什么用命中率而非 Jaccard**：
+- Jaccard 要求双方各自取样的值有交集，对大表而言两边各取 20 个值交集概率极低
+- 命中率只需验证"表 A 的值在表 B 中是否存在"，即使表 B 有百万行也能准确判断
+- SQL 实现：`SELECT COUNT(*) FROM (SELECT DISTINCT col_a FROM table_a LIMIT N) WHERE col_a IN (SELECT DISTINCT col_b FROM table_b)`
+
+**存储结构（JSON 邻接表）**：
+
+```json
+{
+  "california_schools": {
+    "nodes": {
+      "schools": {"columns": ["CDSCode", "School", ...]},
+      "satscores": {"columns": ["cds", "AvgScrRead", ...]},
+      "frpm": {"columns": ["CDSCode", "SchoolName", ...]}
+    },
+    "edges": [
+      {
+        "from": "satscores",
+        "to": "schools",
+        "join_keys": [["satscores.cds", "schools.CDSCode"]],
+        "type": "explicit_fk"
+      },
+      {
+        "from": "frpm",
+        "to": "schools",
+        "join_keys": [
+          ["frpm.CDSCode", "schools.CDSCode"],
+          ["frpm.SchoolName", "schools.School"]
+        ],
+        "type": "vector_similarity"
+      }
+    ]
+  }
+}
+```
+
+**edge.type 取值**：
+- `explicit_fk`：PRAGMA 外键
+- `vector_similarity`：向量匹配 + 命中率检测通过
+- `llm_inferred`：LLM 辅助推断 + 命中率检测通过
+
+**运行时 JOIN 路径提取**：
+1. IR 召回后，收集所有涉及的表名
+2. 在图上对这些表做 BFS，找两两之间的**最短路径**（多条路径时取最短）
+3. 提取路径上的 edge 及 join_keys
+4. 识别桥接表（路径中出现但不在 IR 召回表集合中的表）
+5. 桥接表的 M-Schema 自动补充到 `RetrievedContext` 中
+6. 格式化为 Prompt 片段
+
+**桥接表处理**：当两个 IR 召回的表之间没有直接边，需要经过第三个表才能 JOIN 时，该中间表为桥接表。桥接表虽然未被关键词召回，但 JOIN 必须依赖它，因此需要：
+- 从向量库中查询桥接表的所有列，补充到 `RetrievedContext.columns`
+- 补充桥接表到 `RetrievedContext.tables`
+- Prompt 中标注桥接表
+
+**Prompt 注入示例**：
+```
+表关联:
+  schools ←[satscores.cds = schools.CDSCode]→ satscores
+  schools ←[frpm.CDSCode = schools.CDSCode, frpm.SchoolName = schools.School]→ frpm
+
+JOIN 条件:
+  satscores JOIN schools ON satscores.cds = schools.CDSCode
+  frpm JOIN schools ON frpm.CDSCode = schools.CDSCode AND frpm.SchoolName = schools.School
+
+桥接表: schools
+```
+
+**存储位置**：`data/preprocessed/schema_graphs/{db_id}.json`
+
+---
+
+### 决策 27：预处理增量更新 — Manifest 快照对比 + 按依赖顺序增量重建
+
+**决策**：为三个预处理模块（Schema Index / Schema Graph / LSH Index）提供统一的增量更新能力，通过 Manifest 快照对比检测 schema 变更，按依赖顺序执行增量更新。
+
+**问题背景**：当前三个预处理模块只支持全量重建。当数据库发生 DDL 变更（新增/删除表、增删列、修改列类型）时，必须重跑全量构建脚本，耗时长且浪费计算。实际场景中数据库变更较频繁，需要增量更新能力。
+
+**Manifest 快照**：
+
+存储位置：`data/preprocessed/manifest.json`
+
+```json
+{
+  "version": 1,
+  "last_updated": "2026-06-05T10:30:00",
+  "databases": {
+    "california_schools": {
+      "schema_index_build_time": "2026-06-05T10:00:00",
+      "schema_graph_build_time": "2026-06-05T10:05:00",
+      "lsh_index_build_time": null,
+      "tables": {
+        "schools": {
+          "columns": {
+            "SchoolId": {"type": "INTEGER", "is_fk": false},
+            "CDSCode": {"type": "TEXT", "is_fk": true, "references": "satscores.cds"}
+          }
+        },
+        "satscores": {
+          "columns": {
+            "cds": {"type": "TEXT", "is_fk": false}
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+columns 使用对象（而非列表）存储，方便按列名快速 diff。全量构建完成后自动写入 Manifest，增量更新以此为基准。
+
+**三模块独立 build_time**：每个预处理模块有独立的 `build_time`（`schema_index_build_time` / `schema_graph_build_time` / `lsh_index_build_time`），各构建脚本只写自己的时间戳。`null` 表示该模块尚未构建。增量更新时可根据各模块的 `build_time` 判断是否需要全量构建。
+
+**依赖顺序与级联触发**：
+
+```
+① Schema Index (ChromaDB)  ← 必须先执行，Schema Graph Stage 2 依赖列向量
+② Schema Graph (JSON)      ← 依赖 Schema Index
+③ LSH Index (Pickle)       ← 独立，但逻辑上在 schema 稳定后执行
+```
+
+任何一步失败则停止，保持一致性。
+
+关键依赖规则：
+- Schema Graph 依赖 Schema Index：如果 Schema Index 尚未构建（`build_time == null`），Schema Graph 不能运行，必须先构建 Schema Index
+- Schema Index 发生变更 → Schema Graph 需要重新处理（即使自身 diff 为空，因为依赖的向量已变）
+- LSH Index 独立：不受其他模块变更影响，仅根据自身 diff 决定是否更新
+
+各模块增量判断逻辑：
+
+| 模块 | build_time == null | 上游有变更 | diff 有变更 | 动作 |
+|------|-------------------|-----------|------------|------|
+| Schema Index | 是 | — | — | 全量构建 |
+| Schema Index | 否 | — | 是 | 增量更新 |
+| Schema Index | 否 | — | 否 | 跳过 |
+| Schema Graph | 是 | — | — | 全量构建（前提：Schema Index 已构建） |
+| Schema Graph | 是 | — | — | 跳过 + 警告（Schema Index 未构建） |
+| Schema Graph | 否 | 是（Index 变了） | — | 重新处理 |
+| Schema Graph | 否 | 否 | 是 | 增量更新 |
+| Schema Graph | 否 | 否 | 否 | 跳过 |
+| LSH Index | 是 | — | — | 全量构建 |
+| LSH Index | 否 | — | 是 | 增量更新 |
+| LSH Index | 否 | — | 否 | 跳过 |
+
+**Diff → Action 映射**：
+
+| 变更类型 | Schema Index | Schema Graph | LSH Index |
+|----------|-------------|--------------|-----------|
+| 新增表 T | upsert T 所有列 | T vs 所有表做 Stage 1/2/3 | 重建 T 的 MinHash |
+| 删除表 T | delete T 所有列 | 删 T 的 node + 相关边 | 删除 T 的所有 key |
+| 表 T 新增列 | upsert 单列 | 只对 T 与未连接表做 S2 匹配 | TEXT 列则加入 MinHash |
+| 表 T 删除列 | delete 单列 | 清理含该列的 join_key；边保留（≥1 个 join_key 即存续） | 移除该列的 key |
+| 表 T 修改列类型 | upsert 覆盖 | 重验证受影响的 join_key 类型兼容性 | 值变化则重建列 |
+
+**Schema Graph 增量核心逻辑**：
+
+- **已有连接的表**：新增列不影响已有关系，跳过
+- **未连接的表**：新增列可能带来新的连接机会，只拿新增列的向量去 ChromaDB 匹配
+- **删除列**：检查该列是否参与了 join_key，是则移除该 join_key；边至少保留一个 join_key 即可存续
+
+**LSH Index 增量策略**：表级重建（而非行级修改）
+
+- 原因：MinHashLSH 的 pickle 序列化对大索引开销 ≈ 重建；单表 MinHash 计算通常几秒
+- 新增表 → 重建该表的 MinHash，insert 到 LSH
+- 删除表 → 从 LSH 中 remove 该表所有 key
+- 修改表 → 先 remove 旧 key，再 insert 新 key
+
+**统一入口**：
+
+```python
+from src.preprocessing.incremental_updater import IncrementalUpdater
+
+updater = IncrementalUpdater(data_dir="data")
+report = updater.update(db_id="california_schools")
+
+# 全量扫描所有库
+reports = updater.update_all()
+```
+
+**遗留项**：
+
+- 列值的变化不体现在 Manifest 中（只记录 schema 级信息）。LSH 索引和命中率验证的缓存结果可能因此过期，需通过定期全量重建兜底。未来可考虑记录行数/count hash 等轻量指纹做值级变化检测。
+
+---
+
 ## 触发条件详细规约
 
 | 条件 ID | 名称 | 检测逻辑 | 是否触发搜索 |

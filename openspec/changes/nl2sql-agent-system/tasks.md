@@ -58,24 +58,133 @@
   - 短语保留规则：名词前的描述性定语、量词不单独切分（如"各科score"作为一个短语）
   - 所有输出全小写
 - [x] 3.10.2 修改 `extract_keywords()` 解析新格式，返回结构化的关键词 + 同义词列表
-- [ ] 3.10.3 修改 `extract_keywords()` 返回结构化分组（决策 18 改造）：
+- [x] 3.10.3 修改 `extract_keywords()` 返回结构化分组（决策 18 改造）：
   - 返回 `List[KeywordGroup]`，每个 KeywordGroup 包含 `phrase`（原生关键词）和 `terms`（phrase + zh_synonyms + en_synonyms 扁平列表）
   - 下游 `retrieve_schema()` 按分组独立召回
-- [ ] 3.10.4 修改 `retrieve_schema()` 为按关键词分组独立召回（决策 18/25 改造）：
+- [x] 3.10.4 修改 `retrieve_schema()` 为按关键词分组独立召回（决策 18/25 改造）：
   - 输入改为 `List[KeywordGroup]`
-  - 每个关键词组：组内所有 terms 各自查 top50 → 取并集 → 组内 n-gram 投票 → 取 top5
-  - 返回 `Dict[str, List[RetrievedItem]]`，key 为原生关键词 phrase，value 为该组的 top5 列
-- [ ] 3.10.5 修改 `retrieve()` 流程适配分组返回结构：
+  - 每个关键词组：组内所有 terms 各自查 top50 → 取并集 → 组内 n-gram 投票 → 取 top10
+  - 返回 `Dict[str, List[RetrievedItem]]`，key 为原生关键词 phrase，value 为该组的 top10 列
+- [x] 3.10.5 修改 `retrieve()` 流程适配分组返回结构：
   - 跨组汇总所有列，重复列去重但标注来源关键词
   - `RetrievedContext` 中保留关键词→列的映射关系（新增 `keyword_columns_map` 字段）
 - [x] 3.10.6 修改 `schema_doc_generator.py` 的 `format_column_document()` 输出全小写（决策 19）
 - [x] 3.10.7 重建 ChromaDB 索引（document 全小写 + 三段式格式）
-- [ ] 3.10.8 更新 `tests/retrieval/test_information_retriever.py`：
+- [x] 3.10.8 更新 `tests/retrieval/test_information_retriever.py`：
   - 测试 KeywordGroup 结构化返回
   - 测试分组独立召回（组内投票、组间不干扰）
   - 测试 N-gram 投票函数
   - 测试综合排序逻辑（vector 权重 ≤ 0.2）
   - 测试全小写 document 匹配
+
+## 3.11 表关联图（Schema Relationship Graph，决策 26）
+
+- [x] 3.11.1 创建 `src/preprocessing/schema_graph_builder.py`，实现 `SchemaGraphBuilder` 类：
+  - `__init__(db_connector, vector_store, llm_client, value_overlap_threshold, top_similar_pairs, sample_size)`
+  - `build(db_id) -> dict` 返回完整图结构
+  - `save(graph, output_path)` / `load(path)` 持久化
+  - `extract_join_paths(graph, table_names)` 运行时 BFS 路径提取
+  - `format_join_paths_for_prompt(join_paths)` 格式化 Prompt
+- [x] 3.11.2 实现 Stage 1：显式 FK 提取
+  - PRAGMA foreign_key_list → `explicit_fk` 类型 edge
+  - 多 FK 指向同一表合并为一个 edge，多个 join_keys
+- [x] 3.11.3 实现 Stage 2：向量相似度匹配 + 值命中率检测
+  - 从 ChromaDB 获取列 embedding，计算跨表列余弦相似度
+  - 取 top 3 相似列对作为候选
+  - 值命中率检测：从表 A 列取 N 个 DISTINCT 值，检查在表 B 列中的匹配数
+  - 命中率 = 匹配数 / 样本数，超过阈值（默认 0.5）确认为 join_key
+  - 支持多连接键，类型兼容性检查
+  - 生成 `vector_similarity` 类型 edge
+- [x] 3.11.4 实现 Stage 3：LLM 辅助
+  - 对孤立表对，用 LLM 判断 JOIN 关系
+  - 生成 `llm_inferred` 类型 edge
+- [x] 3.11.5 实现 JSON 邻接表存储（`data/preprocessed/schema_graphs/{db_id}.json`）
+- [x] 3.11.6 实现构建脚本 `src/preprocessing/build_schema_graphs.py`
+- [x] 3.11.7 IR 模块集成：`RetrievedContext` 新增 `join_paths` 和 `join_paths_text` 字段
+  - `retrieve()` 中 `_inject_join_paths()` 自动加载图并注入 JOIN 条件
+- [x] 3.11.8 编写单元测试 `tests/preprocessing/test_schema_graph_builder.py`（30 个用例）
+- [ ] 3.11.9 修复值验证方法：Jaccard → 命中率（决策 26 更新）
+  - 原方案：双方各取 20 个值算 Jaccard 交集/并集，大表下交集概率极低
+  - 新方案：从表 A 列取 N 个 DISTINCT 值，检查在表 B 列中有多少能匹配
+  - 命中率 = 匹配数 / 样本数，阈值默认 0.5
+  - SQL 实现：`SELECT COUNT(*) FROM (SELECT DISTINCT col FROM table_a LIMIT N) WHERE col IN (SELECT DISTINCT col FROM table_b)`
+  - 更新 `_verify_value_overlap()` 方法
+- [ ] 3.11.10 增强 `extract_join_paths()` 支持桥接表识别：
+  - 返回值改为 `{"edges": [...], "bridge_tables": [str, ...]}`
+  - 桥接表 = 路径中出现的表 - IR 召回的表集合
+  - 多条路径时取最短路径
+  - 更新 `format_join_paths_for_prompt()` 展示桥接表
+- [ ] 3.11.11 `_inject_join_paths()` 自动补充桥接表的 M-Schema：
+  - 从向量库查询桥接表的所有列，加入 `RetrievedContext.columns`
+  - 补充桥接表到 `RetrievedContext.tables`
+  - 更新相关单元测试
+- [ ] 3.11.12 Stage 3 LLM 推断的 join_keys 也需要命中率检测验证：
+  - LLM 可能幻觉出不存在的关联，需要用命中率检测过滤假阳性
+  - 在 `_llm_infer_join` 返回后，对 join_keys 调用 `_verify_value_overlap` 验证
+  - 只有通过命中率检测的 join_keys 才写入边
+
+## 3.12 预处理增量更新（决策 27）
+
+- [ ] 3.12.1 实现 `src/preprocessing/manifest.py`：
+  - `Manifest` 类，负责 Manifest 文件的加载、保存、diff 计算
+  - `load(path) -> ManifestData`：加载 manifest.json
+  - `save(path, manifest_data)`：保存 manifest.json（原子写入）
+  - `compute_diff(old_manifest, current_schema) -> DiffResult`：对比 manifest 与当前 DB schema，输出 added_tables / removed_tables / modified_tables（modified 包含 added_columns / removed_columns / changed_columns）
+  - `build_manifest_from_schema(db_id, all_schemas) -> ManifestDBEntry`：从 schema 构建单库 manifest 条目
+  - Manifest 存储路径：`data/preprocessed/manifest.json`
+- [ ] 3.12.2 修改 `DatabaseManifest`，将 `build_time` 拆为三个独立字段：
+  - `schema_index_build_time: Optional[str]`：Schema Index 构建时间，null 表示未构建
+  - `schema_graph_build_time: Optional[str]`：Schema Graph 构建时间，null 表示未构建
+  - `lsh_index_build_time: Optional[str]`：LSH Index 构建时间，null 表示未构建
+  - 修改 `Manifest.load()` / `save()` / `build_manifest_from_schema()` 适配新字段
+  - 兼容旧格式：`build_time` 存在时自动填充三个字段
+- [ ] 3.12.3 修改全量构建脚本，各自只写自己的 build_time：
+  - `build_schema_index_for_db()` 完成后只更新 `schema_index_build_time`
+  - `build_schema_graphs()` 每库成功后只更新 `schema_graph_build_time`
+  - `build_lsh_for_db()` 成功后只更新 `lsh_index_build_time`
+  - 保证增量更新可以区分各模块的构建进度
+- [ ] 3.12.4 实现 Schema Index 增量更新方法：
+  - `incremental_update_schema_index(db_id, diff, vector_store, vectorizer)`：
+    - `schema_index_build_time == null` → 全量构建
+    - 新增表：upsert 该表所有列向量
+    - 删除表：ChromaDB `delete(where={"database": db_id, "table_name": table})`
+    - 新增列：upsert 单列向量
+    - 删除列：ChromaDB `delete(ids=[f"{db_id}.{table}.{col}"])`
+    - 修改列：upsert 覆盖（id 相同自动覆盖）
+- [ ] 3.12.5 实现 Schema Graph 增量更新方法（含依赖检查）：
+  - `incremental_update_schema_graph(db_id, diff, graph, builder)`：
+    - 依赖检查：`schema_index_build_time == null` → 跳过 + 警告"Schema Index 未构建"
+    - `schema_graph_build_time == null` → 全量构建
+    - 上游级联：Schema Index 有变更 → 即使 Graph diff 为空也需要重新处理
+    - 新增表 T：添加 node T → T vs 所有表做 Stage 1/2/3
+    - 删除表 T：删除 node T + 所有 from/to 含 T 的边
+    - 表 T 新增列：只对 T 与未连接表做 Stage 2 匹配（只拿新增列向量去 ChromaDB 匹配）
+    - 表 T 删除列：检查该列是否参与 join_key → 移除该 join_key；边 ≥1 个 join_key 则保留
+    - 表 T 修改列类型：重验证受影响 join_key 的类型兼容性
+- [ ] 3.12.6 实现 LSH Index 增量更新方法：
+  - `incremental_update_lsh_index(db_id, diff, db_directory)`：
+    - `lsh_index_build_time == null` → 全量构建
+    - 新增表 T：加载已有 LSH + minhashes → 计算新表 MinHash → insert → 保存
+    - 删除表 T：加载 LSH + minhashes → remove 该表所有 key → 保存
+    - 修改表 T：remove 旧 key + insert 新 key → 保存
+    - 采用表级重建策略（非行级修改）
+- [ ] 3.12.7 实现统一增量更新入口 `src/preprocessing/incremental_updater.py`：
+  - `IncrementalUpdater` 类，`__init__(data_dir, hit_rate_threshold, top_similar_pairs, sample_size, llm_client)`
+  - `update(db_id) -> UpdateReport`：对单个库执行增量更新
+  - `update_all() -> List[UpdateReport]`：扫描所有库，只更新有 diff 的库
+  - 内部流程：加载 Manifest → 读取当前 DB schema → compute_diff → 按 ①Schema Index ②Schema Graph ③LSH 顺序执行 → 依赖检查 + 上游级联信号传递 → 任何一步失败则停止 → 各模块完成后更新各自的 build_time
+  - `check_updates(db_id=None, data_dir=None)`：仅检测 diff，不执行更新
+  - `UpdateReport` 包含：db_id、diff、各模块的 status/变更统计
+- [ ] 3.12.8 编写 `tests/preprocessing/test_incremental_updater.py`：
+  - 测试 Manifest 的 load/save/compute_diff
+  - 测试三模块独立 build_time：各构建脚本只写自己的时间戳
+  - 测试 Schema Index 增量：新增表、删除表、新增列、删除列、修改列
+  - 测试 Schema Graph 依赖检查：Schema Index 未构建时跳过 + 警告
+  - 测试 Schema Graph 级联触发：Schema Index 有变更时 Graph 重新处理
+  - 测试 Schema Graph 增量：新增表、删除表、新增列、删除列
+  - 测试 LSH Index 增量：新增表、删除表、修改表（表级重建）
+  - 测试统一入口：diff 为空时跳过、某步失败时停止并保持一致性
+  - 测试全量构建后自动写入 Manifest
 
 
 ## 4. Schema 选择器 (SS) 模块开发

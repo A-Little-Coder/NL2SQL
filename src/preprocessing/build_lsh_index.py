@@ -84,6 +84,14 @@ def build_lsh_for_db(db_id: str, data_dir: str = None,
     try:
         indexer.build_db_lsh(db_directory, verbose=True)
         logger.success(f"{db_id} LSH 索引构建完成")
+
+        # 构建完成后自动写入 Manifest
+        try:
+            from src.preprocessing.manifest import write_manifest_for_db
+            write_manifest_for_db(db_id, data_dir, module="lsh_index")
+        except Exception as e:
+            logger.warning(f"写入 Manifest 失败 ({db_id}): {e}")
+
         return True
     except Exception as e:
         logger.error(f"{db_id} LSH 索引构建失败: {e}")

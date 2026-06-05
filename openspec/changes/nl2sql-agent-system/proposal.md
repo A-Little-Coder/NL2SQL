@@ -23,13 +23,14 @@
 
 1. **预处理模块**：为BIRD-SQL数据集中的所有数据库字段创建LSH索引和BGE-M3向量嵌入
 2. **信息检索(IR)模块**：实现关键词提取、LSH值检索和语义schema检索的两阶段策略
-3. **Schema选择器(SS)模块**：基于M-schema格式进行列相关性过滤
-4. **候选SQL生成器(CG)模块**：支持实体掩码、few-shot选择、多SQL生成和安全验证
-5. **执行与决策模块**：实现安全的SQL执行、错误修正循环和self-consistency投票决策
-6. **监控集成**：与LangSmith集成，提供全流程监控和流式输出
-7. **反问 Agent (ClarificationAgent) 与用户记忆 (UserMemory)**：插入到 IR 与 SS 之间的 LangGraph 流程中，主动澄清歧义并积累用户长期偏好
-8. **可回答性检查 (Answerability Check)**：SS 之后、CG 之前插入的轻量判断节点，宽松原则——只有明确无法回答时才拦截，避免浪费后续 LLM 调用
-9. **结果可信度验证 (Result Verification)**：增强 Decision 节点，严格验证最终 SQL 语义是否与用户问题对齐，防止"答非所问"的硬凑输出
+3. **表关联图(Schema Relationship Graph)**：预处理阶段构建表间JOIN关系图，运行时注入JOIN路径到Prompt
+4. **Schema选择器(SS)模块**：基于M-schema格式进行列相关性过滤
+5. **候选SQL生成器(CG)模块**：支持实体掩码、few-shot选择、多SQL生成和安全验证
+6. **执行与决策模块**：实现安全的SQL执行、错误修正循环和self-consistency投票决策
+7. **监控集成**：与LangSmith集成，提供全流程监控和流式输出
+8. **反问 Agent (ClarificationAgent) 与用户记忆 (UserMemory)**：插入到 IR 与 SS 之间的 LangGraph 流程中，主动澄清歧义并积累用户长期偏好
+9. **可回答性检查 (Answerability Check)**：SS 之后、CG 之前插入的轻量判断节点，宽松原则——只有明确无法回答时才拦截，避免浪费后续 LLM 调用
+10. **结果可信度验证 (Result Verification)**：增强 Decision 节点，严格验证最终 SQL 语义是否与用户问题对齐，防止"答非所问"的硬凑输出
 
 ```
 用户输入
@@ -65,6 +66,7 @@
 ### New Capabilities
 - `nl2sql-preprocessing`: 为数据库schema和字段值创建LSH索引和向量嵌入
 - `information-retrieval`: 实现两阶段信息检索策略（LSH + 语义相似性），含四向同义词扩写、向量粗召回(top_k=50) + N-gram 投票精排
+- `schema-relationship-graph`: 预处理阶段构建表间关联图（显式FK + 向量匹配 + 命中率验证 + LLM辅助），运行时BFS提取JOIN路径注入Prompt
 - `schema-selection`: 基于M-schema格式的智能列选择
 - `sql-generation`: 安全的多候选SQL生成，包含危险操作过滤和语法验证
 - `execution-engine`: 安全的SQL执行引擎，支持SQLite和MySQL数据库连接
@@ -78,6 +80,7 @@
 
 **受影响的代码和系统**：
 - 新增核心模块目录：`src/preprocessing/`, `src/retrieval/`, `src/schema_selection/`, `src/sql_generation/`, `src/execution/`, `src/decision/`
+- 新增预处理产物：`data/preprocessed/schema_graphs/{db_id}.json`（表关联图JSON邻接表）
 - 新增模块：`src/clarification/`（含 `agent.py`、`trigger.py`、`web_search.py`、`question_generator.py`、`dialog.py`）
 - 新增模块：`src/memory/`（含 `user_memory.py`、`storage.py`）
 - 数据目录：新增 `data/user_memory/{user_id}.json` 存储用户长期记忆
