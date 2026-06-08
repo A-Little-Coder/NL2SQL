@@ -51,6 +51,18 @@ class NL2SQLState(TypedDict, total=False):
         # ===== 辅助 =====
         error: 主图级别错误信息
         trace_log: 各节点产生的轨迹日志（便于调试）
+
+        # ===== 会话历史（由 API 层/调用方注入）=====
+        conversation_history: 当前会话的历史对话轮次
+        cache_hit: 历史命中标记
+        cached_sql: 命中的缓存 SQL
+        cache_source: 命中来源
+        cache_confidence: 命中置信度
+        metric_definitions: 用户记忆中的指标定义（由 API 层注入）
+
+        # ===== 内部注入（API 层注入，graph 节点内部使用）=====
+        _user_memory: Any  # UserMemory 实例
+        _session_memory: Any  # SessionMemory 实例
     """
 
     # ===== 用户输入 =====
@@ -87,6 +99,18 @@ class NL2SQLState(TypedDict, total=False):
     answerability_result: Optional[Dict[str, Any]]  # 可回答性检查结果
     result_verification: Optional[Dict[str, Any]]    # 结果可信度验证结果
     rejection_reason: Optional[str]                   # 拒答原因
+
+    # ===== 会话历史（由 API 层/调用方注入）=====
+    conversation_history: List[Dict[str, Any]]
+    cache_hit: bool
+    cached_sql: Optional[str]
+    cache_source: Optional[str]
+    cache_confidence: float
+    metric_definitions: List[Dict[str, Any]]
+
+    # ===== 内部注入 =====
+    _user_memory: Any
+    _session_memory: Any
 
     # ===== 辅助 =====
     error: Optional[str]
@@ -129,6 +153,14 @@ def create_initial_state(
         answerability_result=None,
         result_verification=None,
         rejection_reason=None,
+        conversation_history=[],
+        cache_hit=False,
+        cached_sql=None,
+        cache_source=None,
+        cache_confidence=0.0,
+        metric_definitions=[],
+        _user_memory=None,
+        _session_memory=None,
         error=None,
         trace_log=[],
     )

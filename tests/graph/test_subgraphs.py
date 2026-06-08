@@ -25,30 +25,43 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 def test_ir_subgraph_end_to_end():
     from src.retrieval.information_retrieval import (
         InformationRetrieval,
+        KeywordGroup,
         RetrievedItem,
     )
 
     ir = InformationRetrieval()
-    # 打桩各方法
-    ir.extract_keywords = MagicMock(return_value=["销售额", "去年"])
+    # 新契约：extract_keywords 返回 List[KeywordGroup]
+    groups = [
+        KeywordGroup(phrase="销售额", terms=["销售额", "sales"]),
+        KeywordGroup(phrase="去年", terms=["去年", "last year"]),
+    ]
+    ir.extract_keywords = MagicMock(return_value=groups)
+
+    # retrieve_values 接收扁平化的字符串列表
     ir.retrieve_values = MagicMock(return_value=[
         RetrievedItem(item_type="value", name="2023", table_name="t",
                       score=0.9, metadata={"column_name": "year"})
     ])
+
+    # retrieve_schema 新契约：返回 Dict[phrase, List[RetrievedItem]]
     ir.retrieve_schema = MagicMock(return_value={
-        "tables": [RetrievedItem(item_type="table", name="t", score=0.8)],
-        "columns": [RetrievedItem(item_type="column", name="amount",
-                                   table_name="t", score=0.7)],
+        "销售额": [RetrievedItem(item_type="column", name="amount",
+                                  table_name="t", score=0.7,
+                                  metadata={"database": ""})],
+        "去年":   [RetrievedItem(item_type="column", name="year",
+                                  table_name="t", score=0.6,
+                                  metadata={"database": ""})],
     })
-    # enhance_with_schema 保持原行为（IR 已实现）
 
     g = ir.build_graph()
     result = g.invoke({"user_query": "去年销售额"})
 
-    assert result["keywords"] == ["销售额", "去年"]
+    # keywords 现在是 KeywordGroup 列表
+    assert len(result["keywords"]) == 2
     ctx = result["retrieved_context"]
     assert ctx is not None
-    assert len(ctx.keywords) == 2
+    # ctx.keywords 是扁平化后的字符串列表（每组 phrase + terms 去重）
+    assert len(ctx.keywords) >= 2
     assert ctx.lsh_hit_count == 1
     assert len(ctx.tables) >= 1
     assert len(ctx.columns) >= 1
@@ -56,12 +69,12 @@ def test_ir_subgraph_end_to_end():
 
 def test_ir_subgraph_empty_lsh():
     """LSH 未配置时 retrieve_values 返回空，流程仍能走完"""
-    from src.retrieval.information_retrieval import InformationRetrieval
+    from src.retrieval.information_retrieval import InformationRetrieval, KeywordGroup
 
     ir = InformationRetrieval()
-    ir.extract_keywords = MagicMock(return_value=["x"])
+    ir.extract_keywords = MagicMock(return_value=[KeywordGroup(phrase="x", terms=["x"])])
     ir.retrieve_values = MagicMock(return_value=[])
-    ir.retrieve_schema = MagicMock(return_value={"tables": [], "columns": []})
+    ir.retrieve_schema = MagicMock(return_value={})
 
     g = ir.build_graph()
     result = g.invoke({"user_query": "test"})

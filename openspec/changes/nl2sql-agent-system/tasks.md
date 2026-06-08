@@ -103,47 +103,47 @@
 - [x] 3.11.7 IR 模块集成：`RetrievedContext` 新增 `join_paths` 和 `join_paths_text` 字段
   - `retrieve()` 中 `_inject_join_paths()` 自动加载图并注入 JOIN 条件
 - [x] 3.11.8 编写单元测试 `tests/preprocessing/test_schema_graph_builder.py`（30 个用例）
-- [ ] 3.11.9 修复值验证方法：Jaccard → 命中率（决策 26 更新）
+- [x] 3.11.9 修复值验证方法：Jaccard → 命中率（决策 26 更新）
   - 原方案：双方各取 20 个值算 Jaccard 交集/并集，大表下交集概率极低
   - 新方案：从表 A 列取 N 个 DISTINCT 值，检查在表 B 列中有多少能匹配
   - 命中率 = 匹配数 / 样本数，阈值默认 0.5
   - SQL 实现：`SELECT COUNT(*) FROM (SELECT DISTINCT col FROM table_a LIMIT N) WHERE col IN (SELECT DISTINCT col FROM table_b)`
   - 更新 `_verify_value_overlap()` 方法
-- [ ] 3.11.10 增强 `extract_join_paths()` 支持桥接表识别：
+- [x] 3.11.10 增强 `extract_join_paths()` 支持桥接表识别：
   - 返回值改为 `{"edges": [...], "bridge_tables": [str, ...]}`
   - 桥接表 = 路径中出现的表 - IR 召回的表集合
   - 多条路径时取最短路径
   - 更新 `format_join_paths_for_prompt()` 展示桥接表
-- [ ] 3.11.11 `_inject_join_paths()` 自动补充桥接表的 M-Schema：
+- [x] 3.11.11 `_inject_join_paths()` 自动补充桥接表的 M-Schema：
   - 从向量库查询桥接表的所有列，加入 `RetrievedContext.columns`
   - 补充桥接表到 `RetrievedContext.tables`
   - 更新相关单元测试
-- [ ] 3.11.12 Stage 3 LLM 推断的 join_keys 也需要命中率检测验证：
+- [x] 3.11.12 Stage 3 LLM 推断的 join_keys 也需要命中率检测验证：
   - LLM 可能幻觉出不存在的关联，需要用命中率检测过滤假阳性
   - 在 `_llm_infer_join` 返回后，对 join_keys 调用 `_verify_value_overlap` 验证
   - 只有通过命中率检测的 join_keys 才写入边
 
 ## 3.12 预处理增量更新（决策 27）
 
-- [ ] 3.12.1 实现 `src/preprocessing/manifest.py`：
+- [x] 3.12.1 实现 `src/preprocessing/manifest.py`：
   - `Manifest` 类，负责 Manifest 文件的加载、保存、diff 计算
   - `load(path) -> ManifestData`：加载 manifest.json
   - `save(path, manifest_data)`：保存 manifest.json（原子写入）
   - `compute_diff(old_manifest, current_schema) -> DiffResult`：对比 manifest 与当前 DB schema，输出 added_tables / removed_tables / modified_tables（modified 包含 added_columns / removed_columns / changed_columns）
   - `build_manifest_from_schema(db_id, all_schemas) -> ManifestDBEntry`：从 schema 构建单库 manifest 条目
   - Manifest 存储路径：`data/preprocessed/manifest.json`
-- [ ] 3.12.2 修改 `DatabaseManifest`，将 `build_time` 拆为三个独立字段：
+- [x] 3.12.2 修改 `DatabaseManifest`，将 `build_time` 拆为三个独立字段：
   - `schema_index_build_time: Optional[str]`：Schema Index 构建时间，null 表示未构建
   - `schema_graph_build_time: Optional[str]`：Schema Graph 构建时间，null 表示未构建
   - `lsh_index_build_time: Optional[str]`：LSH Index 构建时间，null 表示未构建
   - 修改 `Manifest.load()` / `save()` / `build_manifest_from_schema()` 适配新字段
   - 兼容旧格式：`build_time` 存在时自动填充三个字段
-- [ ] 3.12.3 修改全量构建脚本，各自只写自己的 build_time：
+- [x] 3.12.3 修改全量构建脚本，各自只写自己的 build_time：
   - `build_schema_index_for_db()` 完成后只更新 `schema_index_build_time`
   - `build_schema_graphs()` 每库成功后只更新 `schema_graph_build_time`
   - `build_lsh_for_db()` 成功后只更新 `lsh_index_build_time`
   - 保证增量更新可以区分各模块的构建进度
-- [ ] 3.12.4 实现 Schema Index 增量更新方法：
+- [x] 3.12.4 实现 Schema Index 增量更新方法：
   - `incremental_update_schema_index(db_id, diff, vector_store, vectorizer)`：
     - `schema_index_build_time == null` → 全量构建
     - 新增表：upsert 该表所有列向量
@@ -151,7 +151,7 @@
     - 新增列：upsert 单列向量
     - 删除列：ChromaDB `delete(ids=[f"{db_id}.{table}.{col}"])`
     - 修改列：upsert 覆盖（id 相同自动覆盖）
-- [ ] 3.12.5 实现 Schema Graph 增量更新方法（含依赖检查）：
+- [x] 3.12.5 实现 Schema Graph 增量更新方法（含依赖检查）：
   - `incremental_update_schema_graph(db_id, diff, graph, builder)`：
     - 依赖检查：`schema_index_build_time == null` → 跳过 + 警告"Schema Index 未构建"
     - `schema_graph_build_time == null` → 全量构建
@@ -161,21 +161,21 @@
     - 表 T 新增列：只对 T 与未连接表做 Stage 2 匹配（只拿新增列向量去 ChromaDB 匹配）
     - 表 T 删除列：检查该列是否参与 join_key → 移除该 join_key；边 ≥1 个 join_key 则保留
     - 表 T 修改列类型：重验证受影响 join_key 的类型兼容性
-- [ ] 3.12.6 实现 LSH Index 增量更新方法：
+- [x] 3.12.6 实现 LSH Index 增量更新方法：
   - `incremental_update_lsh_index(db_id, diff, db_directory)`：
     - `lsh_index_build_time == null` → 全量构建
     - 新增表 T：加载已有 LSH + minhashes → 计算新表 MinHash → insert → 保存
     - 删除表 T：加载 LSH + minhashes → remove 该表所有 key → 保存
     - 修改表 T：remove 旧 key + insert 新 key → 保存
     - 采用表级重建策略（非行级修改）
-- [ ] 3.12.7 实现统一增量更新入口 `src/preprocessing/incremental_updater.py`：
+- [x] 3.12.7 实现统一增量更新入口 `src/preprocessing/incremental_updater.py`：
   - `IncrementalUpdater` 类，`__init__(data_dir, hit_rate_threshold, top_similar_pairs, sample_size, llm_client)`
   - `update(db_id) -> UpdateReport`：对单个库执行增量更新
   - `update_all() -> List[UpdateReport]`：扫描所有库，只更新有 diff 的库
   - 内部流程：加载 Manifest → 读取当前 DB schema → compute_diff → 按 ①Schema Index ②Schema Graph ③LSH 顺序执行 → 依赖检查 + 上游级联信号传递 → 任何一步失败则停止 → 各模块完成后更新各自的 build_time
   - `check_updates(db_id=None, data_dir=None)`：仅检测 diff，不执行更新
   - `UpdateReport` 包含：db_id、diff、各模块的 status/变更统计
-- [ ] 3.12.8 编写 `tests/preprocessing/test_incremental_updater.py`：
+- [x] 3.12.8 编写 `tests/preprocessing/test_incremental_updater.py`：
   - 测试 Manifest 的 load/save/compute_diff
   - 测试三模块独立 build_time：各构建脚本只写自己的时间戳
   - 测试 Schema Index 增量：新增表、删除表、新增列、删除列、修改列
@@ -251,19 +251,26 @@
 - [ ] 8.2 开发 Terminal 交互式界面，支持流式输出 (框架已建立)
 - [ ] 8.3 实现思考过程可视化，显示各阶段执行状态
 
-## 9. UserMemory 模块（capability: user-memory）
+## 9. UserMemory 模块（capability: user-memory，决策 29 扩展）
 
-- [ ] 9.1 创建 `src/memory/__init__.py`
-- [ ] 9.2 实现 `src/memory/storage.py`：JSON 读写 + 跨平台文件锁（`fcntl` / `msvcrt`）
-- [ ] 9.3 实现 `src/memory/user_memory.py` 的 `UserMemory` 类，方法：
-  - `__init__(user_id, role_tag=None, base_dir="data/user_memory")`
+- [x] 9.1 创建 `src/memory/__init__.py`
+- [x] 9.2 实现 `src/memory/storage.py`：JSON 读写 + 跨平台文件锁（`fcntl` / `msvcrt`）
+- [x] 9.3 实现 `src/memory/user_memory.py` 的 `UserMemory` 类，方法：
+  - `__init__(user_id, base_dir="data/user_memory")`
   - `load() -> dict`
   - `save() -> None`（原子写入：tmp → rename）
   - `get_term_preference(term: str) -> Optional[dict]`
-  - `record_term_preference(term: str, resolved_to: str, confidence: float)`
+  - `record_term_preference(term: str, resolved_to: str, confidence: float, source: str = "user_taught")`
   - `append_clarification(history_entry: dict)`
-  - `get_domain_context() -> List[str]`
-- [ ] 9.4 编写 `tests/memory/test_user_memory.py`：覆盖创建/读写/并发锁/原子写入
+  - `get_domain_context() -> dict`（返回完整领域信息，含 industry/department/focus_areas）
+  - `record_table_usage(table_name: str)`（自动学习常用表）
+  - `get_frequently_used_tables(top_k: int = 5) -> List[str]`
+  - `record_metric_definition(name, description, sql_pattern, source, confidence)`（双轨：auto_learned + user_taught）
+  - `get_metric_definitions(min_confidence: float = 0.7) -> List[dict]`
+  - `update_query_preference(key: str, value: str)`（自动学习查询偏好）
+  - `get_query_preferences() -> dict`
+  - `update_domain_context(**kwargs)`
+- [x] 9.4 编写 `tests/memory/test_user_memory.py`：覆盖创建/读写/并发锁/原子写入 + 新增 6 维记忆的读写
 
 ## 10. WebSearchEnricher（Tavily 集成）
 
@@ -370,4 +377,83 @@
   - 验证条件边（如全部 SQL 失败时主图正确终止）
 - [x] 18.11 编写 `tests/graph/test_subgraphs.py`：每个 Agent 子图独立可调用 + 状态契约验证
 - [x] 18.12 修改 `tests/e2e_live.py` 使用 `build_main_graph()` 代替手写流程（当前先外部流程展示，未来完整接入子图条件边）
+
+## 19. 会话记忆模块（决策 28）
+
+- [x] 19.1 实现 `src/memory/session_memory.py` 的 `SessionMemory` 类：
+- [x] 19.2 实现 `src/memory/session_manager.py` 的 `SessionManager` 类：
+- [x] 19.3 编写 `tests/memory/test_session_memory.py`：覆盖创建/加载/追加轮次/Prompt格式化/上下文摘要/持久化验证
+- [x] 19.4 编写 `tests/memory/test_session_manager.py`：覆盖创建/列出/删除/LRU缓存/用户隔离
+
+## 20. 问数服务 API（决策 31）
+
+- [x] 20.1 新增依赖：`fastapi>=0.100.0`、`uvicorn>=0.20.0`、`sse-starlette>=1.0.0`
+- [x] 20.2 实现 `src/api/schemas.py`：Pydantic 请求/响应模型
+  - `QueryRequest(query: str, session_id: str, user_id: str)`
+  - `SSEEvent(type: str, **kwargs)`
+  - `SessionSummary(session_id, created_at, updated_at, status, turn_count)`
+  - `UserMemoryResponse(...)`
+- [x] 20.3 实现 `src/api/deps.py`：依赖注入
+  - `get_session_manager()` → 单例 SessionManager
+  - `get_user_memory(user_id)` → 懒加载 UserMemory（LRU 缓存）
+  - `get_graph()` → 预编译的 LangGraph 主图
+- [x] 20.4 实现 `src/api/stream.py`：SSE 事件生成器
+  - `generate_sse_events(state_stream)` → AsyncGenerator
+  - 监听各阶段状态变更，实时推送 SSE 事件
+  - 处理 cache_check / stage / clarification / result / error / done 事件类型
+- [x] 20.5 实现 `src/api/routes/query.py`：核心查询接口
+  - `POST /api/v1/query`：SSE 流式响应
+  - 加载或创建 SessionMemory → 注入 conversation_history 到 state → 调用 graph.invoke → 提取结果 → 更新 SessionMemory 和 UserMemory
+  - 流式：每个节点执行后推送阶段事件
+- [x] 20.6 实现 `src/api/routes/session.py`：会话管理接口
+  - `GET /api/v1/sessions/{user_id}`：列出用户会话
+  - `GET /api/v1/sessions/{session_id}/history`：获取对话历史
+  - `DELETE /api/v1/sessions/{session_id}`：删除会话
+- [x] 20.7 实现 `src/api/routes/user.py`：用户记忆接口
+  - `GET /api/v1/users/{user_id}/memory`：获取完整用户记忆
+  - `GET /api/v1/users/{user_id}/metrics`：获取指标定义
+- [x] 20.8 实现 `src/api/app.py`：FastAPI 应用 + 生命周期
+  - `lifespan()` 中一次性加载所有组件
+  - 注册路由
+  - 健康检查 `GET /api/v1/health`
+- [x] 20.9 编写 `tests/api/test_query.py`：Mock 组件测试 SSE 流式响应
+- [x] 20.10 编写 `tests/api/test_session.py`：测试会话 CRUD 接口
+- [x] 20.11 编写 `tests/api/test_user.py`：测试用户记忆查询接口
+
+## 21. 历史命中检测 + 记忆自动学习（决策 30 + 29）
+
+- [x] 21.1 实现 `src/memory/history_cache.py` 的 `HistoryCache` 类：
+  - `__init__(llm_client, min_confidence=0.8)`
+  - `check(query: str, session_memory: SessionMemory, user_memory: UserMemory) -> CacheResult`
+  - `CacheResult(hit: bool, cached_sql: Optional[str], source: Optional[str], confidence: float)`
+  - 内部调 LLM 判断当前查询是否与历史等价或可用已知指标回答
+  - 安全边界：confidence < min_confidence → 不复用；时间相关的 follow-up → 不复用
+- [x] 21.2 实现 `src/memory/memory_updater.py` 的 `MemoryUpdater` 类：
+  - `update(user_memory: UserMemory, session_memory: SessionMemory, state: NL2SQLState) -> None`
+  - 自动学习逻辑：
+    - 从 `final_sql` 提取表名 → `record_table_usage()`
+    - 检测简单聚合 SQL → 调 LLM 提取指标定义 → `record_metric_definition(source="auto_learned")`
+    - 统计查询偏好频率 → `update_query_preference()`
+  - 写入 clarification_history（如有反问）
+  - 更新 session_memory 的 context_summary
+- [x] 21.3 修改 `src/graph/state.py`，新增字段：
+  - `conversation_history: List[Dict[str, Any]]`（会话历史，由 API 层注入）
+  - `cache_hit: bool`
+  - `cached_sql: Optional[str]`
+  - `cache_source: Optional[str]`
+  - `cache_confidence: float`
+- [x] 21.4 修改 `src/graph/main_graph.py`，新增节点和条件边：
+  - 新增 `history_cache` 节点（START 之后，IR 之前）
+  - 条件边：`cache_hit == True` → execution；否则 → ir
+  - 新增 `memory_update` 节点（decision 之后，END 之前）
+  - 调整流程：`START → history_cache → ir → ... → decision → memory_update → END`
+- [x] 21.5 修改 IR 节点，支持读取 `conversation_history` 辅助 follow-up 理解
+  - 在关键词提取 Prompt 中注入会话历史
+  - 支持"那去年的呢"类 follow-up 的关键词补全
+- [x] 21.6 修改 CG 节点，注入用户偏好和指标定义
+  - 从 `state` 中读取用户记忆（API 层注入）
+  - 注入 `query_preferences`（默认时间/排序/limit）
+  - 注入 `metric_definitions`（min_confidence >= 0.8）
+- [x] 21.7 编写 `tests/memory/test_history_cache.py`：覆盖命中/未命中/低置信度/时间相关 follow-up
+- [x] 21.8 编写 `tests/memory/test_memory_updater.py`：覆盖常用表学习/指标定义学习/查询偏好学习/会话上下文更新
 

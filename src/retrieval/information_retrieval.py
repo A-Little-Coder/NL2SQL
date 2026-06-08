@@ -11,6 +11,7 @@
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 from loguru import logger
 
@@ -162,6 +163,24 @@ KEYWORD_EXTRACTION_PROMPT = """你是一个专业的数据库查询分析专家�
 输入："{query}"
 输出："""
 
+# 当提供了会话历史时，当前查询可能是对上一轮的 follow-up（如"那去年的呢"），
+# 请结合历史查询来补全省略的关键词。
+FOLLOW_UP_INSTRUCTION = """
+注意：以上是当前查询之前的会话历史。当前查询可能是对历史查询的 follow-up（省略句）。
+请结合历史查询来理解当前查询的完整意图，提取完整的关键词。
+
+示例：
+历史：["查询苹果的销售额"]
+当前："那去年的呢"
+理解：用户想知道"苹果去年的销售额"
+关键词：应包含"苹果"、"去年"、"销售额"
+
+历史：["展示各个学校的各科score"]
+当前："只看北京的呢"
+理解：用户想知道"北京地区各个学校的各科score"
+关键词：应包含"北京"、"学校"、"各科score"
+"""
+
 
 class InformationRetrieval:
     """
@@ -191,12 +210,16 @@ class InformationRetrieval:
         self.lsh_threshold = lsh_threshold
         self.vector_top_k = vector_top_k
 
-    def extract_keywords(self, query: str) -> List[KeywordGroup]:
+    def extract_keywords(self, query: str, conversation_history: List[Dict[str, Any]] = None) -> List[KeywordGroup]:
         """
         从自然语言查询中提取关键词（含同义词扩写，按原生关键词分组）
 
+        支持 follow-up 查询：如果提供了会话历史，会在 prompt 中注入上一轮查询
+        辅助 LLM 理解"那去年的呢"类省略句。
+
         Args:
             query: 用户查询
+            conversation_history: 可选，当前会话的历史轮次列表
 
         Returns:
             List[KeywordGroup]: 关键词分组列表，每组含 phrase 和 terms
@@ -207,7 +230,21 @@ class InformationRetrieval:
             return [KeywordGroup(phrase=kw, terms=[kw.lower()]) for kw in simple_kws]
 
         try:
+            # 注入会话历史（辅助 follow-up 理解）
+            history_context = ""
+            if conversation_history:
+                history_lines = []
+                for turn in conversation_history[-3:]:  # 最多最近 3 轮
+                    q = turn.get("user_query", "")
+                    if q:
+                        history_lines.append(f"  - \"{q}\"")
+                if history_lines:
+                    history_context = "\n\n## 会话历史（当前查询之前的对话）：\n" + "\n".join(history_lines)
+
             prompt = KEYWORD_EXTRACTION_PROMPT.format(query=query)
+            if history_context:
+                prompt += history_context + "\n\n" + FOLLOW_UP_INSTRUCTION
+
             messages = [
                 {"role": "system", "content": "你是数据库查询分析专家，只输出 JSON。"},
                 {"role": "user", "content": prompt},

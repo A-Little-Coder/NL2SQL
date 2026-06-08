@@ -23,6 +23,8 @@ class CGGraphState(TypedDict, total=False):
     masked_query: str
     few_shots: List[Dict[str, str]]
     sql_candidates: List[Any]       # List[SQLCandidate]
+    query_preferences: Dict[str, str]  # 用户查询偏好（由主图注入）
+    metric_definitions: List[Dict[str, Any]]  # 用户指标定义（由主图注入）
 
 
 def build_cg_graph(generator):
@@ -64,11 +66,34 @@ def build_cg_graph(generator):
             mschema_dict = MSchemaFormat.create_mschema_schema(schema)
             schema_text = MSchemaFormat.format_for_llm(mschema_dict)
 
+            # 注入用户偏好
+            user_prefs = state.get("query_preferences", {}) or {}
+            pref_lines = []
+            if user_prefs.get("default_sort"):
+                pref_lines.append(f"- 排序偏好：默认使用 {user_prefs['default_sort']}")
+            if user_prefs.get("default_limit"):
+                pref_lines.append(f"- 默认限制行数：{user_prefs['default_limit']}")
+            if user_prefs.get("default_group_by"):
+                pref_lines.append(f"- 分组偏好：{user_prefs['default_group_by']}")
+            preference_text = "\n".join(pref_lines) if pref_lines else ""
+
+            # 注入指标定义（高置信度）
+            metrics = state.get("metric_definitions", []) or []
+            metric_lines = []
+            for m in metrics:
+                if m.get("confidence", 0) >= 0.8:
+                    metric_lines.append(f"- {m.get('name', '')}: {m.get('description', '')} → {m.get('sql_pattern', '')}")
+            metric_text = "\n".join(metric_lines) if metric_lines else ""
+
             prompt = generator.SQL_GENERATION_PROMPT.format(
                 user_query=state["user_query"],
                 schema_text=schema_text,
                 num_candidates=generator.num_candidates,
             )
+            if preference_text:
+                prompt += f"\n\n## 用户查询偏好\n{preference_text}"
+            if metric_text:
+                prompt += f"\n\n## 已知指标定义\n{metric_text}\n如果当前查询匹配以上指标定义，请优先使用对应的 SQL 模式。"
             messages = [
                 {"role": "system", "content": "你是 SQL 专家，只输出 JSON。"},
                 {"role": "user", "content": prompt},

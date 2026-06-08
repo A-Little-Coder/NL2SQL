@@ -21,11 +21,14 @@ class IRGraphState(TypedDict, total=False):
 
     user_query: str
     database_filter: Optional[str]
-    keywords: List[str]
+    keywords: List[Any]            # List[KeywordGroup]
+    flat_terms: List[str]          # 扁平化后的全部检索词（供 LSH 值检索使用）
     values: List[Any]              # List[RetrievedItem]
     schema_tables: List[Any]
     schema_columns: List[Any]
+    keyword_columns_map: Dict[str, List[str]]
     retrieved_context: Any         # 最终 RetrievedContext
+    conversation_history: List[Dict[str, Any]]  # 会话历史（由主图注入，辅助 follow-up 理解）
 
 
 def build_ir_graph(retriever):
@@ -43,37 +46,88 @@ def build_ir_graph(retriever):
     from src.retrieval.information_retrieval import RetrievedContext
 
     def node_extract_keywords(state: IRGraphState) -> Dict[str, Any]:
-        """节点：关键词提取"""
-        kws = retriever.extract_keywords(state["user_query"])
-        return {"keywords": kws}
+        """节点：关键词提取（支持 follow-up 会话历史注入）
+
+        extract_keywords 返回 List[KeywordGroup]，每组包含 phrase + terms（扁平化的同义词）。
+        这里同时输出扁平化的 flat_terms 供 LSH 值检索使用。
+        """
+        keyword_groups = retriever.extract_keywords(
+            state["user_query"],
+            conversation_history=state.get("conversation_history", []),
+        )
+        flat_terms: List[str] = []
+        for g in keyword_groups:
+            flat_terms.extend(getattr(g, "terms", []) or [])
+        return {"keywords": keyword_groups, "flat_terms": flat_terms}
 
     def node_retrieve_values(state: IRGraphState) -> Dict[str, Any]:
-        """节点：LSH 值检索"""
-        keywords = state.get("keywords", [])
-        values = retriever.retrieve_values(keywords)
+        """节点：LSH 值检索（用扁平化后的字符串列表）"""
+        flat_terms = state.get("flat_terms", [])
+        values = retriever.retrieve_values(flat_terms)
         return {"values": values}
 
     def node_retrieve_schema(state: IRGraphState) -> Dict[str, Any]:
-        """节点：语义 schema 检索"""
-        schema = retriever.retrieve_schema(
-            state["user_query"], state.get("database_filter")
+        """节点：语义 schema 检索（按 KeywordGroup 分组独立召回）"""
+        keyword_groups = state.get("keywords", [])
+        group_results = retriever.retrieve_schema(
+            keyword_groups,
+            database_filter=state.get("database_filter"),
         )
+
+        # 跨组汇总：合并所有列，去重保留最高分；同时构建 keyword→columns 映射
+        seen_columns: Dict[str, Any] = {}
+        keyword_columns_map: Dict[str, List[str]] = {}
+        for phrase, cols in (group_results or {}).items():
+            col_keys: List[str] = []
+            for col in cols:
+                col_key = f"{col.table_name}.{col.name}"
+                col_keys.append(col_key)
+                if col_key not in seen_columns or col.score > seen_columns[col_key].score:
+                    seen_columns[col_key] = col
+            keyword_columns_map[phrase] = col_keys
+
+        all_columns = sorted(seen_columns.values(), key=lambda c: c.score, reverse=True)
+
+        # 从列推导表
+        from src.retrieval.information_retrieval import RetrievedItem
+        seen_tables = set()
+        all_tables: List[Any] = []
+        for col in all_columns:
+            if col.table_name and col.table_name not in seen_tables:
+                seen_tables.add(col.table_name)
+                all_tables.append(RetrievedItem(
+                    item_type="table",
+                    name=col.table_name,
+                    table_name=col.table_name,
+                    score=col.score,
+                    metadata={"database": col.metadata.get("database", "") if col.metadata else ""},
+                ))
+
         return {
-            "schema_tables": schema.get("tables", []),
-            "schema_columns": schema.get("columns", []),
+            "schema_tables": all_tables,
+            "schema_columns": all_columns,
+            "keyword_columns_map": keyword_columns_map,
         }
 
     def node_assemble_and_enhance(state: IRGraphState) -> Dict[str, Any]:
-        """节点：装配 RetrievedContext + 反推表覆盖"""
+        """节点：装配 RetrievedContext + 反推表覆盖 + 注入 JOIN 路径"""
+        keyword_groups = state.get("keywords", [])
         ctx = RetrievedContext(
             tables=state.get("schema_tables", []),
             columns=state.get("schema_columns", []),
             values=state.get("values", []),
-            keywords=state.get("keywords", []),
+            keywords=state.get("flat_terms", []),
+            keyword_groups=keyword_groups,
+            keyword_columns_map=state.get("keyword_columns_map", {}),
             lsh_hit_count=len(state.get("values", [])),
-            vector_top_scores=[c.score for c in state.get("schema_columns", [])],
+            vector_top_scores=[c.score for c in state.get("schema_columns", [])[:10]],
         )
         ctx = retriever.enhance_with_schema(ctx)
+        # 注入 JOIN 路径（决策 26）
+        try:
+            ctx = retriever._inject_join_paths(ctx, state.get("database_filter"))
+        except Exception:
+            pass
         return {"retrieved_context": ctx}
 
     graph = StateGraph(IRGraphState)

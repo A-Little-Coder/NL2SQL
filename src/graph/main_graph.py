@@ -33,6 +33,62 @@ from src.graph.state import NL2SQLState
 # 节点工厂：每个节点把主图 state 转为 Agent 子图所需的局部 state
 # ---------------------------------------------------------------------------
 
+def make_history_cache_node(history_cache) -> Callable[[NL2SQLState], Dict[str, Any]]:
+    """构造 HistoryCache 节点：检查历史命中，命中时设置 cache_hit=True 并注入 cached_sql"""
+
+    def node(state: NL2SQLState) -> Dict[str, Any]:
+        if history_cache is None:
+            return {
+                "cache_hit": False,
+                "trace_log": state.get("trace_log", []) + ["[HistoryCache] disabled"],
+            }
+
+        session_memory = state.get("_session_memory")
+        user_memory = state.get("_user_memory")
+        conversation_history = state.get("conversation_history", [])
+        metric_definitions = state.get("metric_definitions", [])
+
+        result = history_cache.check(
+            user_query=state["user_query"],
+            session_history=conversation_history,
+            metric_definitions=metric_definitions,
+        )
+
+        out: Dict[str, Any] = {
+            "cache_hit": result.hit,
+            "cached_sql": result.cached_sql,
+            "cache_source": result.source,
+            "cache_confidence": result.confidence,
+            "trace_log": state.get("trace_log", [])
+                         + [f"[HistoryCache] hit={result.hit}, source={result.source}, confidence={result.confidence}"],
+        }
+        return out
+
+    return node
+
+
+def make_memory_update_node(updater) -> Callable[[NL2SQLState], Dict[str, Any]]:
+    """构造 MemoryUpdate 节点：自动学习用户记忆和会话记忆"""
+
+    def node(state: NL2SQLState) -> Dict[str, Any]:
+        if updater is None:
+            return {
+                "trace_log": state.get("trace_log", []) + ["[MemoryUpdate] disabled"],
+            }
+
+        session_memory = state.get("_session_memory")
+        user_memory = state.get("_user_memory")
+
+        if user_memory is not None and session_memory is not None:
+            updater.update(user_memory, session_memory, state)
+
+        return {
+            "trace_log": state.get("trace_log", []) + ["[MemoryUpdate] done"],
+        }
+
+    return node
+
+
 def make_ir_node(retriever) -> Callable[[NL2SQLState], Dict[str, Any]]:
     """构造 IR 节点：调用 IR 子图，输出 keywords/retrieved_context"""
 
@@ -41,6 +97,7 @@ def make_ir_node(retriever) -> Callable[[NL2SQLState], Dict[str, Any]]:
         result = sub.invoke({
             "user_query": state["user_query"],
             "database_filter": state.get("database_filter"),
+            "conversation_history": state.get("conversation_history", []),
         })
         return {
             "keywords": result.get("keywords", []),
@@ -129,6 +186,9 @@ def make_cg_node(generator) -> Callable[[NL2SQLState], Dict[str, Any]]:
         result = sub.invoke({
             "user_query": state["user_query"],
             "selected_schema": schema,
+            "query_preferences": state.get("_user_memory").get_query_preferences()
+                                  if state.get("_user_memory") else {},
+            "metric_definitions": state.get("metric_definitions", []),
         })
         return {
             "sql_candidates": result.get("sql_candidates", []),
@@ -144,20 +204,39 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
 
     注意 Execution 子图操作的是单条 SQL，这里在主图层面做 for-loop。
     （也可以用 LangGraph Send API 做并行，本期保持简单）。
+
+    当 cache_hit=True 时，从 cached_sql 构造候选并直接执行（跳过 IR/SS/CG）。
     """
-    from src.sql_generation.sql_generator import SQLStatus
+    from src.sql_generation.sql_generator import SQLCandidate, SQLStatus
     from src.schema_selection.schema_selector import MSchemaFormat
 
     def node(state: NL2SQLState) -> Dict[str, Any]:
-        candidates = state.get("sql_candidates", [])
+        # 如果 history_cache 命中，从 cached_sql 构造候选
+        if state.get("cache_hit", False):
+            cached_sql = state.get("cached_sql", "")
+            if not cached_sql:
+                return {"error": "cache_hit=True 但 cached_sql 为空"}
+
+            cand = SQLCandidate(
+                id="cache_hit",
+                sql=cached_sql,
+                status=SQLStatus.PENDING,
+            )
+            candidates = [cand]
+        else:
+            candidates = state.get("sql_candidates", [])
+
         if not candidates:
             return {"error": "CG 未产出 sql_candidates"}
 
-        # 准备 schema_text 供 LLM 修复使用
+        # 准备 schema_text 供 LLM 修复使用（只有有 schema 时才生成）
         schema = state.get("selected_schema", [])
         try:
-            mschema_dict = MSchemaFormat.create_mschema_schema(schema)
-            schema_text = MSchemaFormat.format_for_llm(mschema_dict)
+            if schema:
+                mschema_dict = MSchemaFormat.create_mschema_schema(schema)
+                schema_text = MSchemaFormat.format_for_llm(mschema_dict)
+            else:
+                schema_text = ""
         except Exception:
             schema_text = ""
 
@@ -252,6 +331,8 @@ def build_main_graph(
     *,
     answerability_checker=None,
     enable_clarification: bool = False,
+    history_cache=None,
+    memory_updater=None,
 ):
     """
     构造并编译 NL2SQL 主图
@@ -264,12 +345,16 @@ def build_main_graph(
         decider: SelfConsistencyDecision 实例
         answerability_checker: AnswerabilityChecker 实例（决策 23，可选）
         enable_clarification: 是否启用 Clarification 节点（Phase 2）
+        history_cache: HistoryCache 实例（决策 30，可选；None 时跳过）
+        memory_updater: MemoryUpdater 实例（决策 29，可选；None 时跳过）
 
     Returns:
         CompiledGraph: 已编译主图，可调用 .invoke(initial_state)
     """
     graph = StateGraph(NL2SQLState)
 
+    # 新增节点：历史命中检测（START 之后，IR 之前）
+    graph.add_node("history_cache", make_history_cache_node(history_cache))
     graph.add_node("ir", make_ir_node(retriever))
     graph.add_node("clarification", make_clarification_node())
     graph.add_node("ss", make_ss_node(selector))
@@ -285,8 +370,23 @@ def build_main_graph(
     graph.add_node("execution", make_execution_node(fix_loop))
     graph.add_node("decision", make_decision_node(decider))
 
-    # 主线
-    graph.add_edge(START, "ir")
+    # 新增节点：记忆自动学习（decision 之后，END 之前）
+    graph.add_node("memory_update", make_memory_update_node(memory_updater))
+
+    # 入口 → history_cache
+    graph.add_edge(START, "history_cache")
+
+    # HistoryCache 条件分支：命中 → execution（复用缓存 SQL）；否则 → ir
+    def route_after_cache(state: NL2SQLState) -> str:
+        if state.get("cache_hit", False):
+            return "execution"
+        return "ir"
+
+    graph.add_conditional_edges(
+        "history_cache",
+        route_after_cache,
+        {"ir": "ir", "execution": "execution"},
+    )
     graph.add_edge("ir", "clarification")
 
     # Clarification 条件分支：done → SS，否则循环回自身（Phase 2 实装）
@@ -340,6 +440,7 @@ def build_main_graph(
     )
 
     graph.add_edge("execution", "decision")
-    graph.add_edge("decision", END)
+    graph.add_edge("decision", "memory_update")
+    graph.add_edge("memory_update", END)
 
     return graph.compile()

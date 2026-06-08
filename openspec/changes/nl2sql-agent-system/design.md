@@ -862,6 +862,267 @@ reports = updater.update_all()
 
 ---
 
+### 决策 28：会话记忆 — 持久化、按用户隔离、注入 Prompt
+
+**决策**：会话记忆持久化到 `data/sessions/{user_id}/{session_id}.json`，一个用户可有多个会话，会话不跨用户。会话内多轮对话历史作为 Prompt 上下文注入后续查询。
+
+**会话数据结构**：
+
+```json
+{
+  "session_id": "uuid-aaa",
+  "user_id": "alice",
+  "created_at": "2026-06-05T10:00:00",
+  "updated_at": "2026-06-05T15:30:00",
+  "status": "active",
+  "conversation_history": [
+    {
+      "turn_index": 1,
+      "user_query": "查一下苹果的销售额",
+      "resolved_keywords": ["苹果", "销售额", "gmv"],
+      "final_sql": "SELECT SUM(gmv) FROM sales WHERE product='Apple'",
+      "final_result_sample": [{"gmv_total": 10000}],
+      "tables_used": ["sales"],
+      "timestamp": "2026-06-05T10:05:00"
+    }
+  ],
+  "context_summary": {
+    "last_topic": "苹果销售额查询",
+    "last_tables": ["sales"],
+    "last_time_range": "2025"
+  }
+}
+```
+
+**与 LangGraph 的集成**：
+- 每次调用 `graph.invoke()` 前，从 SessionMemory 中提取最近 N 轮对话历史，写入 `NL2SQLState.conversation_history`
+- IR 节点读取 `conversation_history`，辅助 follow-up 查询的关键词提取和上下文理解
+- 主图执行完毕后，提取本轮结果写入 SessionMemory
+
+**存储策略**：
+- 持久化到 JSON 文件，`data/sessions/{user_id}/{session_id}.json`
+- 同时在内存中保持 LRU 缓存（热会话加速）
+- 会话不设自动过期，用户可手动删除
+
+**理由**：
+- 会话是用户与系统的连续对话上下文，必须持久化以支持断线恢复和多轮对话
+- 按用户分目录存储，天然隔离，无需额外权限控制
+- 会话记忆作为 Prompt 注入而非修改图结构，保持 LangGraph invoke 的纯函数特性
+
+---
+
+### 决策 29：用户记忆扩展 — 6 维长期记忆 + 自动学习
+
+**决策**：用户长期记忆从 2 维（术语偏好 + 澄清历史）扩展为 6 维，新增常用表、指标定义、查询偏好、领域上下文。
+
+**完整用户记忆结构**：
+
+```json
+{
+  "user_id": "alice",
+  "created_at": "...",
+  "updated_at": "...",
+
+  "term_preferences": {
+    "销售额": {"resolved_to": "gmv", "confidence": 0.9, "source": "user_taught", "last_used": "..."}
+  },
+
+  "frequently_used_tables": {
+    "sales": {"query_count": 23, "last_used": "..."},
+    "orders": {"query_count": 15, "last_used": "..."}
+  },
+
+  "metric_definitions": {
+    "GMV": {
+      "description": "完成订单金额总和",
+      "sql_pattern": "SUM(order_amount) WHERE status='completed'",
+      "source": "auto_learned",
+      "confidence": 0.7,
+      "times_used": 3,
+      "last_used": "..."
+    }
+  },
+
+  "query_preferences": {
+    "default_time_range": "last_30_days",
+    "default_group_by": "daily",
+    "default_sort": "DESC",
+    "default_limit": 10
+  },
+
+  "domain_context": {
+    "industry": "生鲜电商",
+    "department": "运营部",
+    "focus_areas": ["销售分析", "用户增长"]
+  },
+
+  "clarification_history": [...]
+}
+```
+
+**各维度来源与用途**：
+
+| 维度 | 来源 | 下游用途 |
+|------|------|----------|
+| term_preferences | 用户澄清 / 主动教 | TriggerDetector D 类冲突检测、IR 关键词替换 |
+| frequently_used_tables | 自动学习（从 SQL 提取表名） | IR 召回加权、SS 优先保留 |
+| metric_definitions | auto_learned + user_taught | CG 注入已知指标、历史命中检测 |
+| query_preferences | 自动学习（统计频率） | CG 注入默认参数（时间/排序/limit） |
+| domain_context | 从查询中推断 / 用户主动设定 | IR 关键词扩展、CG 生成策略 |
+| clarification_history | 反问流程写入 | QuestionGenerator 上下文 |
+
+**metric_definitions 学习机制**：
+- `auto_learned`：每次查询完成后，如果 SQL 是简单聚合（SUM/COUNT/AVG + WHERE），调 LLM 提取"指标名 → SQL 模式"映射，confidence 从低开始（0.5），多次使用相同模式则递增
+- `user_taught`：用户在反问/澄清中主动说明指标含义，confidence=0.95
+- 自动学习的指标 confidence < 0.8 时不在 Prompt 中主动推荐，仅在历史命中检测中使用
+
+**记忆学习时机**：主图新增 `memory_update` 节点，在 decision 之后执行，自动提取本轮结果写入 UserMemory。
+
+**理由**：
+- 用户长期记忆的核心价值是"让系统越用越懂你"
+- 6 个维度覆盖从术语映射到查询习惯的完整偏好谱系
+- 自动学习降低用户主动教的负担，但用户教的置信度始终最高
+
+---
+
+### 决策 30：历史命中检测 — 复用 SQL 重新执行
+
+**决策**：在 IR 之前新增 `history_cache` 节点，通过 LLM 判断当前查询是否与历史查询等价或可用已知指标直接回答。命中时复用历史 SQL 重新执行，不复用历史 result。
+
+**处理流程**：
+
+```
+1. 从 SessionMemory 取最近 N 轮对话
+2. 从 UserMemory 取 metric_definitions
+3. 调 LLM 判断：
+   - 当前问题是否和历史上某轮完全相同/等价？
+   - 或者当前问题是否可以用已知指标定义直接回答？
+4. 输出：{can_reuse: bool, source: str, cached_sql: Optional[str], confidence: float}
+```
+
+**安全边界**：
+- confidence < 0.8 → 不复用，走完整链路
+- 涉及时间变化的 follow-up（如"昨天的"→"今天的"）不复用，因为数据可能已变
+- 只复用 SQL 不复用 result——数据可能已更新，重新执行保证结果时效性
+- 缓存命中时跳过 IR/SS/CG，直接走 Execution + Decision
+
+**理由**：
+- 用户反复问相同或等价问题是常见场景（"今天销售额" / "现在的销售额"）
+- 复用 SQL 重新执行既节省 IR+SS+CG 的 LLM 调用成本（~20-60s），又保证数据时效性
+- 不复用 result 是因为数据可能已变化，特别是时序类查询
+
+---
+
+### 决策 31：问数服务 API — FastAPI + SSE 流式
+
+**决策**：基于 FastAPI 提供问数服务 HTTP API，SSE 流式输出每个阶段的中间状态，避免用户在等待时无反馈。
+
+**API 设计**：
+
+```
+POST /api/v1/query              # 核心查询接口（SSE 流式）
+GET  /api/v1/sessions/{user_id} # 列出用户的所有会话
+GET  /api/v1/sessions/{session_id}/history  # 获取会话对话历史
+DELETE /api/v1/sessions/{session_id}         # 删除会话
+GET  /api/v1/users/{user_id}/memory          # 获取用户长期记忆
+GET  /api/v1/users/{user_id}/metrics         # 获取用户的指标定义
+GET  /api/v1/health                           # 健康检查
+```
+
+**POST /api/v1/query 请求**：
+
+```json
+{
+  "query": "查一下苹果的销售额",
+  "session_id": "uuid-aaa",
+  "user_id": "alice"
+}
+```
+
+**SSE 流式响应事件序列**：
+
+```
+data: {"type": "cache_check", "hit": false}
+
+data: {"type": "stage", "stage": "ir", "status": "started"}
+data: {"type": "stage", "stage": "ir", "status": "completed", "keywords": ["苹果","销售额"]}
+
+data: {"type": "stage", "stage": "ss", "status": "started"}
+data: {"type": "stage", "stage": "ss", "status": "completed"}
+
+data: {"type": "stage", "stage": "cg", "status": "started"}
+data: {"type": "stage", "stage": "cg", "status": "completed", "sql_count": 3}
+
+data: {"type": "stage", "stage": "execution", "status": "started"}
+data: {"type": "stage", "stage": "execution", "status": "completed"}
+
+data: {"type": "clarification", "question": "...", "options": [...], "trigger_type": "..."}
+
+data: {"type": "result", "session_id": "uuid-aaa", "turn_index": 3,
+       "final_sql": "SELECT ...", "final_result": [...], "execution_time_ms": 2340}
+
+data: {"type": "done"}
+```
+
+**缓存命中时**：
+
+```
+data: {"type": "cache_check", "hit": true, "source": "session_history", "confidence": 0.95}
+data: {"type": "result", "final_sql": "SELECT ...", "from_cache": true}
+data: {"type": "done"}
+```
+
+**服务架构**：
+
+- 启动时一次性加载所有组件（DatabaseConnector、LSHIndexer、VectorStoreManager、LLMClient、各 Agent）
+- 会话管理器：内存 LRU 缓存 + 持久化 JSON
+- 用户记忆管理器：LRU 缓存（最多 100 个用户），读时加载、写时持久化
+- API 认证本期不做，代码中标注 TODO
+
+**理由**：
+- SSE 流式让前端能实时展示各阶段状态（"正在检索..."、"正在生成 SQL..."），避免用户在傻等
+- FastAPI 原生 async + Pydantic 校验 + 自动文档，是 Python API 服务的最佳实践
+- 会话和用户记忆的管理与 API 层绑定，不在 LangGraph 图内处理
+
+---
+
+### 决策 32：主图新增 history_cache + memory_update 节点
+
+**决策**：主图在现有流程基础上新增两个节点，调整后的完整流程为：
+
+```
+START → history_cache → (命中→execution→decision→memory_update→END)
+              ↓未命中
+              ir → clarification → ss → answerability_check → cg → execution → decision → memory_update → END
+```
+
+**history_cache 节点**：
+- 位置：START 之后，IR 之前
+- 功能：检测历史命中，命中时直接复用 SQL 跳到 execution
+- 条件边：`cache_hit == True` → execution；否则 → ir
+
+**memory_update 节点**：
+- 位置：decision 之后，END 之前
+- 功能：提取本轮结果，更新 SessionMemory（追加 Turn）和 UserMemory（自动学习）
+- 条件边：无条件 → END
+
+**NL2SQLState 新增字段**：
+
+```python
+conversation_history: List[Dict[str, Any]]  # 会话历史（由 API 层注入）
+cache_hit: bool                             # 历史命中标记
+cached_sql: Optional[str]                   # 命中的缓存 SQL
+cache_source: Optional[str]                 # 命中来源
+cache_confidence: float                     # 命中置信度
+```
+
+**理由**：
+- history_cache 前置可节省大量 LLM 调用成本
+- memory_update 后置确保所有结果都已确定后才学习
+- 会话历史通过 state 注入而非在图内管理，保持图的无副作用特性
+
+---
+
 ## 触发条件详细规约
 
 | 条件 ID | 名称 | 检测逻辑 | 是否触发搜索 |
@@ -892,10 +1153,25 @@ src/
 │   ├── __init__.py
 │   ├── answerability.py        # AnswerabilityChecker：可回答性检查（决策 23）
 │   └── result_verifier.py      # ResultVerifier：结果可信度验证（决策 24）
-└── memory/
+├── memory/
+│   ├── __init__.py
+│   ├── user_memory.py          # UserMemory 主类（6 维长期记忆，决策 29）
+│   ├── session_memory.py       # SessionMemory 会话记忆（决策 28）
+│   ├── session_manager.py      # SessionManager 会话生命周期管理
+│   ├── history_cache.py        # HistoryCache 历史命中检测（决策 30）
+│   ├── memory_updater.py       # MemoryUpdater 自动学习模块（决策 29）
+│   └── storage.py              # JSON 文件读写 + 文件锁 + 原子写入
+└── api/
     ├── __init__.py
-    ├── user_memory.py          # UserMemory 主类
-    └── storage.py              # JSON 文件读写 + 文件锁
+    ├── app.py                  # FastAPI 应用 + 生命周期
+    ├── routes/
+    │   ├── __init__.py
+    │   ├── query.py            # POST /query（SSE 流式，决策 31）
+    │   ├── session.py          # 会话 CRUD
+    │   └── user.py             # 用户记忆查询
+    ├── schemas.py              # Pydantic 请求/响应模型
+    ├── deps.py                 # 依赖注入
+    └── stream.py               # SSE 事件生成器
 ```
 
 ---
