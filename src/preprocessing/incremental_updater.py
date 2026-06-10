@@ -116,7 +116,7 @@ class IncrementalUpdater:
         self.bge_model_path = bge_model_path or os.getenv("BGE_M3_MODEL_PATH", "BAAI/bge-m3")
 
         self.manifest = Manifest(
-            manifest_path=manifest_path or str(Path(data_dir) / "preprocessed" / "manifest.json")
+            manifest_path=manifest_path or str(Path(data_dir) / "manifest.json")
         )
         self.persist_dir = str(Path(data_dir) / "preprocessed" / "chroma")
 
@@ -1139,7 +1139,7 @@ def check_updates(db_id: str = None, data_dir: str = None) -> List[dict]:
 
     from src.preprocessing.build_schema_index import find_bird_databases
     db_map = find_bird_databases(data_dir)
-    manifest = Manifest(manifest_path=str(Path(data_dir) / "preprocessed" / "manifest.json"))
+    manifest = Manifest(manifest_path=str(Path(data_dir) / "manifest.json"))
 
     results = []
     target_dbs = [db_id] if db_id else sorted(db_map.keys())

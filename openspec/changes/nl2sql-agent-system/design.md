@@ -1266,3 +1266,418 @@ class NL2SQLState(TypedDict):
 | 方案 B 过严导致正常查询被拒 | Prompt 中强调"只有明确答非所问才判不可信"；可通过配置 `verification_strictness` 调整 |
 | 两次 LLM 调用增加延迟 | 方案 A 拦截时反而省时间（~2-3s vs ~30-120s）；方案 B 只在最终决策后调用一次 |
 | 拒答用户体验差 | 拒答时返回详细原因 + 缺失信息说明，让用户知道为什么无法回答 |
+
+---
+
+### 决策 49：API 多数据库分池 — DbContextPool（LRU）+ 全局共享单例
+
+**背景与问题**
+
+当前 API 实现（`src/api/deps.py:init_components` + `run_api.py:bootstrap`）存在以下问题：
+
+1. **数据库写死**：服务启动时绑定单一 `db_id`，整个进程只能服务一个数据库；换库必须重启服务。
+2. **schema 范围不可控**：`QueryRequest` 缺少 `db_id` 字段，请求层面无法选库。
+3. **记忆未按场景隔离召回**：当前默认 `metric_definitions(min_confidence=0.7)` 全量召回，未考虑跨数据库时指标定义可能不通用。
+
+**目标**：
+
+- 一次启动可服务全部数据库
+- 请求参数显式传 `user_id` / `session_id` / `db_id`，决定使用哪套数据库资源、复用哪段会话历史与用户记忆
+- 控制内存占用（单 worker 部署，BGE 等大模型只加载一次）
+
+**核心决策**
+
+采用 **「全局单例 + DbContext LRU 池」** 双层架构：
+
+```
+┌─────────────────────────────────────────────────────┐
+│         全局单例层（启动加载，进程级永生）              │
+├─────────────────────────────────────────────────────┤
+│  BGE-M3 (SchemaVectorizer)   ~2GB                   │
+│  VectorStore (chroma 共用)    ~50MB                  │
+│  LLMClient                                          │
+│  SQLGenerator                                       │
+│  SelfConsistencyDecision                            │
+│  AnswerabilityChecker                               │
+│  ResultVerifier                                     │
+│  HistoryCache                                       │
+│  MemoryUpdater                                      │
+│  SessionManager (文件存储)                            │
+└─────────────────────────────────────────────────────┘
+                       ▲
+                       │ 被引用
+                       │
+┌─────────────────────────────────────────────────────┐
+│       DbContextPool (max=2，按 db_id 懒加载)         │
+├─────────────────────────────────────────────────────┤
+│  DbContext("california_schools")                    │
+│      ├─ DatabaseConnector                           │
+│      ├─ LSHIndexer                                  │
+│      ├─ InformationRetrieval（共享 BGE / chroma）    │
+│      ├─ SchemaSelector                              │
+│      ├─ SQLExecutor                                 │
+│      ├─ SQLFixLoop                                  │
+│      └─ CompiledGraph（每个 db 一份主图）            │
+│                                                     │
+│  DbContext("financial")                             │
+│      └─ ... 同上                                    │
+└─────────────────────────────────────────────────────┘
+```
+
+**关键约束**
+
+| 资源                  | 生命周期            | 数量          | 备注                            |
+|----------------------|---------------------|---------------|---------------------------------|
+| BGE-M3 / VectorStore | 进程级永生           | 1            | 与 db_id 无关，所有 db 共用       |
+| LLM / Generator / Decider / Answerability / HistoryCache / MemoryUpdater | 进程级永生 | 各 1 | 无状态或与 db 无关 |
+| SessionManager       | 进程级永生           | 1            | 内部 LRU + 文件持久化             |
+| UserMemory           | LRU 缓存（已有）     | 0 ~ 100       | 现有 `_user_memory_cache` 不动   |
+| DbContext            | LRU 淘汰             | 0 ~ 2         | 按 db_id 懒加载                  |
+
+**DbContextPool 行为约定**
+
+- `max_size = 2`（环境变量 `DB_POOL_MAX_SIZE` 可覆盖）
+- 首次访问某 db_id → 现场构造（首请求慢 5-10 秒，加载 LSH + 建主图）
+- 命中已缓存 db → 立即返回，并在 OrderedDict 中 move_to_end（LRU 提升）
+- 池满淘汰策略：**淘汰最久未用且 refcount=0 的 ctx**；若所有 ctx 都在使用中，**跳过淘汰并允许池短暂超 max**（不阻塞请求）
+- 淘汰时调用 `ctx.close()` 释放 sqlite 连接
+
+**请求路径变化**
+
+```
+   旧：POST /query {user_id, session_id, query}
+        └─ get_graph()  ← 进程唯一的 graph，绑死一个 db
+
+   新：POST /query {user_id, session_id, db_id, query}
+        ├─ get_db_pool().acquire(db_id) → DbContext
+        │     └─ 用 db_ctx.graph 跑主图
+        │     └─ finally: pool.release(db_id)
+        ├─ get_user_memory(user_id) ← 已有 LRU
+        └─ session_manager.get_or_create_session(session_id, user_id)
+```
+
+**启动模型**
+
+- **不预加载所有 db**：启动只装全局单例（BGE + LLM + 各 Agent + SessionManager + 空 DbContextPool）
+- **可选 warm-up**：`run_api.py --db_id <id>` 在 uvicorn 启动前预加载指定 db，避免首请求慢
+- **lifespan 集中初始化**：从 `run_api.py:bootstrap` 改为 `src/api/app.py:lifespan` startup 钩子调用 `init_globals()`；shutdown 钩子调 `pool.close_all()`
+
+**并发与生命周期**
+
+- 仅支持**单 worker** (`uvicorn.run(app, workers=1)`)：不引入 Redis 等共享存储
+- FastAPI 异步框架下多协程并发：`DbContextPool` 用 `threading.RLock()` 保护 dict 操作
+- DbContext 引用计数防淘汰：query handler 用 `try/finally` 包 `acquire/release`
+- SessionManager 文件并发：单 worker 下进程内 LRU + 文件 IO 不会出现 lost update
+
+**Memory 召回策略**
+
+- `user_memory` 全量加载（一个用户的记忆容量小），但调用 `get_metric_definitions(min_confidence)` 时按相关性过滤
+- `session_memory` 按 `session_id` 隔离，每次请求注入最近 N 轮历史
+- 未引入「按 db_id 分桶 user_memory」（用户记忆容量小，跨 db 的指标定义可由 LLM 在 prompt 中自行判断是否适用）
+
+**API 字段变化**
+
+```diff
+  POST /api/v1/query
+  {
+    "query":      str,
+    "session_id": str,
+    "user_id":    str,
++   "db_id":      str       ← 新增必填
+  }
+```
+
+新增端点：
+
+```
+  GET  /api/v1/databases                 → 列出 data/ 下所有可用 db_id
+  GET  /api/v1/databases/{db_id}/tables  → 列出指定 db 的表清单
+  POST /api/v1/sessions                  → 显式创建新会话（body: {user_id, db_id?}）
+```
+
+**为什么不引入 Redis / Backend 抽象**
+
+- 单 worker 部署下，进程内 LRU 与文件存储天然一致，无需共享存储
+- 抽象层（Backend Protocol）属 YAGNI：未来确需多 worker 时再重构 SessionManager / UserMemory 的存储后端
+- 大幅减少改动面（仅 ~9 个文件），降低出错风险
+
+**风险与缓解**
+
+| 风险                                       | 缓解                                     |
+|------------------------------------------|-----------------------------------------|
+| 首次访问冷 db 时请求超时（5-10 秒）           | 提供 `--db_id` warm-up；前端展示加载提示    |
+| 内存预算超出（BGE 2GB + 2 × ~50MB LSH）     | DB_POOL_MAX_SIZE 默认 2；可通过配置调整   |
+| LRU 淘汰时 sqlite 连接被在用请求持有         | 引用计数：refcount > 0 则跳过该 ctx 的淘汰 |
+| 多协程并发构造同一 db                       | RLock 包裹整个 acquire；幂等 double-check |
+| 未来切换多 worker 需要重构                  | 接受 YAGNI：当前不投入抽象成本             |
+
+**取代关系**
+
+本决策**取代**决策 31 中以下内容：
+- 「启动时一次性加载所有组件」→ 改为「启动加载全局单例 + 按需懒加载 DbContext」
+- 「会话管理器：内存 LRU 缓存 + 持久化 JSON」→ 保留（不变）
+- API 服务架构改为多数据库分池模型
+
+决策 31 的 API 端点设计（SSE 事件序列、health 接口等）仍然有效。
+
+---
+
+### 决策 50：API 真流式响应 + LLM 思考链推送
+
+**背景与问题**
+
+当前 `src/api/routes/query.py` 的 `event_stream()` 实现存在严重缺陷：
+
+```python
+# 现状（query.py:88）
+stream_results = await loop.run_in_executor(None, _run_stream, graph, initial_state)
+for update in stream_results:        # ← 先把整个 graph 跑完再 yield
+    yield _format_sse(...)
+```
+
+`_run_stream` 在 executor 中把 `graph.stream()` 跑完、把所有 update 收进 list，**再**回到 async 上下文 yield SSE 事件。等价于"先做完所有工作，再一次性吐出全部进度"。
+
+实测一条 query 在 California Schools 库上：
+- 总耗时约 5 分钟
+- 200 OK 在 3 秒时写出
+- body 第一个字节在 5 分钟后才生成
+- 客户端 httpx 默认 5 秒读超时，直接 `httpx.ReadTimeout`
+
+且节点内部 LLM 调用本身耗时数十秒（关键词提取 60s、列相关性评估 80s、可回答性 51s 等），用户在节点内部毫无进度感知。
+
+**目标**
+
+1. **真流式**：每个 LangGraph 节点完成时立即 yield SSE，客户端实时可见进度。
+2. **思考链推送**：把 qwen3 等模型的 `reasoning_content`（自然语言思考过程）作为独立事件流推送，让用户能"读懂模型在想什么"。
+3. **不推 JSON 业务输出 token**：业务调用全部用 `chat_json`（JSON 模式），token 流出来是 JSON 片段（`{`、`"answerable"`、`:` ...）不可读。不向客户端推送这类 chunk，等 LLM 完整返回 + 解析后再以结构化事件推送（如 `answerability`、`keywords`、`sql_candidates` 等）。
+4. **心跳防断流**：每 15 秒发心跳防止客户端/反向代理超时。
+
+**核心改动**
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                  改造前后对比                                  │
+└──────────────────────────────────────────────────────────────┘
+
+   改造前（伪流式）                  改造后（真流式 + 思考链）
+   ━━━━━━━━━━━━━━━━━━                ━━━━━━━━━━━━━━━━━━━━━━━━
+
+   T=0   POST /query                  T=0    POST /query
+         (no body)                    T=0.1  stage(history_cache, started)
+         ...                          T=2    stage(history_cache, done)
+         5 分钟等待                   T=2.1  stage(ir, started)
+         ...                          T=2.5  llm_thinking("我需要分析这个问题...")
+   T=5m  yield stage(ir,done)         T=5    llm_thinking("应该提取出'学校'和'各科成绩'...")
+         yield stage(ss,done)         T=60   keywords({groups:[...]})
+         yield stage(cg,done)         T=60.1 stage(ir, done)
+         yield result                  T=60.1 stage(ss, started)
+         yield done                    T=80   llm_thinking("评估列相关性...")
+                                        ...
+                                        T=5m   final_decision({...})
+                                        T=5m   result(sql=..., data=...)
+                                        T=5m   done
+```
+
+**架构：contextvars + asyncio.Queue 三层桥接**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│   ┌──────────────────┐                                          │
+│   │ FastAPI handler  │  asyncio loop                            │
+│   │  event_stream()  │◄────────────────── async for evt in Q   │
+│   └────────┬─────────┘                                          │
+│            │ run_in_executor                                    │
+│   ┌────────▼─────────┐                                          │
+│   │ Thread (sync)    │  graph.stream(state)                     │
+│   │  graph 执行       │  每个 node 完成 → Q.put_nowait(...)     │
+│   └────────┬─────────┘                                          │
+│            │ contextvar 注入 stream_emitter                      │
+│   ┌────────▼─────────┐                                          │
+│   │ LLMClient.chat   │  stream=True 接收 token chunk           │
+│   │   _stream(...)   │  仅当 reasoning_content 非空时           │
+│   │                  │  emitter.emit("llm_thinking", reasoning) │
+│   │                  │  正文 content 累积为完整字符串后返回       │
+│   └──────────────────┘  → Q.put_nowait(...)                     │
+│                                                                 │
+│   ┌──────────────────────────────────────┐                      │
+│   │ asyncio.Queue (线程安全 put_nowait)   │                      │
+│   └──────────────────────────────────────┘                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键设计点**
+
+1. **StreamEmitter（事件发射器）**
+
+```python
+# src/api/streaming.py
+class StreamEmitter:
+    """线程安全的 SSE 事件发射器"""
+    def __init__(self, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+        self.queue = queue
+        self.loop = loop
+
+    def emit(self, event_type: str, data: dict) -> None:
+        # 从同步线程往 asyncio.Queue 推事件
+        self.loop.call_soon_threadsafe(
+            self.queue.put_nowait, {"type": event_type, "data": data}
+        )
+
+# contextvar 传递 emitter，无需修改函数签名
+current_emitter: ContextVar[Optional[StreamEmitter]] = ContextVar(
+    "current_emitter", default=None
+)
+```
+
+2. **LLMClient 增加思考链流式方法**
+
+```python
+# utils/llm_client.py 新增
+def chat_stream(self, messages, on_thinking=None, response_format=None, **kw) -> str:
+    """
+    流式调用，仅把 reasoning_content（思考链）实时回调；
+    正文 content 累积为完整字符串后返回（用于后续 json.loads）
+
+    设计决策：不推送正文 token（业务调用全是 JSON 模式，token 不可读）。
+    思考链是自然语言，对用户友好，单独推送。
+    """
+    stream = self.client.chat.completions.create(
+        model=self.model, messages=messages, stream=True,
+        response_format=response_format,
+        extra_body={"enable_thinking": True}  # qwen3 思考链
+    )
+    full_text = ""
+    for chunk in stream:
+        delta = chunk.choices[0].delta
+        # 思考链：自然语言 → 实时推送
+        if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+            on_thinking and on_thinking(delta.reasoning_content)
+        # 正文：JSON 片段 → 仅累积，不推送
+        if delta.content:
+            full_text += delta.content
+    return full_text
+
+def chat_json(self, messages, ...):
+    """改造：内部检查 current_emitter，有则走 chat_stream 推送思考链"""
+    emitter = current_emitter.get()
+    if emitter is None:
+        return self._chat_json_blocking(messages, ...)   # 旧路径
+    node_name = current_node.get() or "unknown"
+    text = self.chat_stream(
+        messages,
+        on_thinking=lambda c: emitter.emit("llm_thinking", {"node": node_name, "text": c}),
+        response_format={"type": "json_object"},
+    )
+    return self._parse_json(text)  # 解析为 dict + 正则兜底
+```
+
+3. **节点感知（当前所在节点名）**
+
+也用 contextvar：
+
+```python
+current_node: ContextVar[Optional[str]] = ContextVar("current_node", default=None)
+
+# 在 main_graph.py 的节点工厂里包一层：
+def make_ir_node(retriever):
+    def node(state):
+        current_node.set("ir")
+        emitter = current_emitter.get()
+        emitter and emitter.emit("stage", {"node": "ir", "status": "started"})
+        try:
+            result = retriever.build_graph().invoke(...)
+            emitter and emitter.emit("stage", {"node": "ir", "status": "done",
+                                                "keywords": result.get("keywords")})
+            return {...}
+        finally:
+            current_node.set(None)
+    return node
+```
+
+4. **event_stream 重写**
+
+```python
+async def event_stream():
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+    emitter = StreamEmitter(queue, loop)
+    sentinel = object()
+
+    def run_graph():
+        token = current_emitter.set(emitter)
+        try:
+            for update in graph.stream(initial_state):
+                # graph.stream 本身的 update 也推（节点级 raw 更新）
+                emitter.emit("graph_update", _serialize(update))
+        finally:
+            current_emitter.reset(token)
+            queue.put_nowait(sentinel)
+
+    asyncio.create_task(asyncio.to_thread(run_graph))
+
+    last_heartbeat = time.time()
+    while True:
+        try:
+            evt = await asyncio.wait_for(queue.get(), timeout=15.0)
+        except asyncio.TimeoutError:
+            yield ": heartbeat\n\n"
+            continue
+        if evt is sentinel:
+            yield _format_sse("done", {"has_result": bool(...)})
+            break
+        yield _format_sse(evt["type"], evt["data"])
+```
+
+**SSE 事件类型表（决策 50 定稿）**
+
+| 事件类型          | 触发时机                          | data 字段                              |
+|------------------|----------------------------------|---------------------------------------|
+| `stage`          | 节点开始/结束                     | `{node, status: started/done, ...}` |
+| `cache_check`    | history_cache 完成                | `{hit, source, confidence, cached_sql}` |
+| `llm_thinking`   | qwen3 reasoning_content chunk     | `{node, text}` ← 自然语言思考片段       |
+| `keywords`       | IR 关键词提取完成                  | `{groups: [...]}`                    |
+| `schema_recall`  | IR schema 召回完成                | `{groups: [{name, top_columns}]}`    |
+| `answerability`  | 可回答性检查完成                  | `{answerable, confidence, reason}`   |
+| `sql_candidates` | CG 候选 SQL 生成完成              | `{candidates: [{id, sql}]}`          |
+| `execution`      | 每个候选 SQL 执行完成              | `{candidate_id, success, rows}`      |
+| `final_decision` | Decision 完成                     | `{selected_id, reason}`              |
+| `result`         | 最终结果                         | `{sql, result}`                      |
+| `error`          | 任意环节错误                     | `{error, node?}`                     |
+| `done`           | 整条 query 完成                   | `{has_result}`                       |
+| `: heartbeat`    | 15 秒内无事件                     | （SSE 注释行）                        |
+
+**注**：决策 50 不推送 `llm_chunk`（业务 LLM 调用全是 JSON 模式，token 是 `{`、`"answerable"`、`:` 之类的片段，对用户没价值）。正文等 LLM 完整返回 + 解析后以结构化事件（`answerability` / `keywords` 等）一次性推出。思考链是自然语言，独立推送为 `llm_thinking`。
+
+**客户端配合**
+
+httpx 配置必须解除 read timeout：
+
+```python
+with httpx.stream(..., timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10)):
+    ...
+```
+
+或保留 timeout 但依赖心跳——每个心跳重置客户端读计时器。
+
+**约束与限制**
+
+- **JSON 模式与流式的兼容**：OpenAI SDK 在 `stream=True` 下不支持 `response_format={"type": "json_object"}`。采用变通方案：流式拿到完整文本后再 `json.loads`，prompt 中加强 JSON 输出约束。
+- **思考链开关**：`enable_thinking` 是 qwen3 专属 `extra_body`。其他模型时该开关无效，`reasoning_content` 字段为 None，自动降级为不发 `llm_thinking` 事件。
+- **回退路径保留**：`current_emitter.get() is None` 时 LLMClient 走旧的阻塞 `chat`/`chat_json` 路径，保证测试、CLI、离线脚本不受影响。
+
+**风险与缓解**
+
+| 风险                                       | 缓解                                  |
+|------------------------------------------|-------------------------------------|
+| 流式 + JSON 模式可能产生不可解析 JSON         | 末尾尝试 `re.search(r'\{[\s\S]*\}', text)` 兜底；prompt 强约束 JSON 输出 |
+| 思考链 token 量大（一次 query 可能数 KB）     | 客户端按 node 分组累加显示；网络开销可控 |
+| contextvar 在 thread executor 中失效        | 用 `contextvars.copy_context().run()` 显式传递 |
+| 反向代理（nginx）缓冲 SSE 导致延迟           | response headers 已带 `X-Accel-Buffering: no`；心跳保活 |
+| qwen3 思考链占用大量推理时间                  | 提供 `enable_thinking` 配置项；默认开，可关闭 |
+| 非 qwen3 模型无 reasoning_content           | `chat_stream` 检测字段存在性，无则不推送 llm_thinking |
+| 旧调用方（测试）依赖 `chat()/chat_json()`     | 保留旧方法签名，emitter 未设置时走旧路径 |
+
+**取代关系**
+
+- **取代决策 31 的"伪流式 SSE 实现"**：从"先攒后吐"改为"边跑边吐 + token 级"。
+- 不取代 §22 决策 49 的 DbContextPool 设计，§23 在其基础上增强。

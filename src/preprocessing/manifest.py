@@ -6,7 +6,7 @@
 #   2. 当前 DB schema 与 Manifest 的 diff 计算
 #   3. 从 schema 构建 Manifest 条目
 #
-# Manifest 存储路径: data/preprocessed/manifest.json
+# Manifest 存储路径: data/manifest.json
 # ============================================================================
 
 
@@ -97,12 +97,12 @@ class Manifest:
     - 增量更新时通过 diff 确定变更范围
     """
 
-    DEFAULT_MANIFEST_PATH = "data/preprocessed/manifest.json"
+    DEFAULT_MANIFEST_PATH = "data/manifest.json"
 
     def __init__(self, manifest_path: str = None):
         """
         Args:
-            manifest_path: Manifest 文件路径，默认 data/preprocessed/manifest.json
+            manifest_path: Manifest 文件路径，默认 data/manifest.json
         """
         self.manifest_path = manifest_path or self.DEFAULT_MANIFEST_PATH
 
@@ -446,7 +446,7 @@ def write_manifest_for_db(
     Args:
         db_id: 数据库 ID
         data_dir: 数据目录
-        manifest_path: Manifest 文件路径（默认 data/preprocessed/manifest.json）
+        manifest_path: Manifest 文件路径（默认 data/manifest.json）
         module: 模块名，"schema_index" / "schema_graph" / "lsh_index"
                 指定时只更新该模块的 build_time；不指定时重建完整条目
 

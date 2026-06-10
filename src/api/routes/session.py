@@ -1,5 +1,6 @@
 """会话管理接口
 
+- POST /api/v1/sessions — 显式创建新会话（决策 49）
 - GET /api/v1/sessions — 列出用户会话（?user_id=xxx）
 - GET /api/v1/sessions/{session_id}/history — 获取对话历史
 - DELETE /api/v1/sessions/{session_id} — 删除会话
@@ -8,9 +9,32 @@
 from fastapi import APIRouter, Depends, Query
 
 from src.api.deps import get_session_manager
-from src.api.schemas import ErrorResponse, SessionHistoryResponse, SessionSummary
+from src.api.schemas import (
+    CreateSessionRequest,
+    CreateSessionResponse,
+    ErrorResponse,
+    SessionHistoryResponse,
+    SessionSummary,
+)
 
 router = APIRouter()
+
+
+@router.post("/sessions", response_model=CreateSessionResponse)
+async def create_session(
+    body: CreateSessionRequest,
+    session_manager=Depends(get_session_manager),
+):
+    """显式创建新会话（决策 49）
+
+    body.db_id 当前仅作记录，不在 SessionManager 内强制绑定；
+    实际查询时通过 POST /query 的 db_id 字段选择数据库。
+    """
+    session = session_manager.create_session(user_id=body.user_id)
+    return CreateSessionResponse(
+        session_id=session.session_id,
+        user_id=body.user_id,
+    )
 
 
 @router.get("/sessions")

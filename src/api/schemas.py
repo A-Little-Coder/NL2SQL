@@ -11,6 +11,36 @@ class QueryRequest(BaseModel):
     query: str = Field(..., description="用户自然语言查询")
     session_id: str = Field(..., description="会话 ID")
     user_id: str = Field(default="default", description="用户标识")
+    db_id: str = Field(..., min_length=1, description="数据库 ID（决策 49，决定使用哪套数据库资源）")
+
+
+class CreateSessionRequest(BaseModel):
+    """显式创建会话的请求（决策 49）"""
+    user_id: str = Field(..., description="用户标识")
+    db_id: Optional[str] = Field(default=None, description="可选：会话关联的数据库 id")
+
+
+class CreateSessionResponse(BaseModel):
+    """显式创建会话的响应"""
+    session_id: str
+    user_id: str
+
+
+class DatabaseInfo(BaseModel):
+    """数据库摘要（GET /databases）"""
+    db_id: str
+    db_path: str
+
+
+class DatabaseListResponse(BaseModel):
+    """数据库列表响应"""
+    databases: List[DatabaseInfo]
+
+
+class TableListResponse(BaseModel):
+    """表清单响应"""
+    db_id: str
+    tables: List[str]
 
 
 class SSEEvent(BaseModel):

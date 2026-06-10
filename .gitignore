@@ -37,7 +37,7 @@ conda-env.yaml
 *.local.json
 
 # Data files
-data/
+/data/
 
 # User memory files (persisted between sessions)
 data/user_memory/*.json
@@ -49,8 +49,14 @@ vector_store/
 lsh_index/
 indexes/
 
+# Scratch / temp files
+try.py
+
 # Logs
 *.log
+
+# Learn
+/learn/
 
 # OS
 .DS_Store

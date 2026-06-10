@@ -457,3 +457,123 @@
 - [x] 21.7 编写 `tests/memory/test_history_cache.py`：覆盖命中/未命中/低置信度/时间相关 follow-up
 - [x] 21.8 编写 `tests/memory/test_memory_updater.py`：覆盖常用表学习/指标定义学习/查询偏好学习/会话上下文更新
 
+## 22. API 多数据库分池重构（决策 49）
+
+依据 决策 49：将 API 从「启动时绑定单一 db」改为「全局单例 + DbContext LRU 池」，支持单进程服务多数据库。
+
+- [x] 22.1 新增 `src/api/db_pool.py`：DbContext + DbContextPool
+  - `class DbContext`：持有 `db_id` / `connector` / `lsh_indexer` / `retriever` / `selector` / `executor` / `fix_loop` / `graph` / `refcount`
+  - `DbContext.close()`：disconnect connector，清理资源
+  - `class DbContextPool`：
+    - `__init__(max_size, globals_)`：保存全局组件引用、初始化 OrderedDict 缓存
+    - `acquire(db_id) -> DbContext`：命中 LRU move_to_end；未命中触发 `_build`；refcount += 1
+    - `release(db_id)`：refcount -= 1
+    - `_build(db_id)`：按 `tests/e2e_live_with_memory.py` 第 282-366 行的逻辑构造组件（复用全局 BGE / VectorStore / LLM / Generator / Decider / Answerability / HistoryCache / MemoryUpdater）
+    - `_evict_if_needed()`：池满时遍历找 refcount=0 的最久未用 ctx 淘汰；全部在用则跳过（允许短暂超 max）
+    - `close_all()`：shutdown 时关闭所有 ctx
+  - 用 `threading.RLock()` 保护 OrderedDict 操作
+- [x] 22.2 重写 `src/api/deps.py`
+  - 删除现有 `init_components` 写死方案
+  - 新增模块级全局变量：`_bge_vectorizer` / `_vector_store` / `_llm_client` / `_generator` / `_decider` / `_answerability` / `_history_cache` / `_memory_updater` / `_session_manager` / `_db_pool`
+  - 新增 `init_globals()`：从 `.env` 读 `BGE_M3_MODEL_PATH` / `QWEN_MODEL` / `DB_POOL_MAX_SIZE`，按依赖顺序构造所有全局组件 + 实例化 `_db_pool`
+  - 新增 FastAPI 依赖项：`get_db_pool()` / `get_globals()` / `get_db_context(db_id)`（前两个返回单例，第三个内部 `pool.acquire`）
+  - 保留：`get_session_manager()` / `get_user_memory(user_id)`
+- [x] 22.3 修改 `src/api/schemas.py`
+  - `QueryRequest` 新增 `db_id: str = Field(..., description="数据库 id")`
+  - 字段验证：`db_id` 非空字符串
+- [x] 22.4 修改 `src/api/routes/query.py`
+  - 改写 `query_endpoint`：从 body 取 `db_id` → `pool.acquire(db_id)` 拿 `db_ctx` → 用 `db_ctx.graph` 替代 `Depends(get_graph)`
+  - `try/finally` 包裹整段 SSE 流，`finally` 中调 `pool.release(db_id)`
+  - history_cache / memory_updater 仍走全局单例（不在 DbContext 内）
+- [x] 22.5 新增 `src/api/routes/databases.py`
+  - `GET /api/v1/databases`：扫描 `data/` 目录返回所有可用 db_id（复用 `find_bird_databases` 逻辑）
+  - `GET /api/v1/databases/{db_id}/tables`：触发 `pool.acquire(db_id)` 后调 `connector.get_tables()`；finally release
+- [x] 22.6 修改 `src/api/routes/session.py`
+  - 新增 `POST /api/v1/sessions`：body `{user_id, db_id?}` → 调 `session_manager.create_session(user_id)` 返回 `{session_id}`
+  - 现有 list/get/delete 接口不变
+- [x] 22.7 修改 `src/api/app.py` 的 `lifespan`
+  - startup：调 `init_globals()`，并根据 `--db_id` 启动参数（通过 env 或 app.state 传入）做可选 warm-up
+  - shutdown：调 `_db_pool.close_all()`
+- [x] 22.8 重写 `run_api.py`
+  - 删除 `bootstrap(db_id)` 全量初始化逻辑
+  - `--db_id` 参数改为可选（默认 None），传值时通过 `app.state.warmup_db_id` 注入 lifespan
+  - `--port` / `--host` / `--reload` 保留
+  - 不再传 `workers` 参数（始终单 worker）
+- [x] 22.9 修改 `.env.example`，新增配置项
+  - `DB_POOL_MAX_SIZE=2`（DbContext 池最大容量）
+  - 文档说明 BGE / VectorStore / LLM 等组件为全局单例，无需配置
+- [x] 22.10 编写 `tests/api/test_db_pool.py`
+  - 测试 LRU 淘汰顺序
+  - 测试 refcount > 0 时跳过淘汰（允许短暂超 max）
+  - 测试并发 acquire/release 不破坏 OrderedDict
+  - 测试 `close_all()` 释放所有 connector
+- [x] 22.11 编写 `tests/api/test_query_multi_db.py`
+  - 测试同一 session_id 切换 db_id 不会污染会话历史
+  - 测试 SSE 流式响应正确（mock graph）
+  - 测试缺少 `db_id` 时返回 422
+- [x] 22.12 编写 `tests/api/test_databases.py`
+  - 测试 `GET /databases` 返回所有 db_id
+  - 测试 `GET /databases/{db_id}/tables` 返回表清单
+  - 测试不存在的 db_id 返回 404
+
+## 23. API 真流式 + LLM 思考链推送（决策 50）
+
+依据 决策 50：把伪流式 SSE 改为「边跑边吐 + LLM 思考链推送 + 心跳」三位一体。
+**注：不推送 LLM 正文 token**（业务全为 JSON 模式，token 是 JSON 片段不可读），仅推送 qwen3 的 `reasoning_content`（自然语言思考链）。
+
+- [x] 23.1 新增 `src/api/streaming.py`：StreamEmitter + contextvars
+  - `class StreamEmitter`：持有 `asyncio.Queue` + `loop`，`emit(event_type, data)` 用 `loop.call_soon_threadsafe(queue.put_nowait, evt)`
+  - `current_emitter: ContextVar[Optional[StreamEmitter]]`
+  - `current_node: ContextVar[Optional[str]]`
+  - 工具函数：`emit_safe(event_type, data)` — 当前无 emitter 时静默不发
+- [x] 23.2 改造 `utils/llm_client.py`
+  - 新增 `chat_stream(messages, on_thinking=None, response_format=None, **kwargs) -> str`
+    - 内部 `stream=True`；遍历 chunks
+    - **正文 `delta.content` 仅累积到 full_text**，不回调（避免推 JSON 片段）
+    - **思考链 `delta.reasoning_content` 实时回调** `on_thinking`
+    - `extra_body={"enable_thinking": True}` 默认开（可通过参数关闭）
+    - 末尾返回累积的 full_text
+  - 改造 `chat_json(messages, ...)`：检查 `current_emitter.get()`；有则走 `chat_stream`，把 `on_thinking` 绑定到 `emitter.emit("llm_thinking", {"node": current_node, "text": c})`；拿到 full_text 后 `json.loads` + 正则兜底
+  - 改造 `chat(messages, ...)`：同上但不解析 JSON
+  - 保留旧函数签名不破坏现有调用方
+- [x] 23.3 改造 `src/graph/main_graph.py` 节点工厂
+  - 每个节点（history_cache / ir / clarification / ss / answerability_check / cg / execution / decision / memory_update）进入时 `current_node.set("ir")` + `emit_safe("stage", {node, status: "started"})`
+  - 退出时 `emit_safe("stage", {node, status: "done", <关键字段>})` + `current_node.set(None)`
+  - 关键节点 emit 业务事件：
+    - IR 节点：`emit_safe("keywords", ...)` + `emit_safe("schema_recall", ...)`
+    - 可回答性：`emit_safe("answerability", {answerable, reason, confidence})`
+    - CG 节点：`emit_safe("sql_candidates", {candidates: [{id, sql}]})`
+    - Execution：每条候选执行完 `emit_safe("execution", {candidate_id, success, rows})`
+    - Decision：`emit_safe("final_decision", {selected_id, reason})`
+- [x] 23.4 重写 `src/api/routes/query.py:event_stream`
+  - 用 `asyncio.Queue` + sentinel 桥接同步 graph 与 async SSE
+  - `run_graph` 在线程中执行：进入时 `current_emitter.set(emitter)`，出来时 `reset` + `queue.put_nowait(sentinel)`
+  - 用 `contextvars.copy_context().run(run_graph)` 保证 contextvar 跨线程传递
+  - 主循环 `await asyncio.wait_for(queue.get(), timeout=15.0)`；TimeoutError 时 yield `: heartbeat\n\n`
+  - 异常捕获：把 emitter 异常包成 `error` 事件
+  - 最终输出 `done` 事件，状态码已在响应头返回 200
+- [x] 23.5 修改 `src/api/routes/query.py` 客户端 timeout 文档
+  - 在 docstring 中说明客户端应使用 `httpx.Timeout(connect=10, read=None, write=10, pool=10)` 或依赖心跳
+- [x] 23.6 更新 `tests/api_client_demo.py`
+  - 改 `timeout=180` 为 `httpx.Timeout(connect=10, read=None, write=10, pool=10)`
+  - 按事件类型分别打印：`stage` 显示节点切换；`llm_thinking` 用前缀 `[思考]` 累计到同一行（按 node 分组）；`answerability` / `keywords` / `sql_candidates` 等业务事件结构化输出；`result` 单独成行
+- [x] 23.7 更新 `.env.example`
+  - 新增 `LLM_ENABLE_THINKING=true`（控制 qwen3 思考链开关）
+  - 新增 `SSE_HEARTBEAT_INTERVAL=15`（心跳间隔秒）
+- [x] 23.8 编写 `tests/api/test_streaming.py`
+  - 测试 `StreamEmitter` 跨线程 emit 不丢事件
+  - 测试 `current_emitter` contextvar 在 `copy_context().run()` 下正确传递
+  - 测试 `chat_stream` 收到 reasoning_content chunks 后 `on_thinking` 被调用
+  - 测试 `chat_stream` 收到 content chunks 时**不**触发任何回调（仅累积）
+  - 测试 emitter=None 时 `chat_json` 走旧阻塞路径（向后兼容）
+  - 测试非 qwen3 模型（无 reasoning_content 字段）时不抛异常、不推送 llm_thinking
+- [x] 23.9 编写 `tests/api/test_query_stream.py`
+  - mock graph 让其 yield 多个 update，验证 SSE 事件按时间顺序到达（非"先攒后吐"）
+  - 测试 15 秒无事件时心跳行 `: heartbeat\n\n` 被发出
+  - 测试 graph 抛异常时 `error` 事件被推送 + `done` 兜底
+  - 测试 SSE 流中**不出现** `llm_chunk` 事件类型
+- [x] 23.10 烟测：跑一次真实查询验证
+  - `python run_api.py --db_id california_schools`
+  - `python tests/api_client_demo.py`
+  - 观察：节点级 stage 实时打印；qwen3 思考链以自然中文片段流入；不出现 JSON 片段；首字节延迟 < 5 秒；业务事件（keywords / answerability / sql_candidates 等）结构化到达
+

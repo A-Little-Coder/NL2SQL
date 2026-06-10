@@ -28,6 +28,46 @@ from langgraph.graph import END, START, StateGraph
 
 from src.graph.state import NL2SQLState
 
+# 流式 SSE 基础设施（决策 50）；导入失败时退化为静默
+try:
+    from src.api.streaming import current_node, emit_safe
+except Exception:  # pragma: no cover - 无 API 模块时（如离线脚本）
+    current_node = None  # type: ignore
+
+    def emit_safe(event_type, data):  # type: ignore
+        return
+
+
+# ---------------------------------------------------------------------------
+# 节点装饰器：统一注入 SSE 事件（stage started/done + current_node ContextVar）
+# ---------------------------------------------------------------------------
+
+def _wrap_node(node_name: str, fn: Callable[[NL2SQLState], Dict[str, Any]]):
+    """给节点函数包一层：进入时发 stage started，退出时发 stage done"""
+
+    def wrapped(state: NL2SQLState) -> Dict[str, Any]:
+        token = None
+        if current_node is not None:
+            token = current_node.set(node_name)
+        emit_safe("stage", {"node": node_name, "status": "started"})
+        try:
+            result = fn(state) or {}
+            done_payload = {"node": node_name, "status": "done"}
+            # 透传节点关键字段（不含大对象）作为 stage done 摘要
+            for key in ("error", "rejection_reason"):
+                if key in result and result[key]:
+                    done_payload[key] = result[key]
+            emit_safe("stage", done_payload)
+            return result
+        except Exception as e:
+            emit_safe("error", {"node": node_name, "error": str(e)})
+            raise
+        finally:
+            if token is not None and current_node is not None:
+                current_node.reset(token)
+
+    return wrapped
+
 
 # ---------------------------------------------------------------------------
 # 节点工厂：每个节点把主图 state 转为 Agent 子图所需的局部 state
@@ -62,6 +102,13 @@ def make_history_cache_node(history_cache) -> Callable[[NL2SQLState], Dict[str, 
             "trace_log": state.get("trace_log", [])
                          + [f"[HistoryCache] hit={result.hit}, source={result.source}, confidence={result.confidence}"],
         }
+        # 决策 50：业务事件
+        emit_safe("cache_check", {
+            "hit": result.hit,
+            "source": result.source,
+            "confidence": result.confidence,
+            "cached_sql": result.cached_sql,
+        })
         return out
 
     return node
@@ -99,13 +146,52 @@ def make_ir_node(retriever) -> Callable[[NL2SQLState], Dict[str, Any]]:
             "database_filter": state.get("database_filter"),
             "conversation_history": state.get("conversation_history", []),
         })
+        keywords = result.get("keywords", [])
+        ctx = result.get("retrieved_context")
+
+        # 决策 50：业务事件
+        if keywords:
+            emit_safe("keywords", {"groups": _serialize_keywords(keywords)})
+        if ctx is not None:
+            emit_safe("schema_recall", _summarize_schema(ctx))
+
         return {
-            "keywords": result.get("keywords", []),
-            "retrieved_context": result.get("retrieved_context"),
+            "keywords": keywords,
+            "retrieved_context": ctx,
             "trace_log": state.get("trace_log", []) + ["[IR] done"],
         }
 
     return node
+
+
+def _serialize_keywords(keywords) -> list:
+    """把 IR 返回的 keywords 转为可 JSON 序列化的结构（用于 SSE 事件）"""
+    out = []
+    for item in keywords:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            name, expansions = item[0], item[1]
+            out.append({"name": str(name), "expansions": list(expansions)})
+        else:
+            out.append({"name": str(item)})
+    return out
+
+
+def _summarize_schema(ctx) -> dict:
+    """从 retrieved_context 中提取召回的列摘要（用于 SSE 事件）"""
+    summary = {"groups": []}
+    if ctx is None:
+        return summary
+    try:
+        groups = getattr(ctx, "schema_results", None) or {}
+        for group_name, cols in groups.items():
+            top = [
+                getattr(c, "column_name", str(c))
+                for c in (cols or [])[:10]
+            ]
+            summary["groups"].append({"name": group_name, "top_columns": top})
+    except Exception:
+        pass
+    return summary
 
 
 def make_clarification_node() -> Callable[[NL2SQLState], Dict[str, Any]]:
@@ -169,6 +255,13 @@ def make_answerability_check_node(checker) -> Callable[[NL2SQLState], Dict[str, 
         if result.should_reject:
             out["rejection_reason"] = result.reason
             out["error"] = f"不可回答: {result.reason}"
+
+        # 决策 50：业务事件
+        emit_safe("answerability", {
+            "answerable": result.answerable,
+            "confidence": getattr(result, "confidence", None),
+            "reason": result.reason,
+        })
         return out
 
     return node
@@ -190,8 +283,18 @@ def make_cg_node(generator) -> Callable[[NL2SQLState], Dict[str, Any]]:
                                   if state.get("_user_memory") else {},
             "metric_definitions": state.get("metric_definitions", []),
         })
+        candidates = result.get("sql_candidates", [])
+
+        # 决策 50：业务事件
+        emit_safe("sql_candidates", {
+            "candidates": [
+                {"id": getattr(c, "id", str(i)), "sql": getattr(c, "sql", str(c))}
+                for i, c in enumerate(candidates)
+            ],
+        })
+
         return {
-            "sql_candidates": result.get("sql_candidates", []),
+            "sql_candidates": candidates,
             "trace_log": state.get("trace_log", []) + ["[CG] done"],
         }
 
@@ -266,6 +369,18 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
                 cand.status = SQLStatus.FAILED
                 cand.error_message = str(e)
 
+            # 决策 50：每条候选执行完 emit
+            try:
+                rows = len(cand.result) if isinstance(cand.result, list) else None
+            except Exception:
+                rows = None
+            emit_safe("execution", {
+                "candidate_id": getattr(cand, "id", None),
+                "success": cand.status == SQLStatus.SUCCESS,
+                "rows": rows,
+                "error": cand.error_message,
+            })
+
         return {
             "sql_candidates": candidates,
             "schema_text": schema_text,
@@ -297,6 +412,13 @@ def make_decision_node(decider) -> Callable[[NL2SQLState], Dict[str, Any]]:
         if decision is not None:
             out["final_sql"] = decision.selected_sql or ""
             out["final_result"] = decision.selected_result
+
+            # 决策 50：业务事件
+            emit_safe("final_decision", {
+                "selected_id": getattr(decision, "selected_id", None),
+                "selected_sql": decision.selected_sql,
+                "reason": getattr(decision, "reason", None),
+            })
 
             # 结果可信度验证（决策 24）
             if decider.result_verifier is not None and decision.selected_sql:
@@ -354,24 +476,27 @@ def build_main_graph(
     graph = StateGraph(NL2SQLState)
 
     # 新增节点：历史命中检测（START 之后，IR 之前）
-    graph.add_node("history_cache", make_history_cache_node(history_cache))
-    graph.add_node("ir", make_ir_node(retriever))
-    graph.add_node("clarification", make_clarification_node())
-    graph.add_node("ss", make_ss_node(selector))
+    graph.add_node("history_cache", _wrap_node("history_cache", make_history_cache_node(history_cache)))
+    graph.add_node("ir", _wrap_node("ir", make_ir_node(retriever)))
+    graph.add_node("clarification", _wrap_node("clarification", make_clarification_node()))
+    graph.add_node("ss", _wrap_node("ss", make_ss_node(selector)))
 
     # 可回答性检查节点（决策 23）：SS 之后、CG 之前
     if answerability_checker is not None:
         graph.add_node(
             "answerability_check",
-            make_answerability_check_node(answerability_checker),
+            _wrap_node(
+                "answerability_check",
+                make_answerability_check_node(answerability_checker),
+            ),
         )
 
-    graph.add_node("cg", make_cg_node(generator))
-    graph.add_node("execution", make_execution_node(fix_loop))
-    graph.add_node("decision", make_decision_node(decider))
+    graph.add_node("cg", _wrap_node("cg", make_cg_node(generator)))
+    graph.add_node("execution", _wrap_node("execution", make_execution_node(fix_loop)))
+    graph.add_node("decision", _wrap_node("decision", make_decision_node(decider)))
 
     # 新增节点：记忆自动学习（decision 之后，END 之前）
-    graph.add_node("memory_update", make_memory_update_node(memory_updater))
+    graph.add_node("memory_update", _wrap_node("memory_update", make_memory_update_node(memory_updater)))
 
     # 入口 → history_cache
     graph.add_edge(START, "history_cache")
