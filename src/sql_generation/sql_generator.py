@@ -38,6 +38,8 @@ class SQLCandidate:
     execution_time: float = None
     result: Any = None
     generation_reason: str = None
+    # 决策 51：执行失败时保留结构化错误对象，供 SmartFix 使用
+    structured_error: Any = None
 
 
 # ============================================================================

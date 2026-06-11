@@ -34,6 +34,47 @@ _ENABLE_THINKING_DEFAULT = os.getenv("LLM_ENABLE_THINKING", "true").lower() in (
     "1", "true", "yes",
 )
 
+# 决策 51：中文思考指令注入，统一让 Qwen3 reasoning_content 输出中文
+_CHINESE_THINKING_DEFAULT = os.getenv("LLM_CHINESE_THINKING", "true").lower() in (
+    "1", "true", "yes",
+)
+_CHINESE_THINKING_INSTRUCTION = "请全程使用中文进行内部思考和推理。"
+
+
+def _inject_chinese_thinking(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """在 messages 头部注入中文思考指令（决策 51）
+
+    规则：
+    - 环境变量 LLM_CHINESE_THINKING=false 时不注入
+    - 首条为 system role：追加到该消息内容末尾（保留原 prompt 完整性）
+    - 首条不是 system role：在列表开头插入新的 system 消息
+    - 返回新列表，不修改原 messages
+
+    Args:
+        messages: 原 messages 列表
+
+    Returns:
+        注入后的新 messages 列表（若关闭则原样返回）
+    """
+    if not _CHINESE_THINKING_DEFAULT:
+        return messages
+    if not messages:
+        return [{"role": "system", "content": _CHINESE_THINKING_INSTRUCTION}]
+
+    new_messages = list(messages)
+    first = new_messages[0]
+    if first.get("role") == "system":
+        # 追加到既有 system 末尾
+        original = first.get("content", "")
+        merged = original.rstrip() + "\n\n" + _CHINESE_THINKING_INSTRUCTION
+        new_messages[0] = {**first, "content": merged}
+    else:
+        # 插入新 system 消息
+        new_messages.insert(
+            0, {"role": "system", "content": _CHINESE_THINKING_INSTRUCTION}
+        )
+    return new_messages
+
 
 class LLMClient:
     """
@@ -160,6 +201,9 @@ class LLMClient:
         Returns:
             str: 完整正文文本
         """
+        # 决策 51：注入中文思考指令
+        messages = _inject_chinese_thinking(messages)
+
         kwargs = {
             "model": self.model,
             "messages": messages,
@@ -218,6 +262,9 @@ class LLMClient:
         response_format: Optional[Dict] = None,
     ) -> str:
         """旧阻塞实现路径（CLI / 测试用）"""
+        # 决策 51：注入中文思考指令
+        messages = _inject_chinese_thinking(messages)
+
         kwargs = {
             "model": self.model,
             "messages": messages,

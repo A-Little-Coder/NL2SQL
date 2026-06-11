@@ -23,7 +23,7 @@ payload = {
     "user_id": "demo_user",
     "session_id": "demo_session_001",
     "db_id": "california_schools",
-    "query": "统计每个学校的学生数",
+    "query": "查一下各个学校的各科成绩",
 }
 
 # 决策 50：服务端走真流式 + 心跳，客户端读超时设为 None

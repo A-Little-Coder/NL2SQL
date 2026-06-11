@@ -95,6 +95,18 @@ class NL2SQLState(TypedDict, total=False):
     final_sql: str
     final_result: Any
 
+    # ===== 评分阶段（决策 51：两段式评分 + 单候选修复） =====
+    candidate_scores_r1: List[Dict[str, Any]]            # R1 数据视角评分 [{id, score, reason}]
+    candidate_scores_r2: Optional[List[Dict[str, Any]]]  # R2 SQL 视角评分（仅 R1 并列=5 时触发）
+    selected_candidate_id: Optional[str]                  # 进入 SmartFix 的候选 ID
+
+    # ===== SmartFix 阶段 =====
+    fix_failed: bool                                       # SmartFix 3 轮全部失败标记
+    fix_rounds_used: int                                   # 实际使用的修复轮次
+    last_error: Optional[str]                              # 失败时的最后错误信息
+    fix_history: List[Dict[str, Any]]                      # 修复历史 [{round, sql, error}]
+    decision_path: str                                     # 决策路径标识 (A/B/C/D/E/F/G/H)
+
     # ===== Verification（决策 23/24）=====
     answerability_result: Optional[Dict[str, Any]]  # 可回答性检查结果
     result_verification: Optional[Dict[str, Any]]    # 结果可信度验证结果
@@ -150,6 +162,14 @@ def create_initial_state(
         final_decision=None,
         final_sql="",
         final_result=None,
+        candidate_scores_r1=[],
+        candidate_scores_r2=None,
+        selected_candidate_id=None,
+        fix_failed=False,
+        fix_rounds_used=0,
+        last_error=None,
+        fix_history=[],
+        decision_path="",
         answerability_result=None,
         result_verification=None,
         rejection_reason=None,

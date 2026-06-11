@@ -303,10 +303,12 @@ def make_cg_node(generator) -> Callable[[NL2SQLState], Dict[str, Any]]:
 
 def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
     """
-    构造 Execution 节点：对每个候选 SQL 调用 Execution 子图，回填结果到 candidate
+    构造 Execution 节点（决策 51：ExecuteAll，一次性执行不修复）
 
-    注意 Execution 子图操作的是单条 SQL，这里在主图层面做 for-loop。
-    （也可以用 LangGraph Send API 做并行，本期保持简单）。
+    重大变更（决策 51）：
+    - 5 个候选只做**一次性执行**，不在执行阶段触发任何 LLM 修复
+    - 所有修复逻辑已移至 Decision 节点的 SmartFix 子流程
+    - fix_loop 参数仍保留（向后兼容签名），但仅使用其 executor 字段
 
     当 cache_hit=True 时，从 cached_sql 构造候选并直接执行（跳过 IR/SS/CG）。
     """
@@ -332,7 +334,7 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
         if not candidates:
             return {"error": "CG 未产出 sql_candidates"}
 
-        # 准备 schema_text 供 LLM 修复使用（只有有 schema 时才生成）
+        # 准备 schema_text 供后续 SmartFix 使用（只有有 schema 时才生成）
         schema = state.get("selected_schema", [])
         try:
             if schema:
@@ -343,20 +345,11 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
         except Exception:
             schema_text = ""
 
-        sub = fix_loop.build_graph()
+        # 决策 51：一次性执行每个候选，不触发 LLM 修复
+        executor = fix_loop.executor
         for cand in candidates:
             try:
-                result = sub.invoke({
-                    "sql": cand.sql,
-                    "original_sql": cand.sql,
-                    "user_query": state["user_query"],
-                    "schema_text": schema_text,
-                    "attempt": 0,
-                    "fix_history": [],
-                })
-                exec_result = result.get("result")
-                if exec_result is None:
-                    continue
+                exec_result = executor.execute(cand.sql)
                 cand.result = exec_result.result_data
                 cand.execution_time = exec_result.execution_time
                 cand.status = (
@@ -365,9 +358,12 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
                 cand.error_message = (
                     exec_result.error.original_message if exec_result.error else None
                 )
+                # 保留结构化错误供 SmartFix 使用
+                cand.structured_error = exec_result.error if not exec_result.success else None
             except Exception as e:
                 cand.status = SQLStatus.FAILED
                 cand.error_message = str(e)
+                cand.structured_error = None
 
             # 决策 50：每条候选执行完 emit
             try:
@@ -384,56 +380,82 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
         return {
             "sql_candidates": candidates,
             "schema_text": schema_text,
-            "trace_log": state.get("trace_log", []) + ["[Execution] done"],
+            "trace_log": state.get("trace_log", []) + ["[ExecuteAll] done (no fix)"],
         }
 
     return node
 
 
-def make_decision_node(decider) -> Callable[[NL2SQLState], Dict[str, Any]]:
+def make_decision_node(decider, fix_loop=None) -> Callable[[NL2SQLState], Dict[str, Any]]:
     """
     构造 Decision 节点：调用 Decision 子图，输出 final_decision
 
-    决策 24：选定 SQL 后进行结果可信度验证，不可信时写入 rejection_reason。
+    决策 51 重写：
+    - 通过子图 state 注入 fix_loop（每 DB 独立的 SQLFixLoop 实例）
+    - 同步 candidate_scores_r1/r2 / fix_failed / decision_path 等新字段回主图 state
+    - 保留原 result_verifier 调用（已移入 Decision 子图末尾节点）
+
+    Args:
+        decider: SelfConsistencyDecision 实例
+        fix_loop: SQLFixLoop 实例（决策 51；优先于 decider.fix_loop）
     """
 
     def node(state: NL2SQLState) -> Dict[str, Any]:
         cands = state.get("sql_candidates", [])
         sub = decider.build_graph()
-        result = sub.invoke({
+        sub_input = {
             "candidates": cands,
             "user_query": state["user_query"],
-        })
+            "schema_text": state.get("schema_text", ""),
+            "mschema": state.get("selected_schema", []),
+        }
+        if fix_loop is not None:
+            sub_input["fix_loop"] = fix_loop
+
+        result = sub.invoke(sub_input)
         decision = result.get("final_decision")
+
         out: Dict[str, Any] = {
             "final_decision": decision,
             "trace_log": state.get("trace_log", []) + ["[Decision] done"],
         }
+
         if decision is not None:
             out["final_sql"] = decision.selected_sql or ""
             out["final_result"] = decision.selected_result
 
+            # 决策 51：同步评分及修复字段到主图 state
+            out["candidate_scores_r1"] = decision.candidate_scores_r1 or []
+            out["candidate_scores_r2"] = decision.candidate_scores_r2
+            out["selected_candidate_id"] = decision.selected_candidate_id
+            out["fix_failed"] = decision.fix_failed
+            out["fix_rounds_used"] = decision.fix_rounds_used
+            out["last_error"] = decision.last_error
+            out["decision_path"] = decision.decision_path
+
             # 决策 50：业务事件
             emit_safe("final_decision", {
-                "selected_id": getattr(decision, "selected_id", None),
+                "selected_id": decision.selected_candidate_id,
                 "selected_sql": decision.selected_sql,
-                "reason": getattr(decision, "reason", None),
+                "decision_path": decision.decision_path,
+                "fix_failed": decision.fix_failed,
+                "reason": decision.decision_reason,
             })
 
-            # 结果可信度验证（决策 24）
-            if decider.result_verifier is not None and decision.selected_sql:
-                mschema = state.get("selected_schema", [])
-                verification = decider.result_verifier.verify(
-                    user_query=state["user_query"],
-                    selected_sql=decision.selected_sql,
-                    result_sample=decision.selected_result,
-                    mschema=mschema,
-                )
-                out["result_verification"] = verification.to_dict()
-                if verification.should_reject:
-                    out["rejection_reason"] = f"结果不可信: {verification.reason}"
+            # 决策 51：result_verification 信息同步（保留 voting_summary.verification）
+            voting = decision.voting_summary or {}
+            if "verification" in voting:
+                out["result_verification"] = voting["verification"]
+                # 如果验证不通过，写 rejection_reason
+                if voting["verification"].get("should_reject"):
+                    out["rejection_reason"] = (
+                        f"结果不可信: {voting['verification'].get('reason', '')}"
+                    )
                     out["final_sql"] = ""
                     out["final_result"] = None
+
+            # SmartFix 失败时也清空 final_sql / final_result？
+            # 决策：保留 final_sql（最佳候选 SQL），final_result 为 None，由前端基于 fix_failed=True 决定如何展示
 
         return out
 
@@ -493,7 +515,7 @@ def build_main_graph(
 
     graph.add_node("cg", _wrap_node("cg", make_cg_node(generator)))
     graph.add_node("execution", _wrap_node("execution", make_execution_node(fix_loop)))
-    graph.add_node("decision", _wrap_node("decision", make_decision_node(decider)))
+    graph.add_node("decision", _wrap_node("decision", make_decision_node(decider, fix_loop=fix_loop)))
 
     # 新增节点：记忆自动学习（decision 之后，END 之前）
     graph.add_node("memory_update", _wrap_node("memory_update", make_memory_update_node(memory_updater)))

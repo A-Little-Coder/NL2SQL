@@ -61,7 +61,13 @@ def _build_complete_mocks(success_path=True):
     generator.build_graph = MagicMock(return_value=cg_graph)
 
     # --- Execution ---
+    # 决策 51：ExecuteAll 直接调用 fix_loop.executor.execute()，不再走 fix_loop.build_graph()
     fix_loop = MagicMock()
+    fix_loop.executor.execute = MagicMock(return_value=ExecutionResult(
+        success=True, sql="SELECT * FROM t",
+        result_data=[(1,)], execution_time=0.001,
+    ))
+    # 保留 build_graph mock 用于向后兼容（虽然新代码不会用到）
     exec_graph = MagicMock()
     exec_graph.invoke = MagicMock(return_value={
         "result": ExecutionResult(
@@ -109,10 +115,10 @@ def test_main_graph_happy_path():
     assert len(result["sql_candidates"]) == 1
     assert result["final_sql"] == "SELECT * FROM t"
     assert result["final_result"] == [(1,)]
-    # trace_log 记录了各节点
+    # trace_log 记录了各节点（决策 51：Execution 节点 trace 改为 ExecuteAll）
     log = " ".join(result.get("trace_log", []))
     assert "IR" in log and "SS" in log and "CG" in log
-    assert "Execution" in log and "Decision" in log
+    assert "ExecuteAll" in log and "Decision" in log
 
 
 def test_main_graph_short_circuit_no_schema():
@@ -261,17 +267,28 @@ def test_main_graph_answerability_uncertain_passes():
 def test_main_graph_decision_result_verification_reject():
     """Decision 结果验证不可信时写入 rejection_reason，清空最终结果"""
     from src.graph import build_main_graph, create_initial_state
-    from src.verification.result_verifier import VerificationResult
+    from src.decision.self_consistency import DecisionResult
 
     retr, sel, gen, fix, dec = _build_complete_mocks(success_path=True)
-    verifier = MagicMock()
-    verifier.verify = MagicMock(return_value=VerificationResult(
-        trustworthy="false",
-        reason="SQL 查学校但问学生，粒度不匹配",
-        granularity_match="mismatch",
-        semantic_alignment="misaligned",
-    ))
-    dec.result_verifier = verifier
+    # 决策 51：verify 已移入 Decision 子图末尾。
+    # mock 子图直接返回包含 verification 的 DecisionResult
+    dec_graph = MagicMock()
+    dec_graph.invoke = MagicMock(return_value={
+        "final_decision": DecisionResult(
+            selected_sql="SELECT * FROM t",
+            selected_result=[(1,)],
+            execution_time=0.001,
+            decision_reason="mock",
+            voting_summary={
+                "verification": {
+                    "trustworthy": "false",
+                    "reason": "SQL 查学校但问学生，粒度不匹配",
+                    "should_reject": True,
+                },
+            },
+        ),
+    })
+    dec.build_graph = MagicMock(return_value=dec_graph)
 
     graph = build_main_graph(retr, sel, gen, fix, dec)
     state = create_initial_state(user_query="每个学生的成绩")
@@ -288,17 +305,27 @@ def test_main_graph_decision_result_verification_reject():
 def test_main_graph_decision_result_verification_pass():
     """Decision 结果验证可信时正常返回"""
     from src.graph import build_main_graph, create_initial_state
-    from src.verification.result_verifier import VerificationResult
+    from src.decision.self_consistency import DecisionResult
 
     retr, sel, gen, fix, dec = _build_complete_mocks(success_path=True)
-    verifier = MagicMock()
-    verifier.verify = MagicMock(return_value=VerificationResult(
-        trustworthy="true",
-        reason="SQL 与问题对齐",
-        granularity_match="aligned",
-        semantic_alignment="aligned",
-    ))
-    dec.result_verifier = verifier
+    # 决策 51：mock 子图返回 verification 通过的 DecisionResult
+    dec_graph = MagicMock()
+    dec_graph.invoke = MagicMock(return_value={
+        "final_decision": DecisionResult(
+            selected_sql="SELECT * FROM t",
+            selected_result=[(1,)],
+            execution_time=0.001,
+            decision_reason="mock",
+            voting_summary={
+                "verification": {
+                    "trustworthy": "true",
+                    "reason": "SQL 与问题对齐",
+                    "should_reject": False,
+                },
+            },
+        ),
+    })
+    dec.build_graph = MagicMock(return_value=dec_graph)
 
     graph = build_main_graph(retr, sel, gen, fix, dec)
     state = create_initial_state(user_query="各校平均分")

@@ -467,6 +467,12 @@ class DatabaseConnector:
                 if description:
                     # SELECT 查询，返回所有行
                     rows = cursor.fetchall()
+                    # 决策 51 修补：把行规范化为 List[Dict[str, Any]]，
+                    # 避免 sqlite3.Row 对象泄漏到业务层导致 LLM 评分/SSE/Memory
+                    # 看到无意义的 "<sqlite3.Row object>" 字符串
+                    if rows:
+                        col_names = [d[0] for d in description]
+                        rows = [dict(zip(col_names, row)) for row in rows]
                     return True, rows, None
                 else:
                     # INSERT/UPDATE/DELETE，返回影响行数

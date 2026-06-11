@@ -26,6 +26,33 @@ class ErrorType(Enum):
     UNKNOWN = "unknown"
 
 
+# 决策 51：错误严重程度（轻 → 重），用于全失败分支按等级排序逐个修复
+ERROR_SEVERITY: Dict["ErrorType", int] = {}  # 在类定义后填充
+
+# 决策 51：不可修复错误类型，SmartFix 跳过 LLM 调用
+UNFIXABLE_ERRORS: set = set()  # 在类定义后填充
+
+
+def _init_error_severity():
+    """模块加载时初始化错误等级映射（避免类前向引用问题）"""
+    ERROR_SEVERITY.update({
+        ErrorType.SEMANTIC_ERROR: 1,   # 表名/列名错，LLM 最容易修对
+        ErrorType.SYNTAX_ERROR: 2,
+        ErrorType.UNKNOWN: 3,
+        ErrorType.TIMEOUT_ERROR: 4,    # 数据/查询问题，LLM 难修
+        ErrorType.RUNTIME_ERROR: 5,    # 数据问题，LLM 难修
+        ErrorType.PERMISSION_ERROR: 6, # 权限问题，LLM 修不了
+    })
+    UNFIXABLE_ERRORS.update({
+        ErrorType.TIMEOUT_ERROR,
+        ErrorType.RUNTIME_ERROR,
+        ErrorType.PERMISSION_ERROR,
+    })
+
+
+_init_error_severity()
+
+
 @dataclass
 class StructuredError:
     """结构化的错误信息"""
@@ -287,82 +314,193 @@ SQL_FIX_PROMPT = """你是 SQL 专家。下面的 SQL 执行失败了，请修�
 
 可用 Schema:
 {schema_text}
-
+{fix_history_section}
 请生成修正后的 SQL（只生成 SELECT 查询，禁止修改数据），返回 JSON：
 {{"sql": "修正后的SQL", "reason": "修正理由"}}
 """
 
 
+def _format_fix_history(history: List[Dict[str, Any]]) -> str:
+    """构造 fix_history 提示段（决策 51）
+
+    Args:
+        history: [{"round": int, "sql": str, "error": str}, ...]
+
+    Returns:
+        str: 给 LLM 的历史提示文本（空 history 时返回 ""）
+    """
+    if not history:
+        return ""
+    lines = ["\n历次修复尝试（请基于这些历史，避免再犯同样的错）："]
+    for h in history:
+        lines.append(f"- 第 {h.get('round', '?')} 轮:")
+        lines.append(f"  SQL: {h.get('sql', '')}")
+        lines.append(f"  错误: {h.get('error', '')}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 class SQLFixLoop:
     """
-    SQL 错误修正循环 - 最多 N 次重试
+    SQL SmartFix 修复循环（决策 51：单候选 ≤3 轮 + fix_history）
+
+    重大变更（决策 51）：
+    - max_retries 默认改为 3 轮（原 2 轮）
+    - 每轮 prompt 携带 fix_history（历次 SQL + 错误），避免反复犯错
+    - _try_fix 入口过滤 UNFIXABLE_ERRORS（TIMEOUT/RUNTIME/PERMISSION）不调 LLM
+    - 仅修复 1 个候选（外部调用方决定，本类不再循环调用 5 候选）
 
     Attributes:
         executor: SQLExecutor 实例
         llm_client: LLM 客户端
-        max_retries: 最大重试次数
+        max_retries: 最大重试次数（默认 3）
     """
 
-    def __init__(self, executor: SQLExecutor, llm_client=None, max_retries: int = 2):
+    def __init__(self, executor: SQLExecutor, llm_client=None, max_retries: int = 3):
         self.executor = executor
         self.llm_client = llm_client
         self.max_retries = max_retries
 
-    def run(self, sql: str, user_query: str, schema_text: str = "") -> ExecutionResult:
-        """
-        执行 SQL 并尝试修正错误
+    def run(self, sql: str, user_query: str, schema_text: str = "",
+            initial_error: Optional[StructuredError] = None) -> Dict[str, Any]:
+        """SmartFix：单候选最多 max_retries 轮修复（决策 51）
 
         Args:
-            sql: 初始 SQL
+            sql: 初始 SQL（来自评分阶段选中的候选）
             user_query: 原始用户查询
             schema_text: schema 描述文本
+            initial_error: 进入 SmartFix 时已知的错误（来自 ExecuteAll；为 None 时先执行一次）
 
         Returns:
-            ExecutionResult: 最终执行结果
+            Dict:
+                - result: ExecutionResult（成功的结果 或 最后一次失败的结果）
+                - fix_history: List[Dict] [{round, sql, error}]
+                - fix_rounds_used: int
+                - fix_failed: bool
+                - last_error: Optional[str]
         """
+        fix_history: List[Dict[str, Any]] = []
         current_sql = sql
-        last_result = None
+        current_error = initial_error
+        last_result: Optional[ExecutionResult] = None
 
-        for attempt in range(self.max_retries + 1):
-            result = self.executor.execute(current_sql)
+        # 不可修类型直接短路（不调 LLM）
+        if current_error is not None and current_error.error_type in UNFIXABLE_ERRORS:
+            logger.info(f"SmartFix 短路：错误类型 {current_error.error_type.value} 不可修复")
+            return {
+                "result": ExecutionResult(
+                    success=False, sql=current_sql, error=current_error,
+                ),
+                "fix_history": [],
+                "fix_rounds_used": 0,
+                "fix_failed": True,
+                "last_error": current_error.original_message,
+            }
+
+        for round_idx in range(1, self.max_retries + 1):
+            # 修复（用上一轮的 SQL + 错误 + 历次记录）
+            if current_error is None:
+                # 首轮且无 initial_error：先执行一次拿到错误
+                pre_result = self.executor.execute(current_sql)
+                if pre_result.success:
+                    return {
+                        "result": pre_result,
+                        "fix_history": fix_history,
+                        "fix_rounds_used": 0,
+                        "fix_failed": False,
+                        "last_error": None,
+                    }
+                current_error = pre_result.error
+                last_result = pre_result
+                # 进入下面修复流程
+                if current_error.error_type in UNFIXABLE_ERRORS:
+                    return {
+                        "result": pre_result,
+                        "fix_history": fix_history,
+                        "fix_rounds_used": 0,
+                        "fix_failed": True,
+                        "last_error": current_error.original_message,
+                    }
+
+            fixed_sql = self._try_fix(current_sql, current_error, user_query,
+                                       schema_text, fix_history)
+            if not fixed_sql or fixed_sql == current_sql:
+                # LLM 没给出新 SQL，提前退出（剩余轮次不可能改善）
+                logger.warning(f"SmartFix 第 {round_idx} 轮 LLM 未提供新 SQL，提前结束")
+                break
+
+            # 执行新 SQL
+            result = self.executor.execute(fixed_sql)
+            current_sql = fixed_sql
+            last_result = result
+
+            # SSE 推送
+            try:
+                from src.api.streaming import emit_safe
+                emit_safe("smart_fix_round", {
+                    "round": round_idx,
+                    "sql": fixed_sql,
+                    "error": result.error.original_message if result.error else None,
+                    "success": result.success,
+                })
+            except Exception:
+                pass
 
             if result.success:
-                if attempt > 0:
-                    logger.info(f"SQL 修正成功（第 {attempt} 次重试）")
-                return result
+                logger.info(f"SmartFix 第 {round_idx} 轮成功")
+                return {
+                    "result": result,
+                    "fix_history": fix_history + [{
+                        "round": round_idx, "sql": fixed_sql, "error": None,
+                    }],
+                    "fix_rounds_used": round_idx,
+                    "fix_failed": False,
+                    "last_error": None,
+                }
 
-            last_result = result
-            logger.warning(
-                f"SQL 执行失败（attempt {attempt + 1}/{self.max_retries + 1}）: "
-                f"{result.error.original_message[:100] if result.error else 'unknown'}"
-            )
+            # 失败：追加到 history，进入下一轮
+            err_msg = result.error.original_message if result.error else "unknown"
+            fix_history.append({
+                "round": round_idx, "sql": fixed_sql, "error": err_msg,
+            })
+            current_error = result.error
 
-            # 如果还有重试机会且有 LLM，尝试修正
-            if attempt < self.max_retries and self.llm_client:
-                fixed_sql = self._try_fix(current_sql, result.error, user_query, schema_text)
-                if fixed_sql and fixed_sql != current_sql:
-                    current_sql = fixed_sql
-                    logger.info(f"LLM 提供修正建议，重试中: {fixed_sql[:80]}")
-                    continue
-            break
-
-        return last_result
+        # 所有轮次都失败
+        last_err_msg = (
+            last_result.error.original_message
+            if last_result and last_result.error else "unknown"
+        )
+        return {
+            "result": last_result if last_result else ExecutionResult(
+                success=False, sql=current_sql,
+            ),
+            "fix_history": fix_history,
+            "fix_rounds_used": len(fix_history),
+            "fix_failed": True,
+            "last_error": last_err_msg,
+        }
 
     def _try_fix(self, sql: str, error: StructuredError, user_query: str,
-                 schema_text: str) -> Optional[str]:
-        """
-        尝试用 LLM 修正 SQL
+                 schema_text: str,
+                 fix_history: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+        """尝试用 LLM 修正 SQL（决策 51：跳过不可修错误 + 带 fix_history）
 
         Args:
             sql: 失败的 SQL
             error: 错误信息
             user_query: 原始查询
             schema_text: schema 描述
+            fix_history: 历次修复记录（None 表示首轮）
 
         Returns:
             Optional[str]: 修正后的 SQL，无法修正时返回 None
         """
         if not self.llm_client or not error:
+            return None
+
+        # 决策 51：不可修类型直接跳过 LLM
+        if error.error_type in UNFIXABLE_ERRORS:
+            logger.info(f"_try_fix 跳过 LLM：错误类型 {error.error_type.value} 不可修复")
             return None
 
         try:
@@ -371,6 +509,7 @@ class SQLFixLoop:
                 sql=sql,
                 error_info=error.to_prompt_format(),
                 schema_text=schema_text or "(未提供 schema)",
+                fix_history_section=_format_fix_history(fix_history or []),
             )
             messages = [
                 {"role": "system", "content": "你是 SQL 修正专家，只输出 JSON。"},
@@ -384,15 +523,12 @@ class SQLFixLoop:
             return None
 
     # ------------------------------------------------------------------
-    # LangGraph 子图接口（§18.6 / §18.8）
+    # LangGraph 子图接口（已废弃，保留方法签名向后兼容）
     # ------------------------------------------------------------------
     def build_graph(self):
-        """
-        返回 Execution Agent 的已编译 LangGraph 子图
+        """已废弃（决策 51）：SmartFix 改为由 Decision 子图直接调用 run() 方法
 
-        子图节点：execute → (条件) llm_fix → execute，循环最多 max_retries 次
-        子图输入字段：sql, user_query, schema_text
-        子图输出字段：result (ExecutionResult), fix_history (List[str])
+        保留以兼容现有调用方（如有），返回空 graph。
         """
         from src.execution.execution_graph import build_execution_graph
         return build_execution_graph(self)

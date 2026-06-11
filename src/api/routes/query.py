@@ -208,6 +208,11 @@ async def query_endpoint(
 
             yield _format_sse("done", {
                 "has_result": bool(accumulated.get("final_sql")),
+                # 决策 51：暴露失败标记、决策路径、修复轮次给前端
+                "fix_failed": accumulated.get("fix_failed", False),
+                "decision_path": accumulated.get("decision_path", ""),
+                "fix_rounds_used": accumulated.get("fix_rounds_used", 0),
+                "last_error": accumulated.get("last_error"),
             })
 
         finally:

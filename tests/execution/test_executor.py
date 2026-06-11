@@ -171,8 +171,11 @@ class TestSQLFixLoop(unittest.TestCase):
     def test_first_attempt_success_no_retry(self):
         executor = SQLExecutor(db_connector=self.connector)
         loop = SQLFixLoop(executor, llm_client=None, max_retries=2)
-        result = loop.run("SELECT * FROM orders", "查询所有订单")
-        self.assertTrue(result.success)
+        # 决策 51：run() 返回 dict，首次执行直接成功
+        ret = loop.run("SELECT * FROM orders", "查询所有订单")
+        self.assertTrue(ret["result"].success)
+        self.assertFalse(ret["fix_failed"])
+        self.assertEqual(ret["fix_rounds_used"], 0)
 
     def test_fix_with_llm_mock(self):
         """LLM 提供修正后第二次成功"""
@@ -184,9 +187,11 @@ class TestSQLFixLoop(unittest.TestCase):
         executor = SQLExecutor(db_connector=self.connector)
         loop = SQLFixLoop(executor, llm_client=mock_llm, max_retries=2)
 
-        # 首次错误，LLM 修正后成功
-        result = loop.run("SELECT * FROM order_typo", "查询所有订单")
-        self.assertTrue(result.success)
+        # 首次错误，LLM 修正后成功（决策 51：run 返回 dict）
+        ret = loop.run("SELECT * FROM order_typo", "查询所有订单")
+        self.assertTrue(ret["result"].success)
+        self.assertFalse(ret["fix_failed"])
+        self.assertEqual(ret["fix_rounds_used"], 1)
         mock_llm.chat_json.assert_called()
 
     def test_fix_max_retries_reached(self):
@@ -198,8 +203,9 @@ class TestSQLFixLoop(unittest.TestCase):
         }
         executor = SQLExecutor(db_connector=self.connector)
         loop = SQLFixLoop(executor, llm_client=mock_llm, max_retries=2)
-        result = loop.run("SELECT * FROM wrong_table", "查询")
-        self.assertFalse(result.success)
+        ret = loop.run("SELECT * FROM wrong_table", "查询")
+        self.assertFalse(ret["result"].success)
+        self.assertTrue(ret["fix_failed"])
         # 应该尝试了 max_retries 次修正
         self.assertEqual(mock_llm.chat_json.call_count, 2)
 
@@ -207,8 +213,9 @@ class TestSQLFixLoop(unittest.TestCase):
         """没有 LLM 时第一次失败就退出"""
         executor = SQLExecutor(db_connector=self.connector)
         loop = SQLFixLoop(executor, llm_client=None, max_retries=2)
-        result = loop.run("SELECT * FROM wrong_table", "查询")
-        self.assertFalse(result.success)
+        ret = loop.run("SELECT * FROM wrong_table", "查询")
+        self.assertFalse(ret["result"].success)
+        self.assertTrue(ret["fix_failed"])
 
 
 if __name__ == "__main__":

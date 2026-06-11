@@ -215,7 +215,7 @@ class DbContextPool:
 
         selector = SchemaSelector(llm_client=g.llm_client, db_connector=connector)
         executor = SQLExecutor(db_connector=connector)
-        fix_loop = SQLFixLoop(executor=executor, llm_client=g.llm_client, max_retries=2)
+        fix_loop = SQLFixLoop(executor=executor, llm_client=g.llm_client, max_retries=3)
 
         graph = build_main_graph(
             retriever=retriever,

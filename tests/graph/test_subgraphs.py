@@ -249,57 +249,101 @@ def _mk_cand(sql, success=True, result=None, exec_time=0.01):
 
 
 def test_decision_subgraph_no_candidates():
+    """决策 51：无候选时走全失败分支，路径 H（无候选可修）"""
     from src.decision.self_consistency import SelfConsistencyDecision
 
     d = SelfConsistencyDecision()
     g = d.build_graph()
     result = g.invoke({"candidates": [], "user_query": "q"})
-    assert result["final_decision"].selected_sql is None
-    assert "无候选" in result["final_decision"].decision_reason
+    dec = result["final_decision"]
+    # 路径 H：无候选导致 fix_failed
+    assert dec.fix_failed is True
+    assert dec.decision_path == "H"
 
 
 def test_decision_subgraph_all_failed():
+    """决策 51：全失败时走 H 路径（默认 mock 候选无 structured_error → 视为 UNKNOWN）"""
     from src.decision.self_consistency import SelfConsistencyDecision
+    from src.execution.executor import ErrorType, StructuredError
 
     d = SelfConsistencyDecision()
     c1 = _mk_cand("bad1", success=False)
     c2 = _mk_cand("bad2", success=False)
+    # 给一个不可修错误（默认走 H）
+    c1.structured_error = StructuredError(ErrorType.TIMEOUT_ERROR, "timeout")
+    c2.structured_error = StructuredError(ErrorType.PERMISSION_ERROR, "perm denied")
     g = d.build_graph()
     result = g.invoke({"candidates": [c1, c2], "user_query": "q"})
-    assert "失败" in result["final_decision"].decision_reason
+    dec = result["final_decision"]
+    assert dec.fix_failed is True
+    assert dec.decision_path == "H"  # 全是不可修类型
 
 
 def test_decision_subgraph_majority():
-    from src.decision.self_consistency import SelfConsistencyDecision
-
-    d = SelfConsistencyDecision()
-    # 3 个相同结果（多数），1 个不同
-    c1 = _mk_cand("SELECT 1", result=[(1,)], exec_time=0.02)
-    c2 = _mk_cand("SELECT 1 AS x", result=[(1,)], exec_time=0.01)  # 最快
-    c3 = _mk_cand("SELECT 1 LIMIT 1", result=[(1,)], exec_time=0.03)
-    c4 = _mk_cand("SELECT 2", result=[(2,)], exec_time=0.01)
-
-    g = d.build_graph()
-    result = g.invoke({"candidates": [c1, c2, c3, c4], "user_query": "q"})
-    dec = result["final_decision"]
-    assert dec.selected_sql == "SELECT 1 AS x"
-    assert "多数一致" in dec.decision_reason
-
-
-def test_decision_subgraph_llm_fallback():
-    """各候选结果都不同，触发 LLM 决策"""
+    """决策 51：多数投票已废弃，改测 R1 评分（mock LLM 给最快候选最高分）"""
     from src.decision.self_consistency import SelfConsistencyDecision
 
     mock_llm = MagicMock()
-    mock_llm.chat_json = MagicMock(return_value={"selected": 2, "reason": "best"})
+    # R1 评分：c2 是 5（唯一最高），直接返回路径 A
+    mock_llm.chat_json.return_value = {
+        "scores": [
+            {"candidate_id": "SELE", "score": 4, "reason": ""},
+            {"candidate_id": "SELE", "score": 5, "reason": ""},  # 注意 id 冲突
+        ]
+    }
+    d = SelfConsistencyDecision(llm_client=mock_llm)
+
+    # 用唯一 id 避免冲突
+    c1 = _mk_cand("SELECT 1", result=[(1,)], exec_time=0.02)
+    c1.id = "c1"
+    c2 = _mk_cand("SELECT 1 AS x", result=[(1,)], exec_time=0.01)
+    c2.id = "c2"
+
+    # 修正 mock 评分使用真实 id
+    mock_llm.chat_json.return_value = {
+        "scores": [
+            {"candidate_id": "c1", "score": 3, "reason": ""},
+            {"candidate_id": "c2", "score": 5, "reason": ""},
+        ]
+    }
+
+    g = d.build_graph()
+    result = g.invoke({"candidates": [c1, c2], "user_query": "q"})
+    dec = result["final_decision"]
+    assert dec.selected_candidate_id == "c2"
+    assert dec.decision_path == "A"
+
+
+def test_decision_subgraph_llm_fallback():
+    """决策 51：原"多数 + LLM fallback"已废弃。改测 R1<5 时进入 SmartFix"""
+    from src.decision.self_consistency import SelfConsistencyDecision
+    from unittest.mock import MagicMock as MM
+
+    mock_llm = MM()
+    # R1 评分：所有候选都 < 5 → 进入 SmartFix
+    mock_llm.chat_json.side_effect = [
+        # R1 评分
+        {"scores": [
+            {"candidate_id": "A", "score": 3, "reason": ""},
+            {"candidate_id": "B", "score": 4, "reason": ""},
+            {"candidate_id": "C", "score": 3, "reason": ""},
+        ]},
+        # SmartFix 调用（不会真正发生，因为没注入 fix_loop，节点会兜底失败）
+    ]
     d = SelfConsistencyDecision(llm_client=mock_llm)
 
     c1 = _mk_cand("A", result=[(1,)])
+    c1.id = "A"
     c2 = _mk_cand("B", result=[(2,)])
+    c2.id = "B"
     c3 = _mk_cand("C", result=[(3,)])
+    c3.id = "C"
 
     g = d.build_graph()
     result = g.invoke({"candidates": [c1, c2, c3], "user_query": "q"})
     dec = result["final_decision"]
-    assert dec.selected_sql == "B"
-    assert dec.voting_summary["llm_decided"] is True
+    # 选中 B（R1 最高分=4）
+    assert dec.selected_candidate_id == "B"
+    # 未注入 fix_loop 且无 executor → 路径 E（SmartFix 兜底失败）
+    assert dec.decision_path == "E"
+    assert dec.fix_failed is True
