@@ -171,6 +171,7 @@ class LLMClient:
         as_json: bool = False,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        thinking: Optional[bool] = None,
     ) -> Union[str, Dict[str, Any]]:
         """
         同步阻塞调用 ChatOpenAI.invoke
@@ -179,6 +180,7 @@ class LLMClient:
             messages: List[BaseMessage] 或 PromptValue（来自 ChatPromptTemplate.format_prompt）
             as_json: True 时绑定 response_format={"type":"json_object"}，返回 dict
             temperature / max_tokens: 按调用覆盖采样参数
+            thinking: 按调用覆盖 enable_thinking（None=沿用构造时默认值）
 
         Returns:
             as_json=False → 完整正文字符串
@@ -188,7 +190,7 @@ class LLMClient:
             TypeError: 传入了 dict 形式的 messages
         """
         lc_messages = self._prepare_lc_messages(messages)
-        bound = self._bind_runtime(temperature, max_tokens, as_json)
+        bound = self._bind_runtime(temperature, max_tokens, as_json, thinking)
 
         ai_msg: AIMessage = bound.invoke(lc_messages)
         text = self._extract_text_from_message(ai_msg)
@@ -201,9 +203,13 @@ class LLMClient:
         as_json: bool = False,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        thinking: Optional[bool] = None,
     ) -> Iterator[Tuple[Optional[str], Optional[str]]]:
         """
         流式调用 ChatOpenAI.stream
+
+        Args:
+            thinking: 按调用覆盖 enable_thinking（None=沿用构造时默认值）
 
         Yields:
             (content_chunk, reasoning_chunk) 二元组
@@ -216,7 +222,7 @@ class LLMClient:
             **不解析 JSON**——解析由业务侧调 parse_json(accumulate(stream)) 完成
         """
         lc_messages = self._prepare_lc_messages(messages)
-        bound = self._bind_runtime(temperature, max_tokens, as_json)
+        bound = self._bind_runtime(temperature, max_tokens, as_json, thinking)
 
         for chunk in bound.stream(lc_messages):
             text_part, reasoning_part = self._extract_chunk_blocks(chunk)
@@ -231,10 +237,11 @@ class LLMClient:
         as_json: bool = False,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        thinking: Optional[bool] = None,
     ) -> Union[str, Dict[str, Any]]:
         """异步版 invoke，签名一致"""
         lc_messages = self._prepare_lc_messages(messages)
-        bound = self._bind_runtime(temperature, max_tokens, as_json)
+        bound = self._bind_runtime(temperature, max_tokens, as_json, thinking)
 
         ai_msg: AIMessage = await bound.ainvoke(lc_messages)
         text = self._extract_text_from_message(ai_msg)
@@ -247,10 +254,11 @@ class LLMClient:
         as_json: bool = False,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        thinking: Optional[bool] = None,
     ) -> AsyncIterator[Tuple[Optional[str], Optional[str]]]:
         """异步版 stream，yield 与同步 stream 相同的二元组"""
         lc_messages = self._prepare_lc_messages(messages)
-        bound = self._bind_runtime(temperature, max_tokens, as_json)
+        bound = self._bind_runtime(temperature, max_tokens, as_json, thinking)
 
         async for chunk in bound.astream(lc_messages):
             text_part, reasoning_part = self._extract_chunk_blocks(chunk)
@@ -320,8 +328,13 @@ class LLMClient:
         temperature: Optional[float],
         max_tokens: Optional[int],
         as_json: bool,
+        thinking: Optional[bool] = None,
     ):
-        """构造 bind() 参数，返回绑定后的 Runnable"""
+        """构造 bind() 参数，返回绑定后的 Runnable
+
+        thinking=None 时沿用构造时 enable_thinking；
+        thinking=True/False 时通过 bind(extra_body=...) 覆盖。
+        """
         kw: Dict[str, Any] = {}
         if temperature is not None:
             kw["temperature"] = temperature
@@ -329,6 +342,8 @@ class LLMClient:
             kw["max_tokens"] = max_tokens
         if as_json:
             kw["response_format"] = {"type": "json_object"}
+        if thinking is not None:
+            kw["extra_body"] = {"enable_thinking": bool(thinking)}
 
         return self._chat_model.bind(**kw) if kw else self._chat_model
 

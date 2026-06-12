@@ -431,6 +431,74 @@ class TestParseJson(unittest.TestCase):
 # 构造时 ChatOpenAI 配置
 # ──────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────
+# per-call thinking 参数
+# ──────────────────────────────────────────────────────────────────────
+
+class TestPerCallThinking(unittest.TestCase):
+    """验证 _bind_runtime 的 thinking 参数正确传递到 bind()"""
+
+    def test_thinking_none_no_bind(self):
+        """thinking=None + 无其他覆盖参数 → 返回 _chat_model 本身，不调 bind"""
+        client = _build_client()
+        bound = client._bind_runtime(None, None, False, thinking=None)
+        self.assertIs(bound, client._chat_model)
+
+    def test_thinking_false_returns_binding(self):
+        """thinking=False 时返回 RunnableBinding，其 kwargs 含 extra_body"""
+        client = _build_client()
+        bound = client._bind_runtime(None, None, False, thinking=False)
+        # RunnableBinding 有 kwargs 属性，记录 bind 传入的参数
+        self.assertIsNot(bound, client._chat_model)
+        bound_kwargs = getattr(bound, "kwargs", {})
+        self.assertEqual(bound_kwargs.get("extra_body"), {"enable_thinking": False})
+
+    def test_thinking_true_returns_binding(self):
+        """thinking=True 时返回 RunnableBinding，其 kwargs 含 extra_body"""
+        client = _build_client()
+        bound = client._bind_runtime(None, None, False, thinking=True)
+        self.assertIsNot(bound, client._chat_model)
+        bound_kwargs = getattr(bound, "kwargs", {})
+        self.assertEqual(bound_kwargs.get("extra_body"), {"enable_thinking": True})
+
+    def test_thinking_with_other_kwargs(self):
+        """thinking 与 temperature / as_json 可同时 bind"""
+        client = _build_client()
+        bound = client._bind_runtime(0.3, 4096, True, thinking=False)
+        bound_kwargs = getattr(bound, "kwargs", {})
+        self.assertEqual(bound_kwargs.get("temperature"), 0.3)
+        self.assertEqual(bound_kwargs.get("max_tokens"), 4096)
+        self.assertEqual(bound_kwargs.get("response_format"), {"type": "json_object"})
+        self.assertEqual(bound_kwargs.get("extra_body"), {"enable_thinking": False})
+
+    def test_invoke_passes_thinking_to_bind_runtime(self):
+        """invoke 的 thinking 参数应透传到 _bind_runtime"""
+        from langchain_core.messages import AIMessage, HumanMessage
+        client = _build_client()
+        fake_runnable = MagicMock()
+        fake_runnable.invoke = MagicMock(
+            return_value=AIMessage(content=[_block_text("ok")])
+        )
+        with patch.object(client, "_bind_runtime",
+                          return_value=fake_runnable) as bind_mock:
+            client.invoke([HumanMessage("x")], thinking=False)
+        # _bind_runtime 最后一个位置参数是 thinking
+        self.assertEqual(bind_mock.call_args.args[3], False)
+
+    def test_stream_passes_thinking_to_bind_runtime(self):
+        """stream 的 thinking 参数应透传到 _bind_runtime"""
+        from langchain_core.messages import HumanMessage
+        client = _build_client()
+        fake_runnable = MagicMock()
+        fake_runnable.stream = MagicMock(return_value=iter([
+            _make_chunk(content=[_block_text("x")])
+        ]))
+        with patch.object(client, "_bind_runtime",
+                          return_value=fake_runnable) as bind_mock:
+            list(client.stream([HumanMessage("q")], thinking=True))
+        self.assertEqual(bind_mock.call_args.args[3], True)
+
+
 class TestChatOpenAIConfiguration(unittest.TestCase):
 
     def test_output_version_set(self):

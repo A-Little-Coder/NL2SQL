@@ -202,11 +202,24 @@ class TestE2EMock(unittest.TestCase):
 
         # Step 5: Decision
         print("\n[Step 5] Self-Consistency 决策")
-        decider = SelfConsistencyDecision()
-        decision = decider.decide(candidates, "查一下北京地区苹果的销售额")
+        # mock R1 评分：第一个候选打 5 分，路径 A 直选
+        scoring_llm = MagicMock()
+        scoring_llm.stream.return_value = iter([(__import__("json").dumps({
+            "scores": [
+                {"candidate_id": candidates[0].id, "score": 5, "reason": "完整匹配"},
+                {"candidate_id": candidates[1].id, "score": 3, "reason": "缺少分组列"},
+            ]
+        }, ensure_ascii=False), None)])
+        decider = SelfConsistencyDecision(llm_client=scoring_llm)
+        graph_result = decider.build_graph().invoke({
+            "candidates": candidates,
+            "user_query": "查一下北京地区苹果的销售额",
+        })
+        decision = graph_result["final_decision"]
         print(f"  最终 SQL: {decision.selected_sql}")
         print(f"  结果: {decision.selected_result}")
-        print(f"  耗时: {decision.execution_time:.4f}s")
+        if decision.execution_time is not None:
+            print(f"  耗时: {decision.execution_time:.4f}s")
         print(f"  决策理由: {decision.decision_reason}")
 
         # 验证
@@ -261,8 +274,18 @@ class TestE2EMock(unittest.TestCase):
             cand.status = SQLStatus.SUCCESS if result.success else SQLStatus.FAILED
 
         # Decision
-        decider = SelfConsistencyDecision()
-        decision = decider.decide(candidates, "有多少种水果")
+        scoring_llm = MagicMock()
+        scoring_llm.stream.return_value = iter([(__import__("json").dumps({
+            "scores": [
+                {"candidate_id": candidates[0].id, "score": 5, "reason": "完整匹配"},
+            ]
+        }, ensure_ascii=False), None)])
+        decider = SelfConsistencyDecision(llm_client=scoring_llm)
+        graph_result = decider.build_graph().invoke({
+            "candidates": candidates,
+            "user_query": "有多少种水果",
+        })
+        decision = graph_result["final_decision"]
 
         print(f"\n  SQL: {decision.selected_sql}")
         print(f"  结果: {decision.selected_result}")

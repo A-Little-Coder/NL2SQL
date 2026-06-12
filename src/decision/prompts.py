@@ -4,7 +4,6 @@
 # 集中管理 self_consistency.py 中所有 LLM 调用的 prompt：
 #   - SCORE_BY_DATA_PROMPT     R1 数据视角评分（隐藏 SQL）
 #   - SCORE_BY_SQL_PROMPT      R2 SQL 视角评分（R1 并列=5 时触发）
-#   - LLM_FINAL_DECISION_PROMPT  llm_final_decision（向后兼容旧路径）
 #
 # 设计要点：
 #   - 用 ChatPromptTemplate.from_messages 拆分 system / user 段
@@ -69,15 +68,4 @@ SCORE_BY_SQL_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 
-# ── LLM 最终决策（向后兼容旧 llm_final_decision 方法） ───────────────
-
-LLM_FINAL_DECISION_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "你是 SQL 评审专家，只输出 JSON。"),
-    ("user", """用户查询: "{user_query}"
-
-有以下候选 SQL 及其执行结果：
-{candidates_text}
-
-请选择最符合用户查询意图的 SQL，返回 JSON：
-{{"selected": 候选编号, "reason": "选择理由"}}"""),
-])
+# ── END ──────────────────────────────────────────────────────────────

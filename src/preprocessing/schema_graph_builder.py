@@ -521,7 +521,7 @@ class SchemaGraphBuilder:
 
         try:
             # 离线脚本场景：用 invoke 一步到位（无 SSE 上下文）
-            result = self.llm_client.invoke(messages, as_json=True, temperature=0.0)
+            result = self.llm_client.invoke(messages, as_json=True, temperature=0.0, thinking=False)
 
             if result.get("has_join") and result.get("join_keys"):
                 logger.debug(
