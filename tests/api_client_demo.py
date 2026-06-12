@@ -21,7 +21,7 @@ BASE_URL = "http://localhost:8000"
 
 payload = {
     "user_id": "demo_user",
-    "session_id": "demo_session_010",
+    "session_id": "demo_session_011",
     "db_id": "california_schools",
     "query": "查一下各个学校的各科成绩",
 }
