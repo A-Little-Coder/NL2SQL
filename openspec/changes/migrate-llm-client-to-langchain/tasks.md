@@ -10,28 +10,28 @@
 - [x] 1.6 探测脚本验证项 3：`model.bind(response_format={"type": "json_object"}).invoke([...])` 强制 JSON 输出生效
 - [x] 1.7 探测脚本验证项 4：`await model.ainvoke([...])` 和 `async for chunk in model.astream([...]):` 异步路径可用
 - [x] 1.8 更新 `requirements.txt`：新增 `langchain-openai>=1.0.0,<2.0.0` 和 `langchain-core>=1.0.0,<2.0.0` 显式锁定；锁定 `openai>=2.0.0,<3.0.0`
-- [ ] 1.9 探测全部通过 → commit 1：`feat(deps): 锁定 langchain-openai 1.x，环境探测脚本通过`
+- [x] 1.9 探测全部通过 → commit 1：`feat(deps): 锁定 langchain-openai 1.x，环境探测脚本通过`
 - [x] 1.10 若探测失败（如 reasoning_content 不在 additional_kwargs）→ 暂停后续步骤，更新 `design.md` 决策 8 —— **已触发**：1.x 不再保留 reasoning_content，已更新 design.md 决策 8 和 specs/llm-client/spec.md 对应 Requirement
 
 ## 2. Step 2 — 重写 LLMClient
 
-- [ ] 2.1 备份当前 `utils/llm_client.py`（git 已是版本控制，此为心理保险）
-- [ ] 2.2 重写 `utils/llm_client.py`：导入 `from langchain_openai import ChatOpenAI` / `from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage` / `from langchain_core.prompt_values import PromptValue`
-- [ ] 2.3 重写 `LLMClient.__init__`：构造 `self._chat_model = ChatOpenAI(...)`，把 `enable_thinking` 通过 `model_kwargs={"extra_body": {"enable_thinking": True}}` 透传；删除 `self.client` 别名
-- [ ] 2.4 实现私有方法 `_inject_chinese_thinking(messages: List[BaseMessage]) -> List[BaseMessage]`（用 `SystemMessage` 对象操作）
-- [ ] 2.5 实现私有方法 `_normalize_messages(messages_or_prompt_value) -> List[BaseMessage]`：接受 `List[BaseMessage]` 或 `PromptValue`，dict 入参抛 `TypeError`
-- [ ] 2.6 实现私有方法 `_build_runtime_kwargs(temperature, max_tokens, as_json) -> Dict`：组装 `bind()` 参数
-- [ ] 2.7 实现私有方法 `_extract_reasoning(chunk) -> Optional[str]`：`return chunk.additional_kwargs.get("reasoning_content")`
-- [ ] 2.8 实现公开方法 `invoke(messages, *, as_json=False, temperature=None, max_tokens=None) -> Union[str, Dict]`
-- [ ] 2.9 实现公开方法 `stream(messages, *, as_json=False, temperature=None, max_tokens=None) -> Iterator[Tuple[Optional[str], Optional[str]]]`
-- [ ] 2.10 实现公开方法 `async def ainvoke(...)` —— 调底层 `self._chat_model.ainvoke(...)`
-- [ ] 2.11 实现公开方法 `async def astream(...)` —— 调底层 `self._chat_model.astream(...)`
-- [ ] 2.12 在同文件实现模块级函数 `accumulate(stream_iter) -> str`
-- [ ] 2.13 在同文件实现模块级函数 `stream_with_sse(stream_iter) -> str`（依赖 `src.api.streaming.current_emitter` ContextVar）
-- [ ] 2.14 在同文件实现模块级函数 `parse_json(text) -> Dict[str, Any]`
-- [ ] 2.15 删除旧公开 API：`chat` / `chat_json` / `chat_stream` / 私有 `_chat_blocking` / `_parse_json` / `_has_emitter` / `_inject_chinese_thinking`（dict 版）
-- [ ] 2.16 编写新 LLMClient 单元测试：`tests/utils/test_llm_client_new.py` 覆盖 invoke / stream / ainvoke / astream / 三个辅助函数 / 中文注入
-- [ ] 2.17 单元测试全部通过 → commit 2：`refactor(llm_client): 内部迁移到 ChatOpenAI，对外暴露 invoke/stream/ainvoke/astream`
+- [x] 2.1 备份当前 `utils/llm_client.py`（git 已是版本控制，此为心理保险）
+- [x] 2.2 重写 `utils/llm_client.py`：导入 `from langchain_openai import ChatOpenAI` / `from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage` / `from langchain_core.prompt_values import PromptValue`
+- [x] 2.3 重写 `LLMClient.__init__`：构造 `self._chat_model = ChatOpenAI(...)`，把 `enable_thinking` 通过 `extra_body` 顶层参数透传（决策 8 修正：不是 model_kwargs）；删除 `self.client` 别名；新增 `output_version="responses/v1"`
+- [x] 2.4 实现私有方法 `_inject_chinese_thinking(messages: List[BaseMessage]) -> List[BaseMessage]`（用 `SystemMessage` 对象操作）
+- [x] 2.5 实现私有方法 `_normalize_messages(messages_or_prompt_value) -> List[BaseMessage]`：接受 `List[BaseMessage]` 或 `PromptValue`，dict 入参抛 `TypeError`
+- [x] 2.6 实现私有方法 `_bind_runtime(temperature, max_tokens, as_json) -> Runnable`：组装 `bind()` 参数并返回绑定后的 Runnable（也是测试 mock 锚点）
+- [x] 2.7 实现私有方法 `_extract_chunk_blocks(chunk) -> Tuple[Optional[str], Optional[str]]`：解析 `chunk.content` 的 `list[dict]`，按 type 分别拿 text / reasoning（决策 8 修正：不是 `additional_kwargs.reasoning_content`）；另有 `_extract_text_from_message(AIMessage)` 处理阻塞 invoke 返回
+- [x] 2.8 实现公开方法 `invoke(messages, *, as_json=False, temperature=None, max_tokens=None) -> Union[str, Dict]`
+- [x] 2.9 实现公开方法 `stream(messages, *, as_json=False, temperature=None, max_tokens=None) -> Iterator[Tuple[Optional[str], Optional[str]]]`
+- [x] 2.10 实现公开方法 `async def ainvoke(...)` —— 调底层 `self._chat_model.ainvoke(...)`
+- [x] 2.11 实现公开方法 `async def astream(...)` —— 调底层 `self._chat_model.astream(...)`
+- [x] 2.12 在同文件实现模块级函数 `accumulate(stream_iter) -> str`
+- [x] 2.13 在同文件实现模块级函数 `stream_with_sse(stream_iter) -> str`（依赖 `src.api.streaming.current_emitter` ContextVar）
+- [x] 2.14 在同文件实现模块级函数 `parse_json(text) -> Dict[str, Any]`
+- [x] 2.15 删除旧公开 API：`chat` / `chat_json` / `chat_stream` / 私有 `_chat_blocking` / `_parse_json` / `_has_emitter` / `_inject_chinese_thinking`（dict 版）—— 旧测试 `tests/utils/test_llm_client_chinese_thinking.py` 也删除
+- [x] 2.16 编写新 LLMClient 单元测试：`tests/utils/test_llm_client_new.py` 覆盖 invoke / stream / ainvoke / astream / 三个辅助函数 / 中文注入 / Pydantic ChatOpenAI mock 通过 `patch.object(client, "_bind_runtime")` 锚点 —— **35/35 通过**
+- [x] 2.17 单元测试全部通过 → commit 2：`refactor(llm_client): 内部迁移到 ChatOpenAI，对外暴露 invoke/stream/ainvoke/astream`
 
 ## 3. Step 3 — Prompt 模板化
 
