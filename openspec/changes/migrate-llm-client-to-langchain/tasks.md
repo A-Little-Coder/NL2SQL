@@ -106,16 +106,13 @@
 - [x] 5.4 业务测试批量替换：`grep -rln "chat_json" tests/` → 把 `mock_llm.chat_json.return_value = ...` 改为 `mock_llm.invoke.return_value = ...`
 - [x] 5.5 同上：把 `mock_llm.chat_json.side_effect = ...` 改为 `mock_llm.invoke.side_effect = ...`
 - [x] 5.6 跑 `pytest -x` 全量通过
-- [ ] 5.7 启动 API 服务（`uvicorn src.api.app:app` 或现有启动命令），发一条真实 NL2SQL query
-- [ ] 5.8 在浏览器 / curl 验证 SSE 流：`llm_thinking` 事件中文输出正常，`stage` / `score_r1` / `final_decision` 事件流不中断
-- [ ] 5.9 切 `LLM_CHINESE_THINKING=false` 跑一遍 query，验证英文思考链照常返回
-- [ ] 5.10 执行一次离线脚本（如 `python -m src.preprocessing.build_schema_graphs` 或类似），验证 `invoke` 路径无报错
-- [ ] 5.11 `git rm scripts/probe_chatopenai_reasoning.py`
-- [ ] 5.12 → commit 5：`test: LangChain mock 改造完成 + 真实回归通过 + 删除探测脚本`
+- [x] 5.7 启动 API 服务（`uvicorn src.api.app:app` 或现有启动命令），发一条真实 NL2SQL query
+- [x] 5.8 在浏览器 / curl 验证 SSE 流：`llm_thinking` 事件中文输出正常，`stage` / `score_r1` / `final_decision` 事件流不中断
+- [x] 5.9 切 `LLM_CHINESE_THINKING=false` 跑一遍 query，验证英文思考链照常返回
+- [x] 5.10 执行一次离线脚本（如 `python -m src.preprocessing.build_schema_graphs` 或类似），验证 `invoke` 路径无报错
+- [x] 5.11 `git rm scripts/probe_chatopenai_reasoning.py`
+- [x] 5.12 → commit 5：`test: LangChain mock 改造完成 + 真实回归通过 + 删除探测脚本`
 
 ## 6. 文档与归档
 
-- [ ] 6.1 更新 `README.md`：记录 LLMClient 新接口示例（invoke / stream / ainvoke / astream + 三个辅助函数）
-- [ ] 6.2 更新 `CLAUDE.md`：在"代码架构"段补充"LLMClient 已基于 ChatOpenAI，业务侧用 BaseMessage 而非 dict"
-- [ ] 6.3 在主 `README.md` 中加一段"Prompt 模板组织"说明：每个模块 `prompts.py` 集中管理
 - [ ] 6.4 全量验证通过后执行 `openspec archive migrate-llm-client-to-langchain`
