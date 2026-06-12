@@ -67,8 +67,8 @@ class HistoryCache:
 
         try:
             # 历史缓存检测属于"准实时"场景：直接走 invoke 而不是 stream
-            # （响应快 + 不需要 SSE 推送）
-            data = self._llm.invoke(messages, as_json=True)
+            # （响应快 + 不需要 SSE 推送 + 不需要思考链：规则明确，输出固定）
+            data = self._llm.invoke(messages, as_json=True, thinking=False)
             result = self._parse_response(data)
         except Exception:
             # LLM 调用失败时安全降级：不走缓存
