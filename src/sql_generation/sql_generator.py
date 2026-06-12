@@ -80,22 +80,7 @@ class SQLGenerator:
         validator: SQL 安全验证器
     """
 
-    SQL_GENERATION_PROMPT = """你是一位 SQL 专家。请根据以下 schema 和用户查询生成 SQLite SQL 语句。
-
-用户查询: "{user_query}"
-
-数据库 Schema:
-{schema_text}
-
-要求:
-1. 只生成 SELECT 查询，不要生成 INSERT/UPDATE/DELETE/DROP 等修改操作
-2. SQL 必须兼容 SQLite 语法
-3. 如果涉及多表，使用合适的 JOIN
-4. 考虑 WHERE 条件、GROUP BY、ORDER BY、LIMIT 等子句
-5. 生成 {num_candidates} 个不同的 SQL 候选（可以用不同思路实现）
-6. 返回 JSON 格式：{{"candidates": [{{"sql": "SQL语句", "reason": "生成理由"}}, ...]}}
-
-请生成 SQL:"""
+    # SQL_GENERATION_PROMPT 已迁移至 src/sql_generation/prompts.py
 
     def __init__(self, llm_client=None, num_candidates: int = 5):
         self.llm_client = llm_client
@@ -249,16 +234,15 @@ class SQLGenerator:
             mschema_dict = MSchemaFormat.create_mschema_schema(schema)
             schema_text = MSchemaFormat.format_for_llm(mschema_dict)
 
-            prompt = self.SQL_GENERATION_PROMPT.format(
+            from src.sql_generation.prompts import SQL_GENERATION_PROMPT
+            from utils.llm_client import parse_json, stream_with_sse
+            messages = SQL_GENERATION_PROMPT.format_messages(
                 user_query=user_query,
                 schema_text=schema_text,
                 num_candidates=self.num_candidates,
             )
-            messages = [
-                {"role": "system", "content": "你是 SQL 专家，只输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ]
-            result = self.llm_client.chat_json(messages, temperature=0.3)
+            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.3))
+            result = parse_json(raw)
 
             candidates = []
             for entry in result.get("candidates", []):

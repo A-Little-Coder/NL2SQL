@@ -107,12 +107,12 @@ class TestEvaluateColumnRelevance(unittest.TestCase):
 
     def test_with_llm_mock(self):
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "scores": [
                 {"table": "orders", "column": "amount", "score": 0.9, "reason": "直接相关"},
                 {"table": "orders", "column": "id", "score": 0.3, "reason": "弱相关"},
             ]
-        }
+        }, ensure_ascii=False), None)])
         selector = SchemaSelector(llm_client=mock_llm)
         tables = [
             MSchemaTable(name="orders", columns=[
@@ -189,13 +189,13 @@ class TestSelectFlow(unittest.TestCase):
 
     def test_full_flow(self):
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "scores": [
                 {"table": "orders", "column": "amount", "score": 0.9},
                 {"table": "orders", "column": "date", "score": 0.6},
                 {"table": "orders", "column": "note", "score": 0.2},
             ]
-        }
+        }, ensure_ascii=False), None)])
         selector = SchemaSelector(llm_client=mock_llm, relevance_threshold=0.5)
 
         ctx = RetrievedContext(

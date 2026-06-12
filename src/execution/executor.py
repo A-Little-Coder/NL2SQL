@@ -302,22 +302,9 @@ class SQLExecutor:
 # 错误修正循环
 # ============================================================================
 
-SQL_FIX_PROMPT = """你是 SQL 专家。下面的 SQL 执行失败了，请修正它。
-
-原始用户查询: "{user_query}"
-
-失败的 SQL:
-{sql}
-
-错误信息:
-{error_info}
-
-可用 Schema:
-{schema_text}
-{fix_history_section}
-请生成修正后的 SQL（只生成 SELECT 查询，禁止修改数据），返回 JSON：
-{{"sql": "修正后的SQL", "reason": "修正理由"}}
-"""
+# SQL_FIX_PROMPT 已迁移至 src/execution/prompts.py
+from src.execution.prompts import SQL_FIX_PROMPT
+from utils.llm_client import parse_json, stream_with_sse
 
 
 def _format_fix_history(history: List[Dict[str, Any]]) -> str:
@@ -504,18 +491,15 @@ class SQLFixLoop:
             return None
 
         try:
-            prompt = SQL_FIX_PROMPT.format(
+            messages = SQL_FIX_PROMPT.format_messages(
                 user_query=user_query,
                 sql=sql,
                 error_info=error.to_prompt_format(),
                 schema_text=schema_text or "(未提供 schema)",
                 fix_history_section=_format_fix_history(fix_history or []),
             )
-            messages = [
-                {"role": "system", "content": "你是 SQL 修正专家，只输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ]
-            result = self.llm_client.chat_json(messages, temperature=0.0)
+            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0))
+            result = parse_json(raw)
             fixed = result.get("sql", "").strip()
             return fixed if fixed else None
         except Exception as e:

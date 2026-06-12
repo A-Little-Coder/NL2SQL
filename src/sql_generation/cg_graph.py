@@ -85,20 +85,27 @@ def build_cg_graph(generator):
                     metric_lines.append(f"- {m.get('name', '')}: {m.get('description', '')} → {m.get('sql_pattern', '')}")
             metric_text = "\n".join(metric_lines) if metric_lines else ""
 
-            prompt = generator.SQL_GENERATION_PROMPT.format(
+            from src.sql_generation.prompts import SQL_GENERATION_PROMPT
+            from utils.llm_client import parse_json, stream_with_sse
+            from langchain_core.messages import HumanMessage
+
+            base_messages = SQL_GENERATION_PROMPT.format_messages(
                 user_query=state["user_query"],
                 schema_text=schema_text,
                 num_candidates=generator.num_candidates,
             )
+            # 把额外上下文（preference / metric）作为追加的 user 消息（保持模板纯净）
             if preference_text:
-                prompt += f"\n\n## 用户查询偏好\n{preference_text}"
+                base_messages.append(
+                    HumanMessage(f"## 用户查询偏好\n{preference_text}")
+                )
             if metric_text:
-                prompt += f"\n\n## 已知指标定义\n{metric_text}\n如果当前查询匹配以上指标定义，请优先使用对应的 SQL 模式。"
-            messages = [
-                {"role": "system", "content": "你是 SQL 专家，只输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ]
-            result = generator.llm_client.chat_json(messages, temperature=0.3)
+                base_messages.append(HumanMessage(
+                    f"## 已知指标定义\n{metric_text}\n"
+                    "如果当前查询匹配以上指标定义，请优先使用对应的 SQL 模式。"
+                ))
+            raw = stream_with_sse(generator.llm_client.stream(base_messages, as_json=True, temperature=0.3))
+            result = parse_json(raw)
 
             candidates: List[SQLCandidate] = []
             for entry in result.get("candidates", []):

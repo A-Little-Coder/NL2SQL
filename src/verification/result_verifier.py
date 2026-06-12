@@ -19,38 +19,9 @@ from loguru import logger
 # Prompt 模板
 # ---------------------------------------------------------------------------
 
-RESULT_VERIFICATION_PROMPT = """\
-你是一个 SQL 结果可信度验证专家。请严格验证：生成的 SQL 是否**真正在回答用户的问题**，而非答非所问。
-
-## 严格原则
-- 只有当 SQL 语义与用户问题**明确对齐**时才判 "true"
-- 存在**任何**粒度不匹配、硬凑替代、维度缺失时判 "false"
-- 答非所问比拒答对用户伤害更大——拒答至少诚实，答非所问会误导
-
-## 检查维度
-1. **粒度匹配**：SQL 查询的粒度是否与问题匹配（如问"每个学生"但 SQL 查的是"每个学校"→ 不匹配）
-2. **维度覆盖**：结果列是否覆盖了问题中请求的维度（如问"姓名+分数"但结果只有分数）
-3. **硬凑检测**：是否存在用近似字段替代了用户真正要的字段（如用"School"替代"学生姓名"）
-
-## 用户问题
-{user_query}
-
-## 最终选定的 SQL
-{selected_sql}
-
-## SQL 执行结果样本（列名 + 前 5 行）
-{result_sample}
-
-## 数据库 Schema（参考）
-{schema_text}
-
-请验证并返回 JSON：
-{{
-  "trustworthy": "true" | "false",
-  "reason": "验证理由",
-  "granularity_match": "粒度对齐说明",
-  "semantic_alignment": "语义对齐说明"
-}}"""
+# Prompt 已迁移至 src/verification/prompts.py
+from src.verification.prompts import RESULT_VERIFICATION_PROMPT
+from utils.llm_client import parse_json, stream_with_sse
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +112,7 @@ class ResultVerifier:
             schema_text = self._format_mschema(mschema)
 
         # 3. 调用 LLM
-        prompt = RESULT_VERIFICATION_PROMPT.format(
+        messages = RESULT_VERIFICATION_PROMPT.format_messages(
             user_query=user_query,
             selected_sql=selected_sql,
             result_sample=sample_text,
@@ -149,11 +120,8 @@ class ResultVerifier:
         )
 
         try:
-            messages = [
-                {"role": "system", "content": "你是 SQL 结果验证专家，只输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ]
-            result = self.llm_client.chat_json(messages, temperature=0.0)
+            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0))
+            result = parse_json(raw)
 
             trustworthy = result.get("trustworthy", "true").lower()
             if trustworthy not in ("true", "false"):

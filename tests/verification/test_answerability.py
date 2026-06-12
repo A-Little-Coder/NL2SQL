@@ -55,7 +55,7 @@ class TestAnswerabilityCheckerNoLLM(unittest.TestCase):
         result = checker.check("任何问题", mschema=[])
         self.assertEqual(result.answerable, "false")
         # 不应该调用 LLM
-        mock_llm.chat_json.assert_not_called()
+        mock_llm.stream.assert_not_called()
 
 
 class TestAnswerabilityCheckerWithLLM(unittest.TestCase):
@@ -89,13 +89,13 @@ class TestAnswerabilityCheckerWithLLM(unittest.TestCase):
     def test_granularity_mismatch_returns_false(self):
         """问学生但只有学校级别数据 → false"""
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "answerable": "false",
             "confidence": 0.85,
             "reason": "数据库只有学校级别的 SAT 分数，没有学生个体数据",
             "missing_info": "学生粒度的成绩数据",
             "granularity_match": "问'每个学生'但数据粒度为学校",
-        }
+        }, ensure_ascii=False), None)])
         checker = AnswerabilityChecker(llm_client=mock_llm)
         result = checker.check(
             "每个学生的各科平均分是怎么样的",
@@ -108,13 +108,13 @@ class TestAnswerabilityCheckerWithLLM(unittest.TestCase):
     def test_clearly_answerable_returns_true(self):
         """明确可回答 → true"""
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "answerable": "true",
             "confidence": 0.95,
             "reason": "satscores 表包含阅读和数学分数，可回答各科平均分",
             "missing_info": "",
             "granularity_match": "问题未指定学生粒度，学校级别数据可满足",
-        }
+        }, ensure_ascii=False), None)])
         checker = AnswerabilityChecker(llm_client=mock_llm)
         result = checker.check(
             "各校的 SAT 平均分是多少",
@@ -126,13 +126,13 @@ class TestAnswerabilityCheckerWithLLM(unittest.TestCase):
     def test_uncertain_passes_through(self):
         """不确定 → 放行"""
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "answerable": "uncertain",
             "confidence": 0.5,
             "reason": "可能有相关信息但需要进一步验证",
             "missing_info": "不确定是否有学生级别数据",
             "granularity_match": "不确定",
-        }
+        }, ensure_ascii=False), None)])
         checker = AnswerabilityChecker(llm_client=mock_llm)
         result = checker.check(
             "有没有关于成绩的数据",
@@ -144,11 +144,11 @@ class TestAnswerabilityCheckerWithLLM(unittest.TestCase):
     def test_invalid_answerable_defaults_to_uncertain(self):
         """LLM 返回无效值 → 退回 uncertain"""
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "answerable": "maybe",
             "confidence": 0.3,
             "reason": "不确定",
-        }
+        }, ensure_ascii=False), None)])
         checker = AnswerabilityChecker(llm_client=mock_llm)
         result = checker.check("查询", mschema=self._make_mschema())
         self.assertEqual(result.answerable, "uncertain")
@@ -156,7 +156,7 @@ class TestAnswerabilityCheckerWithLLM(unittest.TestCase):
     def test_llm_failure_returns_uncertain(self):
         """LLM 调用失败 → 默认放行"""
         mock_llm = MagicMock()
-        mock_llm.chat_json.side_effect = Exception("API 超时")
+        mock_llm.stream.side_effect = Exception("API 超时")
         checker = AnswerabilityChecker(llm_client=mock_llm)
         result = checker.check("查询", mschema=self._make_mschema())
         self.assertEqual(result.answerable, "uncertain")

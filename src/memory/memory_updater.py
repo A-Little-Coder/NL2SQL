@@ -27,21 +27,8 @@ TABLE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# LLM 指标提取 Prompt
-METRIC_EXTRACT_PROMPT = """你是一个 SQL 分析器。请从以下 SQL 中提取业务指标定义。
-
-SQL:
-{sql}
-
-请输出 JSON:
-{{
-    "metric_name": "指标名称（中文，如'销售额'）",
-    "description": "指标的业务含义描述",
-    "sql_pattern": "简化后的 SQL 模式（保留聚合函数和 WHERE 条件）"
-}}
-
-如果 SQL 不是简单聚合查询（无 SUM/COUNT/AVG/MAX/MIN），返回 {{"metric_name": null}}。
-"""
+# Prompt 已迁移至 src/memory/prompts.py
+from src.memory.prompts import METRIC_EXTRACT_PROMPT
 
 
 class MemoryUpdater:
@@ -113,12 +100,9 @@ class MemoryUpdater:
 
         # 调 LLM 提取
         try:
-            messages = [
-                {"role": "system", "content": "你是一个 SQL 分析器。只输出 JSON。"},
-                {"role": "user", "content": METRIC_EXTRACT_PROMPT.format(sql=sql)},
-            ]
-            response = self._llm.chat(messages, response_format={"type": "json_object"})
-            data = json.loads(response) if isinstance(response, str) else response
+            messages = METRIC_EXTRACT_PROMPT.format_messages(sql=sql)
+            # 记忆更新是离线/异步场景，走 invoke（不需要 SSE 推送）
+            data = self._llm.invoke(messages, as_json=True)
 
             metric_name = data.get("metric_name")
             if metric_name:

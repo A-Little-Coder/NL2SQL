@@ -19,38 +19,9 @@ from loguru import logger
 # Prompt 模板
 # ---------------------------------------------------------------------------
 
-ANSWERABILITY_CHECK_PROMPT = """\
-你是一个数据库可回答性判断专家。根据用户问题和当前可用的数据库 schema，判断数据库是否有足够信息回答该问题。
-
-## 宽松原则
-- 只要有**合理的可能性**能回答，就判为 "true" 或 "uncertain"
-- 只有在**明确**缺少关键实体、或数据粒度与问题要求**严重不匹配**时，才判为 "false"
-- "uncertain" 一律视为可继续，不要过度拦截
-
-## 判断维度
-1. **实体覆盖**：问题中提到的核心实体（如"学生""订单"）在 schema 中是否有对应表/列
-2. **粒度匹配**：数据的粒度是否与问题一致（如问"每个学生"但数据是"每个学校"级别 → 不匹配）
-3. **字段覆盖**：问题请求的维度（如"姓名+分数"）是否在 schema 中有对应列
-
-## 用户问题
-{user_query}
-
-## 可用数据库 Schema
-{schema_text}
-
-## IR 检索辅助信息
-- 提取关键词: {keywords}
-- LSH 值命中数: {lsh_hit_count}
-- 向量检索 top 分数: {vector_top_scores}
-
-请判断并返回 JSON：
-{{
-  "answerable": "true" | "false" | "uncertain",
-  "confidence": 0.0-1.0,
-  "reason": "判断理由",
-  "missing_info": "缺少什么信息（如果 false/uncertain，否则空字符串）",
-  "granularity_match": "粒度是否匹配的说明"
-}}"""
+# Prompt 已迁移至 src/verification/prompts.py
+from src.verification.prompts import ANSWERABILITY_CHECK_PROMPT
+from utils.llm_client import parse_json, stream_with_sse
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +119,7 @@ class AnswerabilityChecker:
             vector_top_scores = getattr(ir_context, "vector_top_scores", []) or []
 
         # 3. 调用 LLM
-        prompt = ANSWERABILITY_CHECK_PROMPT.format(
+        messages = ANSWERABILITY_CHECK_PROMPT.format_messages(
             user_query=user_query,
             schema_text=schema_text,
             keywords=", ".join(keywords) if keywords else "无",
@@ -158,11 +129,8 @@ class AnswerabilityChecker:
         )
 
         try:
-            messages = [
-                {"role": "system", "content": "你是数据库可回答性判断专家，只输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ]
-            result = self.llm_client.chat_json(messages, temperature=0.0)
+            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0))
+            result = parse_json(raw)
 
             answerable = result.get("answerable", "uncertain").lower()
             if answerable not in ("true", "false", "uncertain"):

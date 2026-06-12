@@ -87,12 +87,12 @@ class TestGenerate(unittest.TestCase):
 
     def test_generate_with_mock_llm(self):
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "candidates": [
                 {"sql": "SELECT SUM(amount) FROM orders WHERE region = '北京'", "reason": "聚合查询"},
                 {"sql": "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING region = '北京'", "reason": "分组聚合"},
             ]
-        }
+        }, ensure_ascii=False), None)])
         gen = SQLGenerator(llm_client=mock_llm, num_candidates=5)
 
         schema = [
@@ -114,12 +114,12 @@ class TestGenerate(unittest.TestCase):
     def test_generate_filters_dangerous_sql(self):
         """危险 SQL 应该被过滤"""
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "candidates": [
                 {"sql": "SELECT * FROM orders", "reason": "安全"},
                 {"sql": "DROP TABLE orders", "reason": "危险"},
             ]
-        }
+        }, ensure_ascii=False), None)])
         gen = SQLGenerator(llm_client=mock_llm)
         result = gen.generate([], "test")
         # DROP 应该被过滤

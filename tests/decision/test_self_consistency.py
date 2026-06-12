@@ -152,7 +152,8 @@ class TestDecide(unittest.TestCase):
 
     def test_all_different_calls_llm(self):
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {"selected": 2, "reason": "更准确"}
+        # 新接口：llm_final_decision 走 stream + parse_json
+        mock_llm.stream.return_value = iter([('{"selected": 2, "reason": "更准确"}', None)])
         decider = SelfConsistencyDecision(llm_client=mock_llm)
 
         cands = [

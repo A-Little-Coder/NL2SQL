@@ -70,7 +70,7 @@ class TestExecuteAllNode(unittest.TestCase):
         node(_make_state(candidates))
 
         # 关键：LLM 客户端任何方法都不应被调用
-        self.assertEqual(self.llm_client.chat_json.call_count, 0)
+        self.assertEqual(self.llm_client.stream.call_count, 0)
         self.assertEqual(self.llm_client.chat.call_count, 0)
         # 也不应调用 build_graph（无 fix 子图）
         self.assertEqual(self.fix_loop.build_graph.call_count, 0)

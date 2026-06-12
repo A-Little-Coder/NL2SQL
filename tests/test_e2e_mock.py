@@ -168,7 +168,7 @@ class TestE2EMock(unittest.TestCase):
         # Step 3: CG（模拟 LLM 返回 SQL）
         print("\n[Step 3] SQL 生成 (CG)")
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "candidates": [
                 {
                     "sql": "SELECT p.name, SUM(o.quantity * p.price) AS total_sales FROM products p JOIN orders o ON p.id = o.product_id WHERE p.name = '苹果' AND o.region = '北京'",
@@ -179,7 +179,7 @@ class TestE2EMock(unittest.TestCase):
                     "reason": "使用 LIKE 模糊匹配",
                 },
             ]
-        }
+        }, ensure_ascii=False), None)])
         generator = SQLGenerator(llm_client=mock_llm)
         candidates = generator.generate(filtered, "查一下北京地区苹果的销售额")
         for c in candidates:
@@ -243,12 +243,12 @@ class TestE2EMock(unittest.TestCase):
 
         # CG
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "candidates": [
                 {"sql": "SELECT COUNT(*) AS fruit_count FROM products WHERE category = '水果'",
                  "reason": "统计水果种类"},
             ]
-        }
+        }, ensure_ascii=False), None)])
         generator = SQLGenerator(llm_client=mock_llm)
         candidates = generator.generate(mschema, "有多少种水果")
 

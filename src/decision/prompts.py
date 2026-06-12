@@ -1,0 +1,83 @@
+# ============================================================================
+# Decision 模块的 Prompt 模板（OpenSpec migrate-llm-client-to-langchain）
+# ============================================================================
+# 集中管理 self_consistency.py 中所有 LLM 调用的 prompt：
+#   - SCORE_BY_DATA_PROMPT     R1 数据视角评分（隐藏 SQL）
+#   - SCORE_BY_SQL_PROMPT      R2 SQL 视角评分（R1 并列=5 时触发）
+#   - LLM_FINAL_DECISION_PROMPT  llm_final_decision（向后兼容旧路径）
+#
+# 设计要点：
+#   - 用 ChatPromptTemplate.from_messages 拆分 system / user 段
+#   - 模板变量用单层花括号 {var}，需要字面量大括号写 {{...}}
+#   - 中文思考指令不放进模板（由 LLMClient 入口集中注入）
+# ============================================================================
+
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# ── R1 数据视角评分 ───────────────────────────────────────────────────
+
+SCORE_BY_DATA_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "你是数据分析专家，只输出 JSON。"),
+    ("user", """请基于"数据视角"为每个候选 SQL 的执行结果打分。
+
+**重要提示**：下面展示的"结果数据"是节选的前 {topk} 行（不代表完整结果）。
+- 请基于这 {topk} 行的数据形态、列结构、是否包含用户所需信息进行评分
+- "row_count" 字段告诉你 SQL 实际返回了多少行（即使你只看到 {topk} 行）
+- 请**不要**因为只看到 {topk} 行而误判数据量
+
+【第一轮评分标准 - 数据视角】
+5 完美匹配：返回的数据完整、精确回答了用户问题，无冗余无缺失
+4 基本匹配：数据回答了核心问题，存在轻微非关键瑕疵（如多了一列、行数略多/少）
+3 部分匹配：数据方向正确但缺失关键维度，或行数明显异常
+2 严重偏差：返回的数据可能误导用户（如统计口径错、缺关键过滤）
+1 数据无意义：返回 0 行 / 全 NULL / 数据完全和问题无关
+0 不可评估：执行虽成功但结果不可读
+
+用户查询: "{user_query}"
+
+候选结果：
+{candidates_text}
+
+请为每个候选评分，返回 JSON：
+{{"scores": [{{"candidate_id": "c1", "score": 5, "reason": "评分理由"}}, ...]}}"""),
+])
+
+
+# ── R2 SQL 视角评分（严格模式） ──────────────────────────────────────
+
+SCORE_BY_SQL_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "你是 SQL 评审专家，只输出 JSON。"),
+    ("user", """这些候选 SQL 在数据视角上已并列得到满分（5/5），
+现在请基于 SQL 代码本身的质量进行第二轮评分。
+
+【第二轮评分标准 - 严格模式】
+5 完美满足：DSL 逻辑**完全覆盖**用户意图，指标、维度、筛选条件均**绝对精确**，无冗余，无缺失
+4 基本满足：核心数据逻辑正确，但存在**轻微**且**不影响结论的**瑕疵（如非核心冗余字段，业务上等价的替代字段）
+3 部分满足/存在小错：核心指标正确但缺失关键限定条件 / 时间范围/排序方式等次要逻辑明显错误 / DSL 存在不必要的复杂操作
+2 存在严重偏差：核心指标选取错误或不完整 / 漏掉了核心业务限定条件 / DSL 结构混乱
+1 严重错误：DSL 无法执行 / 字段名错误 / 查询结果与用户意图大方向完全不符
+0 完全不相关：生成内容不是合法的 DSL，或完全未响应用户输入
+
+用户查询: "{user_query}"
+
+候选 SQL（含第一轮数据视角评价）：
+{candidates_text}
+
+请为每个候选评分，返回 JSON：
+{{"scores": [{{"candidate_id": "c1", "score": 5, "reason": "评分理由"}}, ...]}}"""),
+])
+
+
+# ── LLM 最终决策（向后兼容旧 llm_final_decision 方法） ───────────────
+
+LLM_FINAL_DECISION_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "你是 SQL 评审专家，只输出 JSON。"),
+    ("user", """用户查询: "{user_query}"
+
+有以下候选 SQL 及其执行结果：
+{candidates_text}
+
+请选择最符合用户查询意图的 SQL，返回 JSON：
+{{"selected": 候选编号, "reason": "选择理由"}}"""),
+])

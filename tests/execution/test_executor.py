@@ -179,11 +179,11 @@ class TestSQLFixLoop(unittest.TestCase):
 
     def test_fix_with_llm_mock(self):
         """LLM 提供修正后第二次成功"""
+        import json
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
-            "sql": "SELECT * FROM orders",
-            "reason": "修正表名",
-        }
+        mock_llm.stream.return_value = iter([(
+            json.dumps({"sql": "SELECT * FROM orders", "reason": "修正表名"}), None
+        )])
         executor = SQLExecutor(db_connector=self.connector)
         loop = SQLFixLoop(executor, llm_client=mock_llm, max_retries=2)
 
@@ -192,22 +192,26 @@ class TestSQLFixLoop(unittest.TestCase):
         self.assertTrue(ret["result"].success)
         self.assertFalse(ret["fix_failed"])
         self.assertEqual(ret["fix_rounds_used"], 1)
-        mock_llm.chat_json.assert_called()
+        mock_llm.stream.assert_called()
 
     def test_fix_max_retries_reached(self):
         """超过最大重试次数返回最后一次的错误"""
+        import json
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
-            "sql": "SELECT * FROM still_wrong",  # 仍然错误
-            "reason": "尝试修正",
-        }
+        # 每次都返回错误的修正（迭代器需要重置）
+        def fake_stream(*args, **kwargs):
+            return iter([(
+                json.dumps({"sql": "SELECT * FROM still_wrong", "reason": "尝试修正"}), None
+            )])
+        mock_llm.stream.side_effect = fake_stream
+
         executor = SQLExecutor(db_connector=self.connector)
         loop = SQLFixLoop(executor, llm_client=mock_llm, max_retries=2)
         ret = loop.run("SELECT * FROM wrong_table", "查询")
         self.assertFalse(ret["result"].success)
         self.assertTrue(ret["fix_failed"])
         # 应该尝试了 max_retries 次修正
-        self.assertEqual(mock_llm.chat_json.call_count, 2)
+        self.assertEqual(mock_llm.stream.call_count, 2)
 
     def test_no_llm_no_retry(self):
         """没有 LLM 时第一次失败就退出"""

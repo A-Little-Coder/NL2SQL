@@ -85,12 +85,12 @@ class TestResultVerifierWithLLM(unittest.TestCase):
     def test_granularity_mismatch_returns_false(self):
         """SQL 查学校但问学生 → 不可信"""
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "trustworthy": "false",
             "reason": "SQL queries school-level data but user asked for student-level",
             "granularity_match": "mismatch: asked per-student but SQL returns per-school",
             "semantic_alignment": "school scores used as proxy for student scores",
-        }
+        }, ensure_ascii=False), None)])
         verifier = ResultVerifier(llm_client=mock_llm)
         result = verifier.verify(
             user_query="each student's average score",
@@ -104,12 +104,12 @@ class TestResultVerifierWithLLM(unittest.TestCase):
     def test_normal_alignment_returns_true(self):
         """SQL 与问题对齐 → 可信"""
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "trustworthy": "true",
             "reason": "SQL correctly queries school-level SAT scores matching user request",
             "granularity_match": "aligned: both at school level",
             "semantic_alignment": "result columns match requested dimensions",
-        }
+        }, ensure_ascii=False), None)])
         verifier = ResultVerifier(llm_client=mock_llm)
         result = verifier.verify(
             user_query="average SAT scores for each school",
@@ -123,12 +123,12 @@ class TestResultVerifierWithLLM(unittest.TestCase):
     def test_hard_coded_substitution_returns_false(self):
         """用 School 替代学生姓名 → 不可信"""
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "trustworthy": "false",
             "reason": "User asked for student names but SQL returns school names as substitute",
             "granularity_match": "mismatch",
             "semantic_alignment": "school name used in place of student name (hard substitution)",
-        }
+        }, ensure_ascii=False), None)])
         verifier = ResultVerifier(llm_client=mock_llm)
         result = verifier.verify(
             user_query="list student names and their scores",
@@ -141,7 +141,7 @@ class TestResultVerifierWithLLM(unittest.TestCase):
     def test_llm_failure_returns_trustworthy(self):
         """LLM 调用失败 → 默认放行"""
         mock_llm = MagicMock()
-        mock_llm.chat_json.side_effect = Exception("API timeout")
+        mock_llm.stream.side_effect = Exception("API timeout")
         verifier = ResultVerifier(llm_client=mock_llm)
         result = verifier.verify(
             user_query="query",
@@ -153,10 +153,10 @@ class TestResultVerifierWithLLM(unittest.TestCase):
     def test_invalid_trustworthy_defaults_to_true(self):
         """LLM 返回无效值 → 默认放行"""
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "trustworthy": "maybe",
             "reason": "uncertain",
-        }
+        }, ensure_ascii=False), None)])
         verifier = ResultVerifier(llm_client=mock_llm)
         result = verifier.verify(
             user_query="query",

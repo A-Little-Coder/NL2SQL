@@ -122,32 +122,9 @@ class MSchemaFormat:
         return "\n".join(lines)
 
 
-# ============================================================================
-# 列相关性评估 Prompt
-# ============================================================================
-
-COLUMN_RELEVANCE_PROMPT = """你是一位 SQL 专家。请评估以下 schema 中每个列与用户查询的相关性。
-
-用户查询: "{user_query}"
-
-可用 schema:
-{schema_text}
-
-请为每个列评分（0.0 - 1.0）：
-- 1.0: 直接用于 SELECT、WHERE 或 GROUP BY
-- 0.7: JOIN 或聚合时需要
-- 0.5: 间接相关
-- 0.3: 弱相关，可能不需要
-- 0.0: 完全不相关
-
-只返回 JSON，格式如下：
-{{"scores": [
-  {{"table": "表名", "column": "列名", "score": 0.9, "reason": "原因"}},
-  ...
-]}}
-
-注意：必须为 schema 中**每一个**列打分。
-"""
+# Prompt 已迁移至 src/schema_selection/prompts.py
+from src.schema_selection.prompts import COLUMN_RELEVANCE_PROMPT
+from utils.llm_client import parse_json, stream_with_sse
 
 
 class SchemaSelector:
@@ -288,15 +265,12 @@ class SchemaSelector:
             mschema_dict = MSchemaFormat.create_mschema_schema(mschema_tables)
             schema_text = MSchemaFormat.format_for_llm(mschema_dict)
 
-            prompt = COLUMN_RELEVANCE_PROMPT.format(
+            messages = COLUMN_RELEVANCE_PROMPT.format_messages(
                 user_query=user_query,
                 schema_text=schema_text,
             )
-            messages = [
-                {"role": "system", "content": "你是 SQL 专家，只输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ]
-            result = self.llm_client.chat_json(messages, temperature=0.0)
+            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0))
+            result = parse_json(raw)
 
             # 应用评分
             scores_map = {}

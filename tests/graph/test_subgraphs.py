@@ -128,9 +128,11 @@ def test_cg_subgraph_with_mock_llm():
     from src.sql_generation.sql_generator import SQLGenerator
 
     mock_llm = MagicMock()
-    mock_llm.chat_json = MagicMock(return_value={
-        "candidates": [{"sql": "SELECT * FROM t", "reason": "test"}]
-    })
+    import json
+    mock_llm.stream = MagicMock(return_value=iter([(
+        json.dumps({"candidates": [{"sql": "SELECT * FROM t", "reason": "test"}]}),
+        None,
+    )]))
     cg = SQLGenerator(llm_client=mock_llm, num_candidates=2)
 
     col = MSchemaColumn(name="id", data_type="INT")
@@ -285,12 +287,12 @@ def test_decision_subgraph_majority():
 
     mock_llm = MagicMock()
     # R1 评分：c2 是 5（唯一最高），直接返回路径 A
-    mock_llm.chat_json.return_value = {
+    mock_llm.stream.return_value = iter([(__import__("json").dumps({
         "scores": [
             {"candidate_id": "SELE", "score": 4, "reason": ""},
             {"candidate_id": "SELE", "score": 5, "reason": ""},  # 注意 id 冲突
         ]
-    }
+    }, ensure_ascii=False), None)])
     d = SelfConsistencyDecision(llm_client=mock_llm)
 
     # 用唯一 id 避免冲突
@@ -300,12 +302,12 @@ def test_decision_subgraph_majority():
     c2.id = "c2"
 
     # 修正 mock 评分使用真实 id
-    mock_llm.chat_json.return_value = {
+    mock_llm.stream.return_value = iter([(__import__("json").dumps({
         "scores": [
             {"candidate_id": "c1", "score": 3, "reason": ""},
             {"candidate_id": "c2", "score": 5, "reason": ""},
         ]
-    }
+    }, ensure_ascii=False), None)])
 
     g = d.build_graph()
     result = g.invoke({"candidates": [c1, c2], "user_query": "q"})
@@ -321,7 +323,9 @@ def test_decision_subgraph_llm_fallback():
 
     mock_llm = MM()
     # R1 评分：所有候选都 < 5 → 进入 SmartFix
-    mock_llm.chat_json.side_effect = [
+    mock_llm.stream.side_effect = [
+    iter([(__import__("json").dumps(d, ensure_ascii=False), None)])
+    for d in [
         # R1 评分
         {"scores": [
             {"candidate_id": "A", "score": 3, "reason": ""},
@@ -330,6 +334,7 @@ def test_decision_subgraph_llm_fallback():
         ]},
         # SmartFix 调用（不会真正发生，因为没注入 fix_loop，节点会兜底失败）
     ]
+]
     d = SelfConsistencyDecision(llm_client=mock_llm)
 
     c1 = _mk_cand("A", result=[(1,)])

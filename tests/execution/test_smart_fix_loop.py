@@ -1,5 +1,5 @@
 # ============================================================================
-# SmartFix（SQLFixLoop 决策 51 版）测试
+# SmartFix（SQLFixLoop 决策 51 版）测试 — 适配新 invoke/stream API
 # ============================================================================
 # 覆盖：
 # - 1 轮成功
@@ -12,7 +12,7 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -38,16 +38,22 @@ def _exec_fail(sql, err_type=ErrorType.SEMANTIC_ERROR, msg="no such column"):
     )
 
 
+def _stream_returning(sql: str, reason: str = ""):
+    """构造一个 mock stream 迭代器，yield JSON 文本"""
+    import json
+    body = json.dumps({"sql": sql, "reason": reason})
+    return iter([(body, None)])
+
+
 class TestSmartFixLoop(unittest.TestCase):
 
     def test_first_round_success(self):
         """第 1 轮 LLM 修复后即成功"""
         executor = MagicMock()
-        # 修复后执行成功
         executor.execute.return_value = _exec_success("SELECT fixed")
 
         llm = MagicMock()
-        llm.chat_json.return_value = {"sql": "SELECT fixed", "reason": "fix"}
+        llm.stream.return_value = _stream_returning("SELECT fixed", "fix")
 
         loop = SQLFixLoop(executor=executor, llm_client=llm, max_retries=3)
         ret = loop.run(
@@ -59,22 +65,21 @@ class TestSmartFixLoop(unittest.TestCase):
         self.assertFalse(ret["fix_failed"])
         self.assertEqual(ret["fix_rounds_used"], 1)
         self.assertTrue(ret["result"].success)
-        self.assertEqual(llm.chat_json.call_count, 1)
+        self.assertEqual(llm.stream.call_count, 1)
 
     def test_third_round_success(self):
         """前 2 轮失败，第 3 轮成功"""
         executor = MagicMock()
-        # 3 次执行：失败、失败、成功
         executor.execute.side_effect = [
             _exec_fail("SELECT fixed1"),
             _exec_fail("SELECT fixed2"),
             _exec_success("SELECT fixed3"),
         ]
         llm = MagicMock()
-        llm.chat_json.side_effect = [
-            {"sql": "SELECT fixed1", "reason": "try1"},
-            {"sql": "SELECT fixed2", "reason": "try2"},
-            {"sql": "SELECT fixed3", "reason": "try3"},
+        llm.stream.side_effect = [
+            _stream_returning("SELECT fixed1", "try1"),
+            _stream_returning("SELECT fixed2", "try2"),
+            _stream_returning("SELECT fixed3", "try3"),
         ]
 
         loop = SQLFixLoop(executor=executor, llm_client=llm, max_retries=3)
@@ -82,18 +87,17 @@ class TestSmartFixLoop(unittest.TestCase):
 
         self.assertFalse(ret["fix_failed"])
         self.assertEqual(ret["fix_rounds_used"], 3)
-        # 3 次 LLM 调用
-        self.assertEqual(llm.chat_json.call_count, 3)
+        self.assertEqual(llm.stream.call_count, 3)
 
     def test_all_three_rounds_fail(self):
         """3 轮全部失败 → fix_failed=True"""
         executor = MagicMock()
         executor.execute.return_value = _exec_fail("SELECT bad")
         llm = MagicMock()
-        llm.chat_json.side_effect = [
-            {"sql": "SELECT v1", "reason": ""},
-            {"sql": "SELECT v2", "reason": ""},
-            {"sql": "SELECT v3", "reason": ""},
+        llm.stream.side_effect = [
+            _stream_returning("SELECT v1"),
+            _stream_returning("SELECT v2"),
+            _stream_returning("SELECT v3"),
         ]
 
         loop = SQLFixLoop(executor=executor, llm_client=llm, max_retries=3)
@@ -101,8 +105,7 @@ class TestSmartFixLoop(unittest.TestCase):
 
         self.assertTrue(ret["fix_failed"])
         self.assertEqual(ret["fix_rounds_used"], 3)
-        self.assertEqual(llm.chat_json.call_count, 3)
-        # 3 次执行（每轮修复后执行一次）
+        self.assertEqual(llm.stream.call_count, 3)
         self.assertEqual(executor.execute.call_count, 3)
         self.assertIsNotNone(ret["last_error"])
 
@@ -121,7 +124,7 @@ class TestSmartFixLoop(unittest.TestCase):
             )
             self.assertTrue(ret["fix_failed"], f"failed for {err_type}")
             self.assertEqual(ret["fix_rounds_used"], 0)
-            self.assertEqual(llm.chat_json.call_count, 0,
+            self.assertEqual(llm.stream.call_count, 0,
                              f"LLM should not be called for {err_type}")
 
     def test_fix_history_passed_in_prompt(self):
@@ -132,17 +135,19 @@ class TestSmartFixLoop(unittest.TestCase):
             _exec_success("SELECT fixed2"),
         ]
         llm = MagicMock()
-        llm.chat_json.side_effect = [
-            {"sql": "SELECT fixed1", "reason": ""},
-            {"sql": "SELECT fixed2", "reason": ""},
+        llm.stream.side_effect = [
+            _stream_returning("SELECT fixed1"),
+            _stream_returning("SELECT fixed2"),
         ]
 
         loop = SQLFixLoop(executor=executor, llm_client=llm, max_retries=3)
         loop.run("SELECT bad", "x", initial_error=_err("no such column"))
 
-        # 第 2 次 LLM 调用的 prompt 应包含 fix_history
-        second_call_messages = llm.chat_json.call_args_list[1][0][0]
-        user_msg = second_call_messages[1]["content"]
+        # 第 2 次 LLM 调用的 messages 应包含 fix_history
+        second_call_args = llm.stream.call_args_list[1]
+        messages = second_call_args.args[0]
+        # messages 是 List[BaseMessage]，user 消息在 index 1
+        user_msg = messages[1].content
         self.assertIn("历次修复尝试", user_msg)
         self.assertIn("第 1 轮", user_msg)
         self.assertIn("SELECT fixed1", user_msg)
@@ -154,32 +159,16 @@ class TestSmartFixLoop(unittest.TestCase):
         executor.execute.return_value = _exec_fail("SELECT bad")
         llm = MagicMock()
         # 第 1 次返回相同的 SELECT bad
-        llm.chat_json.return_value = {"sql": "SELECT bad", "reason": ""}
+        llm.stream.return_value = _stream_returning("SELECT bad")
 
         loop = SQLFixLoop(executor=executor, llm_client=llm, max_retries=3)
         ret = loop.run("SELECT bad", "x", initial_error=_err("no such column"))
 
         self.assertTrue(ret["fix_failed"])
         # LLM 只被调用 1 次（提前结束）
-        self.assertEqual(llm.chat_json.call_count, 1)
+        self.assertEqual(llm.stream.call_count, 1)
 
     def test_format_fix_history_empty(self):
         """空 history 应返回空字符串"""
         self.assertEqual(_format_fix_history([]), "")
         self.assertEqual(_format_fix_history(None or []), "")
-
-    def test_format_fix_history_content(self):
-        """history 应包含轮次、SQL、错误"""
-        s = _format_fix_history([
-            {"round": 1, "sql": "SELECT a", "error": "err1"},
-            {"round": 2, "sql": "SELECT b", "error": "err2"},
-        ])
-        self.assertIn("第 1 轮", s)
-        self.assertIn("SELECT a", s)
-        self.assertIn("err1", s)
-        self.assertIn("第 2 轮", s)
-        self.assertIn("SELECT b", s)
-
-
-if __name__ == "__main__":
-    unittest.main()

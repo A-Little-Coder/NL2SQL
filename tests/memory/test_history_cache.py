@@ -26,11 +26,18 @@ class MockLLMClient:
         self.preset = preset_result
         self.last_messages = None
 
+    def invoke(self, messages, **kwargs):
+        """新接口：as_json=True 时返回 dict"""
+        self.last_messages = messages
+        return self.preset
+
     def chat(self, messages, **kwargs):
+        """旧接口（向后兼容，本测试已不再用）"""
         self.last_messages = messages
         return self.preset
 
     def chat_json(self, messages, **kwargs):
+        """旧接口（向后兼容）"""
         self.last_messages = messages
         return self.preset
 
@@ -210,7 +217,7 @@ class TestLLMFailure:
     def test_llm_raises_exception(self):
         """LLM 异常应返回未命中"""
         failing_client = MagicMock()
-        failing_client.chat.side_effect = RuntimeError("API 调用失败")
+        failing_client.invoke.side_effect = RuntimeError("API 调用失败")
 
         cache = HistoryCache(failing_client, min_confidence=0.8)
         result = cache.check(
@@ -224,8 +231,10 @@ class TestLLMFailure:
         """LLM 返回无效 JSON 时应返回未命中"""
 
         class InvalidClient:
-            def chat(self, messages, **kwargs):
-                return "not valid json{{{"
+            def invoke(self, messages, **kwargs):
+                # invoke(as_json=True) 失败时会经过 parse_json 兜底，
+                # 返回 {"raw_response": ...} dict
+                return {"raw_response": "not valid json{{{"}
 
         cache = HistoryCache(InvalidClient(), min_confidence=0.8)
         result = cache.check(

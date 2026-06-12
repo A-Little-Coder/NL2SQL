@@ -35,77 +35,77 @@
 
 ## 3. Step 3 — Prompt 模板化
 
-- [ ] 3.1 创建 `src/decision/prompts.py`：抽取 `self_consistency.py` 中所有 LLM prompt（约 4-5 个）为 `ChatPromptTemplate.from_messages` 模板
-- [ ] 3.2 创建 `src/sql_generation/prompts.py`：抽取 `sql_generator.py` / `cg_graph.py` 中的 prompt（约 2 个）
-- [ ] 3.3 创建 `src/retrieval/prompts.py`：抽取 `information_retrieval.py` 中的 prompt（约 1-2 个）
-- [ ] 3.4 创建 `src/schema_selection/prompts.py`：抽取 `schema_selector.py` 中的 prompt（约 1-2 个）
-- [ ] 3.5 创建 `src/verification/prompts.py`：抽取 `answerability.py` / `result_verifier.py` 中的 prompt（约 2 个）
-- [ ] 3.6 创建 `src/execution/prompts.py`：抽取 `executor.py` 的 `SQL_FIX_PROMPT`（1 个）
-- [ ] 3.7 创建 `src/memory/prompts.py`：抽取 `memory_updater.py` / `history_cache.py` 的 prompt（约 2 个）
-- [ ] 3.8 每个 `prompts.py` 中的模板用 `("system", "...")` / `("user", "...")` 拆分（system 段不再含 JSON 输出指令时移至 user 段尾）
-- [ ] 3.9 每个 prompts.py 写一个 smoke test：`tests/<module>/test_prompts.py`，断言 `TEMPLATE.format_messages(...)` 输出含期望字段
-- [ ] 3.10 所有 prompts.py 创建完成 → commit 3：`feat(prompts): 各业务模块新增 prompts.py，集中管理 ChatPromptTemplate`
+- [x] 3.1 创建 `src/decision/prompts.py`：抽取 `self_consistency.py` 中所有 LLM prompt（约 4-5 个）为 `ChatPromptTemplate.from_messages` 模板
+- [x] 3.2 创建 `src/sql_generation/prompts.py`：抽取 `sql_generator.py` / `cg_graph.py` 中的 prompt（约 2 个）
+- [x] 3.3 创建 `src/retrieval/prompts.py`：抽取 `information_retrieval.py` 中的 prompt（约 1-2 个）
+- [x] 3.4 创建 `src/schema_selection/prompts.py`：抽取 `schema_selector.py` 中的 prompt（约 1-2 个）
+- [x] 3.5 创建 `src/verification/prompts.py`：抽取 `answerability.py` / `result_verifier.py` 中的 prompt（约 2 个）
+- [x] 3.6 创建 `src/execution/prompts.py`：抽取 `executor.py` 的 `SQL_FIX_PROMPT`（1 个）
+- [x] 3.7 创建 `src/memory/prompts.py`：抽取 `memory_updater.py` / `history_cache.py` 的 prompt（约 2 个）
+- [x] 3.8 每个 `prompts.py` 中的模板用 `("system", "...")` / `("user", "...")` 拆分（system 段不再含 JSON 输出指令时移至 user 段尾）
+- [x] 3.9 每个 prompts.py 写一个 smoke test：`tests/<module>/test_prompts.py`，断言 `TEMPLATE.format_messages(...)` 输出含期望字段
+- [x] 3.10 所有 prompts.py 创建完成 → commit 3：`feat(prompts): 各业务模块新增 prompts.py，集中管理 ChatPromptTemplate`
 
 ## 4. Step 4 — 业务调用全量迁移
 
 ### 4.1 决策模块（self_consistency.py）
 
-- [ ] 4.1.1 `src/decision/self_consistency.py`：替换 `llm_final_decision()` 中的 LLM 调用 → 用 `LLM_FINAL_DECISION_PROMPT.format_messages(...)` + `stream_with_sse(self.llm_client.stream(msgs, as_json=True))` + `parse_json(raw)`
-- [ ] 4.1.2 `score_by_data()` 同样迁移：用 `SCORE_BY_DATA_PROMPT`
-- [ ] 4.1.3 `score_by_sql()` 同样迁移：用 `SCORE_BY_SQL_PROMPT`
-- [ ] 4.1.4 删除所有 `chat_json(...)` 调用残留
-- [ ] 4.1.5 跑相关单元测试 `pytest tests/decision -x` 通过
+- [x] 4.1.1 `src/decision/self_consistency.py`：替换 `llm_final_decision()` 中的 LLM 调用 → 用 `LLM_FINAL_DECISION_PROMPT.format_messages(...)` + `stream_with_sse(self.llm_client.stream(msgs, as_json=True))` + `parse_json(raw)`
+- [x] 4.1.2 `score_by_data()` 同样迁移：用 `SCORE_BY_DATA_PROMPT`
+- [x] 4.1.3 `score_by_sql()` 同样迁移：用 `SCORE_BY_SQL_PROMPT`
+- [x] 4.1.4 删除所有 `chat_json(...)` 调用残留
+- [x] 4.1.5 跑相关单元测试 `pytest tests/decision -x` 通过
 
 ### 4.2 执行模块（executor.py）
 
-- [ ] 4.2.1 `src/execution/executor.py`：`_try_fix()` 中的 LLM 调用 → 用 `SQL_FIX_PROMPT` + `stream_with_sse(...)` + `parse_json(...)`
-- [ ] 4.2.2 跑 `pytest tests/execution -x` 通过
+- [x] 4.2.1 `src/execution/executor.py`：`_try_fix()` 中的 LLM 调用 → 用 `SQL_FIX_PROMPT` + `stream_with_sse(...)` + `parse_json(...)`
+- [x] 4.2.2 跑 `pytest tests/execution -x` 通过
 
 ### 4.3 验证模块（verification/）
 
-- [ ] 4.3.1 `src/verification/answerability.py`：替换 `chat_json` 调用 → 用 `ANSWERABILITY_PROMPT` + stream 组合
-- [ ] 4.3.2 `src/verification/result_verifier.py`：同上 → 用 `RESULT_VERIFY_PROMPT`
-- [ ] 4.3.3 跑 `pytest tests/verification -x` 通过
+- [x] 4.3.1 `src/verification/answerability.py`：替换 `chat_json` 调用 → 用 `ANSWERABILITY_PROMPT` + stream 组合
+- [x] 4.3.2 `src/verification/result_verifier.py`：同上 → 用 `RESULT_VERIFY_PROMPT`
+- [x] 4.3.3 跑 `pytest tests/verification -x` 通过
 
 ### 4.4 检索 + Schema 选择（retrieval / schema_selection）
 
-- [ ] 4.4.1 `src/retrieval/information_retrieval.py`：替换 `chat_json` → 用 `KEYWORD_EXTRACT_PROMPT`（或同名）+ stream 组合
-- [ ] 4.4.2 `src/schema_selection/schema_selector.py`：替换 `chat_json` → 用 `SCHEMA_SELECT_PROMPT` + stream 组合
-- [ ] 4.4.3 跑 `pytest tests/retrieval tests/schema_selection -x` 通过
+- [x] 4.4.1 `src/retrieval/information_retrieval.py`：替换 `chat_json` → 用 `KEYWORD_EXTRACT_PROMPT`（或同名）+ stream 组合
+- [x] 4.4.2 `src/schema_selection/schema_selector.py`：替换 `chat_json` → 用 `SCHEMA_SELECT_PROMPT` + stream 组合
+- [x] 4.4.3 跑 `pytest tests/retrieval tests/schema_selection -x` 通过
 
 ### 4.5 SQL 生成（sql_generation/）
 
-- [ ] 4.5.1 `src/sql_generation/sql_generator.py`：替换 `chat_json` → 用 `SQL_GENERATE_PROMPT` + stream 组合
-- [ ] 4.5.2 `src/sql_generation/cg_graph.py`：替换 `chat_json` → 用 `CG_PROMPT` + stream 组合
-- [ ] 4.5.3 跑 `pytest tests/sql_generation -x` 通过
+- [x] 4.5.1 `src/sql_generation/sql_generator.py`：替换 `chat_json` → 用 `SQL_GENERATE_PROMPT` + stream 组合
+- [x] 4.5.2 `src/sql_generation/cg_graph.py`：替换 `chat_json` → 用 `CG_PROMPT` + stream 组合
+- [x] 4.5.3 跑 `pytest tests/sql_generation -x` 通过
 
 ### 4.6 记忆模块（memory/）
 
-- [ ] 4.6.1 `src/memory/memory_updater.py`：替换 `chat(messages, response_format={"type":"json_object"})` → 用 `MEMORY_UPDATE_PROMPT` + invoke as_json=True（记忆更新是离线/异步场景，无需 SSE）
-- [ ] 4.6.2 `src/memory/history_cache.py`：同上 → 用 `HISTORY_CACHE_PROMPT`
-- [ ] 4.6.3 跑 `pytest tests/memory -x` 通过
+- [x] 4.6.1 `src/memory/memory_updater.py`：替换 `chat(messages, response_format={"type":"json_object"})` → 用 `MEMORY_UPDATE_PROMPT` + invoke as_json=True（记忆更新是离线/异步场景，无需 SSE）
+- [x] 4.6.2 `src/memory/history_cache.py`：同上 → 用 `HISTORY_CACHE_PROMPT`
+- [x] 4.6.3 跑 `pytest tests/memory -x` 通过
 
 ### 4.7 离线预处理（preprocessing/）
 
-- [ ] 4.7.1 `src/preprocessing/build_schema_graphs.py`：保持 `LLMClient` 初始化方式但改用 `invoke(...)` 直接获取结果（无 SSE 场景）
-- [ ] 4.7.2 `src/preprocessing/schema_graph_builder.py`：替换 `chat_json` → 用 `invoke(msgs, as_json=True)`（离线场景用 invoke）
-- [ ] 4.7.3 跑 `pytest tests/preprocessing -x` 通过
+- [x] 4.7.1 `src/preprocessing/build_schema_graphs.py`：保持 `LLMClient` 初始化方式但改用 `invoke(...)` 直接获取结果（无 SSE 场景）
+- [x] 4.7.2 `src/preprocessing/schema_graph_builder.py`：替换 `chat_json` → 用 `invoke(msgs, as_json=True)`（离线场景用 invoke）
+- [x] 4.7.3 跑 `pytest tests/preprocessing -x` 通过
 
 ### 4.8 业务调用全部迁移完成
 
-- [ ] 4.8.1 全局 grep 确认无残留：`grep -rn "\.chat_json\|\.chat_stream\|self\.client\." src/` 输出为空
-- [ ] 4.8.2 全局 grep 确认无 dict messages：`grep -rn '\[{"role":' src/` 输出为空
-- [ ] 4.8.3 跑全量 `pytest -x` 通过
+- [x] 4.8.1 全局 grep 确认无残留：`grep -rn "\.chat_json\|\.chat_stream\|self\.client\." src/` 输出为空
+- [x] 4.8.2 全局 grep 确认无 dict messages：`grep -rn '\[{"role":' src/` 输出为空
+- [x] 4.8.3 跑全量 `pytest -x` 通过
 - [ ] 4.8.4 → commit 4：`refactor(llm): 13+ 处业务调用全量迁移到 invoke/stream，prompt 全模板化`
 
 ## 5. Step 5 — 测试改造 + 真实回归
 
-- [ ] 5.1 重写 `tests/api/test_streaming.py` 的 `_make_chunk` 辅助函数：用 `from langchain_core.messages import AIMessageChunk` 构造真实 chunk
-- [ ] 5.2 重写 `_build_llm_client` 后续的 mock：`client._chat_model.invoke = MagicMock(return_value=AIMessage(content='{"k":1}'))` / `client._chat_model.stream = MagicMock(return_value=iter([...]))`
-- [ ] 5.3 测试用例验证 `stream_with_sse` 的 SSE 推送正确（用 ContextVar 设置 emitter）
-- [ ] 5.4 业务测试批量替换：`grep -rln "chat_json" tests/` → 把 `mock_llm.chat_json.return_value = ...` 改为 `mock_llm.invoke.return_value = ...`
-- [ ] 5.5 同上：把 `mock_llm.chat_json.side_effect = ...` 改为 `mock_llm.invoke.side_effect = ...`
-- [ ] 5.6 跑 `pytest -x` 全量通过
+- [x] 5.1 重写 `tests/api/test_streaming.py` 的 `_make_chunk` 辅助函数：用 `from langchain_core.messages import AIMessageChunk` 构造真实 chunk
+- [x] 5.2 重写 `_build_llm_client` 后续的 mock：`client._chat_model.invoke = MagicMock(return_value=AIMessage(content='{"k":1}'))` / `client._chat_model.stream = MagicMock(return_value=iter([...]))`
+- [x] 5.3 测试用例验证 `stream_with_sse` 的 SSE 推送正确（用 ContextVar 设置 emitter）
+- [x] 5.4 业务测试批量替换：`grep -rln "chat_json" tests/` → 把 `mock_llm.chat_json.return_value = ...` 改为 `mock_llm.invoke.return_value = ...`
+- [x] 5.5 同上：把 `mock_llm.chat_json.side_effect = ...` 改为 `mock_llm.invoke.side_effect = ...`
+- [x] 5.6 跑 `pytest -x` 全量通过
 - [ ] 5.7 启动 API 服务（`uvicorn src.api.app:app` 或现有启动命令），发一条真实 NL2SQL query
 - [ ] 5.8 在浏览器 / curl 验证 SSE 流：`llm_thinking` 事件中文输出正常，`stage` / `score_r1` / `final_decision` 事件流不中断
 - [ ] 5.9 切 `LLM_CHINESE_THINKING=false` 跑一遍 query，验证英文思考链照常返回

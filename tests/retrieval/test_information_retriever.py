@@ -49,12 +49,12 @@ class TestLLMKeywordExtract(unittest.TestCase):
     def test_llm_extract_new_format(self):
         """新格式：含 zh_synonyms 和 en_synonyms，返回 KeywordGroup 列表"""
         mock_client = MagicMock()
-        mock_client.chat_json.return_value = {
+        mock_client.stream.return_value = iter([(__import__("json").dumps({
             "keywords": [
                 {"phrase": "学校", "zh_synonyms": ["学校", "院校"], "en_synonyms": ["school", "schools"]},
                 {"phrase": "各科score", "zh_synonyms": ["各科成绩", "每科分数"], "en_synonyms": ["subject score", "course score"]},
             ]
-        }
+        }, ensure_ascii=False), None)])
         ir = InformationRetrieval(llm_client=mock_client)
         result = ir.extract_keywords("各个学校的各科score")
         # 返回 KeywordGroup 列表
@@ -77,9 +77,9 @@ class TestLLMKeywordExtract(unittest.TestCase):
     def test_llm_extract_old_format_compat(self):
         """兼容旧格式：纯字符串列表"""
         mock_client = MagicMock()
-        mock_client.chat_json.return_value = {
+        mock_client.stream.return_value = iter([(__import__("json").dumps({
             "keywords": ["去年", "北京", "销售额"]
-        }
+        }, ensure_ascii=False), None)])
         ir = InformationRetrieval(llm_client=mock_client)
         result = ir.extract_keywords("显示去年北京地区的销售额")
         self.assertEqual(len(result), 3)
@@ -88,7 +88,7 @@ class TestLLMKeywordExtract(unittest.TestCase):
 
     def test_llm_extract_fallback(self):
         mock_client = MagicMock()
-        mock_client.chat_json.side_effect = Exception("API Error")
+        mock_client.stream.side_effect = Exception("API Error")
         ir = InformationRetrieval(llm_client=mock_client)
         result = ir.extract_keywords("苹果公司的营收")
         # 回退到简单提取，返回 KeywordGroup 列表
@@ -253,12 +253,12 @@ class TestRetrieveFull(unittest.TestCase):
 
     def test_retrieve_with_mocks(self):
         mock_llm = MagicMock()
-        mock_llm.chat_json.return_value = {
+        mock_llm.stream.return_value = iter([(__import__("json").dumps({
             "keywords": [
                 {"phrase": "苹果", "zh_synonyms": ["苹果"], "en_synonyms": ["apple"]},
                 {"phrase": "销售额", "zh_synonyms": ["销售额", "营收"], "en_synonyms": ["sales", "revenue"]},
             ]
-        }
+        }, ensure_ascii=False), None)])
 
         mock_lsh = MagicMock()
         mock_lsh._loaded_lsh = MagicMock()

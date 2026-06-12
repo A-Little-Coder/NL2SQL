@@ -511,31 +511,17 @@ class SchemaGraphBuilder:
         desc_a = self._format_schema_for_llm(table_a, schema_a)
         desc_b = self._format_schema_for_llm(table_b, schema_b)
 
-        prompt = f"""你是一个数据库专家。请判断以下两个表之间是否存在 JOIN 关系。
-
-表A:
-{desc_a}
-
-表B:
-{desc_b}
-
-如果存在 JOIN 关系，请返回 JSON 格式：
-{{"has_join": true, "join_keys": [[\"{table_a}.列名\", \"{table_b}.列名\"]]}}
-
-如果没有明显的 JOIN 关系，返回：
-{{"has_join": false, "join_keys": []}}
-
-注意：
-1. 只返回确定的 JOIN 关系，不要猜测
-2. 可以有多个 join_key（如同时通过 id 和 name 关联）
-3. 只输出 JSON，不要解释"""
+        from src.preprocessing.prompts import JOIN_INFER_PROMPT
+        messages = JOIN_INFER_PROMPT.format_messages(
+            desc_a=desc_a,
+            desc_b=desc_b,
+            table_a=table_a,
+            table_b=table_b,
+        )
 
         try:
-            messages = [
-                {"role": "system", "content": "你是数据库专家，只输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ]
-            result = self.llm_client.chat_json(messages, temperature=0.0)
+            # 离线脚本场景：用 invoke 一步到位（无 SSE 上下文）
+            result = self.llm_client.invoke(messages, as_json=True, temperature=0.0)
 
             if result.get("has_join") and result.get("join_keys"):
                 logger.debug(

@@ -23,34 +23,8 @@ class CacheResult:
     confidence: float = 0.0
 
 
-# LLM 判断 Prompt 模板
-CACHE_CHECK_PROMPT = """你是一个 NL2SQL 系统的历史命中检测器。请判断当前用户查询是否可以直接复用历史记录中的 SQL。
-
-## 当前查询
-{user_query}
-
-## 历史对话（最近 {max_turns} 轮）
-{conversation_history}
-
-## 已知指标定义
-{metric_definitions}
-
-## 判断规则
-1. 如果当前查询与历史某轮查询完全等价（意图相同、参数相同）→ 复用该轮 SQL
-2. 如果当前查询可以用已知指标定义直接回答 → 使用指标定义的 sql_pattern
-3. 如果当前查询涉及时间范围变化（如"昨天的"→"今天的"、"去年"→"今年"）→ 不复用
-4. 如果当前查询是上一轮的 follow-up 但意图不同 → 不复用
-5. 置信度低于 0.8 时请返回 false
-
-## 输出格式（仅 JSON）
-{{
-    "can_reuse": true/false,
-    "source": "session_history" 或 "metric_definition" 或 null,
-    "cached_sql": "复用的 SQL" 或 null,
-    "confidence": 0.0-1.0,
-    "reason": "判断理由"
-}}
-"""
+# Prompt 已迁移至 src/memory/prompts.py
+from src.memory.prompts import CACHE_CHECK_PROMPT
 
 
 class HistoryCache:
@@ -84,7 +58,7 @@ class HistoryCache:
         history_text = self._format_history(session_history)
         metrics_text = self._format_metrics(metric_definitions)
 
-        prompt = CACHE_CHECK_PROMPT.format(
+        messages = CACHE_CHECK_PROMPT.format_messages(
             user_query=user_query,
             max_turns=len(session_history),
             conversation_history=history_text or "无",
@@ -92,12 +66,10 @@ class HistoryCache:
         )
 
         try:
-            messages = [
-                {"role": "system", "content": "你是一个历史命中检测器。只输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ]
-            response = self._llm.chat(messages, response_format={"type": "json_object"})
-            result = self._parse_response(response)
+            # 历史缓存检测属于"准实时"场景：直接走 invoke 而不是 stream
+            # （响应快 + 不需要 SSE 推送）
+            data = self._llm.invoke(messages, as_json=True)
+            result = self._parse_response(data)
         except Exception:
             # LLM 调用失败时安全降级：不走缓存
             return CacheResult(hit=False)
