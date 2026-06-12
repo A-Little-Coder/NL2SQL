@@ -115,4 +115,4 @@
 
 ## 6. 文档与归档
 
-- [ ] 6.4 全量验证通过后执行 `openspec archive migrate-llm-client-to-langchain`
+- [x] 6.4 全量验证通过后执行 `openspec archive migrate-llm-client-to-langchain`
