@@ -21,6 +21,7 @@ import contextvars
 import json
 import os
 from typing import Any, AsyncGenerator, Dict, List
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
@@ -56,6 +57,17 @@ def _format_sse(event_type: str, data: Dict[str, Any]) -> str:
     return f"data: {payload}\n\n"
 
 
+def _with_qid(data: Dict[str, Any], query_id: str) -> Dict[str, Any]:
+    """给 SSE 事件 payload 注入 query_id（若已存在则保留）。
+
+    用于 event_stream 主循环里 emitter 之外手工构造的事件（result/error/done）。
+    StreamEmitter.emit() 已自动注入；此函数补齐主循环里的事件路径。
+    """
+    if not query_id or "query_id" in data:
+        return data
+    return {**data, "query_id": query_id}
+
+
 @router.post("/query")
 async def query_endpoint(
     body: QueryRequest,
@@ -78,10 +90,21 @@ async def query_endpoint(
         error           错误             {error, node?}
         done            整条 query 完成  {has_result}
 
+    所有事件 payload 都带 `query_id` 字段（§7b 决策，Q4=b 全量带）：
+        前端可按 query_id 分组渲染、定位上下文。
+
     客户端 timeout 建议：
         httpx.Timeout(connect=10, read=None, write=10, pool=10)
     或保留有限 timeout，依赖每 15s 的 `: heartbeat\\n\\n` 重置读计时器。
     """
+    # 0. 生成 query_id：单次请求的全局 ID（§7b 决策）
+    query_id = uuid4().hex[:12]
+    logger.info(
+        f"[query_id={query_id}] 请求进入: "
+        f"user={body.user_id} session={body.session_id} "
+        f"db={body.db_id} query={body.query[:100]!r}"
+    )
+
     # 1. 获取/创建会话
     session = session_manager.get_or_create_session(body.session_id, body.user_id)
 
@@ -92,8 +115,10 @@ async def query_endpoint(
     try:
         db_ctx = pool.acquire(body.db_id)
     except FileNotFoundError as e:
+        logger.warning(f"[query_id={query_id}] 数据库不存在: {body.db_id} ({e})")
         raise HTTPException(status_code=404, detail=f"数据库不存在: {body.db_id} ({e})")
     except Exception as e:
+        logger.exception(f"[query_id={query_id}] 加载数据库失败: {body.db_id}")
         raise HTTPException(status_code=500, detail=f"加载数据库失败: {e}")
 
     # 4. 构建初始 state
@@ -101,6 +126,7 @@ async def query_endpoint(
         user_query=body.query,
         user_id=body.user_id,
         database_filter=body.db_id,
+        query_id=query_id,
     )
     recent_turns = session.get_recent_turns(n=5)
     initial_state["conversation_history"] = [t for t in recent_turns]
@@ -111,7 +137,7 @@ async def query_endpoint(
     async def event_stream() -> AsyncGenerator[str, None]:
         loop = asyncio.get_event_loop()
         queue: asyncio.Queue = asyncio.Queue()
-        emitter = StreamEmitter(queue, loop)
+        emitter = StreamEmitter(queue, loop, query_id=query_id)
         sentinel: Dict[str, Any] = {"__sentinel__": True}
 
         # 累积 graph.stream 的 update（用于事后构造 result/done 事件）
@@ -119,15 +145,31 @@ async def query_endpoint(
 
         def run_graph() -> None:
             """在线程中执行 graph.stream，每个 update 推 graph_update 内部事件"""
+            # §8.1.7：构造 LangSmith config（路径 A 之上的请求级追踪）
+            #   - thread_id 让 LangSmith 按会话聚合（也是 LangGraph checkpoint 的 key）
+            #   - run_name 让单次请求在 LangSmith UI 上可识别
+            #   - tags / metadata 让多维度过滤成为可能
+            config = {
+                "configurable": {"thread_id": body.session_id},
+                "run_name": f"query-{query_id}",
+                "tags": [body.db_id, "api", f"user:{body.user_id}"],
+                "metadata": {
+                    "query_id": query_id,
+                    "user_id": body.user_id,
+                    "session_id": body.session_id,
+                    "db_id": body.db_id,
+                    "user_query": body.query[:200],
+                },
+            }
             token = current_emitter.set(emitter)
             try:
-                for update in db_ctx.graph.stream(initial_state):
+                for update in db_ctx.graph.stream(initial_state, config=config):
                     # 累积到本地 state 字典（_wrap_node 已发 stage 事件，这里只攒结果）
                     for _, node_output in update.items():
                         if isinstance(node_output, dict):
                             accumulated.update(node_output)
             except Exception as e:
-                logger.exception("graph.stream 异常")
+                logger.exception(f"[query_id={query_id}] graph.stream 异常")
                 emitter.emit("error", {"error": str(e)})
             finally:
                 current_emitter.reset(token)
@@ -170,17 +212,17 @@ async def query_endpoint(
             try:
                 await task
             except Exception as e:
-                yield _format_sse("error", {"error": str(e)})
+                yield _format_sse("error", _with_qid({"error": str(e)}, query_id))
 
             # 推送最终 result
             rejection = accumulated.get("rejection_reason")
             if rejection:
-                yield _format_sse("error", {"error": rejection, "rejection": True})
+                yield _format_sse("error", _with_qid({"error": rejection, "rejection": True}, query_id))
             elif accumulated.get("final_sql"):
-                yield _format_sse("result", {
+                yield _format_sse("result", _with_qid({
                     "sql": accumulated["final_sql"],
                     "result": _serialize(accumulated.get("final_result")),
-                })
+                }, query_id))
 
             # 更新会话历史
             try:
@@ -204,16 +246,24 @@ async def query_endpoint(
                     }
                 session.add_turn(turn_data)
             except Exception as e:
-                logger.warning(f"更新会话历史失败: {e}")
+                logger.warning(f"[query_id={query_id}] 更新会话历史失败: {e}")
 
-            yield _format_sse("done", {
+            done_payload = _with_qid({
                 "has_result": bool(accumulated.get("final_sql")),
                 # 决策 51：暴露失败标记、决策路径、修复轮次给前端
                 "fix_failed": accumulated.get("fix_failed", False),
                 "decision_path": accumulated.get("decision_path", ""),
                 "fix_rounds_used": accumulated.get("fix_rounds_used", 0),
                 "last_error": accumulated.get("last_error"),
-            })
+            }, query_id)
+            yield _format_sse("done", done_payload)
+
+            logger.info(
+                f"[query_id={query_id}] 完成: "
+                f"has_result={done_payload['has_result']} "
+                f"fix_failed={done_payload['fix_failed']} "
+                f"decision_path={done_payload['decision_path']!r}"
+            )
 
         finally:
             # 无论如何 release（refcount -= 1）

@@ -54,8 +54,38 @@
 - **理由**: 平衡修正效果和计算成本，避免无限循环
 
 **7. 监控集成**
-- **决策**: 使用LangSmith进行全流程监控
-- **理由**: 已配置API密钥，支持trace链路追踪和性能分析
+- **决策**：通过环境变量驱动 LangSmith 自动接入（路径 A），不实现自定义 `LangSmithMonitor` 包装类。
+- **背景**：LangChain 1.x + LangGraph 原生支持 LangSmith：当 `LANGCHAIN_TRACING_V2=true` 且 `LANGCHAIN_API_KEY` 非空时，所有 `ChatOpenAI` 调用与 `StateGraph` 节点会自动上报 trace，业务代码无需任何改动。
+- **理由**：
+  1. **零侵入**：`utils/llm_client.py`、`main_graph._wrap_node`、各 Agent 子图都不需要插入 monitor 调用，避免与 LangGraph 自动 span 双重嵌套。
+  2. **嵌套自动**：LangGraph 主图 → 子图 → LLM 调用形成天然 span 树，trace 拓扑与代码拓扑一致。
+  3. **维护成本低**：升级 LangChain/LangGraph 时无需同步维护 Monitor 适配代码。
+- **被否决方案**：手写 `LangSmithMonitor.trace(...)` 上下文管理器
+  - 与 LangGraph 自动 span 形成双重嵌套，trace 树混乱
+  - 每个节点都要包一层 `with monitor.trace(...)`，样板代码多
+  - 现有 `src/monitor/langsmith_monitor.py` stub 即此路线遗留，需在落地任务中清理
+
+**7a. 命名层（路径 A 之上的可读性增强）**
+- **决策**：在路径 A 自动接入之上，显式给图 / LLM 调用起 `run_name`，让 LangSmith UI 可读。
+- **三个层次**：
+  1. **项目级**：`LANGCHAIN_PROJECT=NL2SQL`（全大写），一个项目一个 LangSmith 面板。
+  2. **图级 run_name**：主图 `nl2sql-pipeline`；子图 `ir-graph` / `ss-graph` / `cg-graph` / `execution-graph` / `decision-graph`。在 `build_*_graph()` 编译末尾用 `compile().with_config(run_name=...)` 钉死。
+  3. **LLM 调用级 run_name**：`LLMClient.invoke / stream / ainvoke / astream` 4 个公开方法新增 `run_name: Optional[str] = None` 参数。内部走 `self._chat_model.with_config(run_name=...).bind(**kw)`（注意 `with_config` 与 `bind` 的语义差异：前者管 runtime 配置，后者管 model 参数）。业务侧 9+ 处调用点统一起名：`cache-check` / `ir-keywords` / `ir-synonyms` / `answer-check` / `ss-relevance` / `cg-generate` / `exec-smartfix` / `decision-r1` / `decision-r2` / `join-inference` / `clarify-question`。
+- **不再是"零代码"**：约 15 处增量改动，每处 1-3 行。代价换 LangSmith dashboard 可读。
+
+**7b. 请求级追踪（query_id 与 LangSmith metadata）**
+- **决策**：每次 HTTP 请求生成 `query_id = uuid4().hex[:12]`，作为该请求在日志、SSE、LangSmith 三处的统一关联 ID。
+- **生成位置**：`src/api/routes/query.py` 的 `query_endpoint` 入口第一行。
+- **三处使用**：
+  1. **日志**：`query_endpoint` 入口/出口/异常 `logger.info(f"[query_id={query_id}] ...")`；`main_graph._wrap_node` 装饰器在每个节点 enter/exit 自动追加 `[qid={state['query_id']}]`，使 13 个节点的日志全部可关联。
+  2. **SSE**：所有 SSE 事件 payload 都带 `query_id` 字段（不仅 `done`）。前端可按 `query_id` 分组渲染、定位上下文。
+  3. **LangSmith**：在 `graph.stream(state, config=...)` 处一次性注入 `configurable.thread_id=session_id` + `run_name=f"query-{query_id}"` + `tags=[db_id, "api", f"user:{user_id}"]` + `metadata={query_id, user_id, session_id, db_id, user_query[:200]}`。LangSmith UI 可按 `metadata.query_id` 精确定位单次请求；按 `thread_id` 聚合多轮会话。
+- **state 字段**：`NL2SQLState` 新增 `query_id: str` 字段，节点内部如需打日志显式 `state.get("query_id", "")` 取出（与节点内业务日志的接入风格保持一致，不引入 ContextVar 魔法）。
+- **独立性**：`query_id` 基础设施（生成 + state + 日志 + SSE）是独立子任务（§8.0），不依赖 LangSmith；LangSmith config 注入（§8.1.7）依赖 §8.0 完成。
+- **理由**：
+  1. **可定位**：用户报 bug 时直接给 `query_id`，后端日志、SSE 重放、LangSmith 三方 1 秒定位。
+  2. **零额外成本**：`uuid4().hex[:12]` 生成几乎零开销，12 位短 hex 在日志里可读。
+  3. **解耦**：日志可观测性（§8.0）与 LangSmith 接入（§8.1）两件事独立，便于阶段性交付。
 
 ---
 

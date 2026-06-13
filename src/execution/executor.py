@@ -498,7 +498,7 @@ class SQLFixLoop:
                 schema_text=schema_text or "(未提供 schema)",
                 fix_history_section=_format_fix_history(fix_history or []),
             )
-            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0))
+            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0, run_name="exec-smartfix"))
             result = parse_json(raw)
             fixed = result.get("sql", "").strip()
             return fixed if fixed else None

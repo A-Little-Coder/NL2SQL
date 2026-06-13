@@ -196,7 +196,7 @@ class SelfConsistencyDecision:
             ]
 
         try:
-            raw = stream_with_sse(self.llm_client.stream(prompt_messages, as_json=True, temperature=0.0))
+            raw = stream_with_sse(self.llm_client.stream(prompt_messages, as_json=True, temperature=0.0, run_name="decision-r1"))
             result = parse_json(raw)
             scores = result.get("scores", [])
             # 校验：每条必须有 candidate_id 和 score
@@ -276,7 +276,7 @@ class SelfConsistencyDecision:
             ]
 
         try:
-            raw = stream_with_sse(self.llm_client.stream(prompt_messages, as_json=True, temperature=0.0))
+            raw = stream_with_sse(self.llm_client.stream(prompt_messages, as_json=True, temperature=0.0, run_name="decision-r2"))
             result = parse_json(raw)
             scores = result.get("scores", [])
             valid_scores = []

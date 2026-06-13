@@ -247,7 +247,77 @@
 
 ## 8. 监控和用户界面集成
 
-- [ ] 8.1 集成 LangSmith 全流程监控，记录 trace 链路
+- [x] 8.0 query_id 基础设施（独立子任务，不依赖 LangSmith；§7b 决策）
+  - [x] 8.0.1 `NL2SQLState` 新增 `query_id: str` 字段（默认 `""`），`create_initial_state()` 接受可选 `query_id` 参数（src/graph/state.py）
+  - [x] 8.0.2 `query_endpoint` 入口生成 `query_id = uuid4().hex[:12]` + 入口日志（src/api/routes/query.py）
+        日志格式：`[query_id={query_id}] 请求进入: user={user_id} session={session_id} db={db_id} query={query[:100]!r}`
+  - [x] 8.0.3 写入 `initial_state["query_id"] = query_id`
+  - [x] 8.0.4 **所有 SSE 事件 payload 都带 `query_id`**（Q4=b 全量带）：
+        - 修改 `_format_sse(event_type, data)` 或在调用处统一注入
+        - 包括 `stage` / `cache_check` / `keywords` / `schema_recall` / `answerability` / `sql_candidates` / `execution` / `final_decision` / `result` / `error` / `llm_thinking` / `done` 等所有事件
+        - emitter 层注入：`StreamEmitter.emit(event_type, data)` 在入参 data 中合并 `{"query_id": ...}`，需要 emitter 持有 query_id（构造时传入）
+  - [x] 8.0.5 出口日志 + 异常日志带 `[query_id=xxx]`（src/api/routes/query.py）
+  - [x] 8.0.6 `main_graph._wrap_node` 装饰器在节点 enter/exit 追加 `[qid=...]` 日志（Q1=a）：
+        - 进入节点：`logger.info(f"[qid={state.get('query_id','')}] [stage] node={node_name} status=started")`
+        - 退出节点：`logger.info(f"[qid={state.get('query_id','')}] [stage] node={node_name} status=done")`
+        - 异常：`logger.exception(f"[qid={state.get('query_id','')}] [stage] node={node_name} error={e}")`
+  - [x] 8.0.7 关键节点（IR/SS/CG/Decision/SmartFix）入口/出口业务日志带 `[qid={state['query_id']}]`（Q2=b 节点手动从 state 取，不引入 ContextVar）
+  - [x] 8.0.8 测试 `tests/api/test_query_id.py`：
+        - 验证 SSE 所有事件 payload 都包含 `query_id` 字段
+        - 验证 `done` 事件返回的 `query_id` 与请求生成的一致
+        - 验证日志包含 `[query_id=xxx]` 格式（caplog fixture）
+        - 验证两个并发请求 query_id 不同
+
+- [x] 8.1 LangSmith 接入（路径 A + 完整命名层；§7/§7a 决策）
+  - [x] 8.1.1 启动入口（`src/api/app.py` lifespan + `src/main.py`）的 `load_dotenv()` 之后，读取 `LANGCHAIN_TRACING_V2` 与 `LANGCHAIN_PROJECT`，打印日志：
+        - 启用：`LangSmith tracing enabled: project=<name>`
+        - 关闭：`LangSmith tracing disabled`
+  - [x] 8.1.2 整体清理 `src/monitor/` 目录（路径 A 不需要任何包装层）：
+        - 删除 `src/monitor/langsmith_monitor.py`
+        - 删除 `src/monitor/__init__.py`（其中 `from .terminal_interface import TerminalInterface` 已是死引用）
+        - 整个 `src/monitor/` 目录移除
+  - [x] 8.1.3 主图 `build_main_graph` 编译末尾追加 `with_config(run_name="nl2sql-pipeline")`（src/graph/main_graph.py）
+  - [x] 8.1.4 5 个子图编译末尾追加 `with_config(run_name=...)`：
+        - `ir-graph` (src/retrieval/ir_graph.py)
+        - `ss-graph` (src/schema_selection/ss_graph.py)
+        - `cg-graph` (src/sql_generation/cg_graph.py)
+        - `execution-graph` (src/execution/execution_graph.py)
+        - `decision-graph` (src/decision/decision_graph.py)
+  - [x] 8.1.5 `LLMClient` 4 个公开方法（`invoke` / `stream` / `ainvoke` / `astream`）新增 `run_name: Optional[str] = None` 参数（utils/llm_client.py）：
+        - 内部走 `self._chat_model.with_config(run_name=run_name).bind(**kw)`（仅当 `run_name is not None`）
+        - 注意 `with_config` 与 `bind` 顺序：先 `with_config` 再 `bind`，避免 RunnableBinding 嵌套混乱
+        - 测试用 `RunnableBinding.config["run_name"]` 验证（同 thinking 参数测法）
+  - [x] 8.1.6 9+ 处业务侧调用点显式起名（命名规范见 design.md §7a）：
+        - `src/memory/history_cache.py` → `cache-check`
+        - `src/retrieval/information_retrieval.py` → `ir-keywords` / `ir-synonyms`
+        - `src/verification/answerability.py` → `answer-check`
+        - `src/schema_selection/schema_selector.py` → `ss-relevance`
+        - `src/sql_generation/sql_generator.py` → `cg-generate`
+        - `src/execution/executor.py` (SmartFix) → `exec-smartfix`
+        - `src/decision/self_consistency.py` → `decision-r1` / `decision-r2`
+        - `src/preprocessing/schema_graph_builder.py` → `join-inference`
+        - `src/clarification/question_generator.py` → `clarify-question`（如已实现）
+  - [x] 8.1.7 API 层（`src/api/routes/query.py`）注入请求级 LangSmith config（依赖 §8.0）：
+        ```python
+        config = {
+          "configurable": {"thread_id": session_id},
+          "run_name": f"query-{query_id}",
+          "tags": [db_id, "api", f"user:{user_id}"],
+          "metadata": {
+            "query_id": query_id, "user_id": user_id,
+            "session_id": session_id, "db_id": db_id,
+            "user_query": user_query[:200],
+          },
+        }
+        for update in db_ctx.graph.stream(initial_state, config=config): ...
+        ```
+  - [x] 8.1.8 `.env.example` 更新：`LANGCHAIN_PROJECT=NL2SQL`（全大写，符合项目命名规范）
+  - [x] 8.1.9 测试：
+        - mock `LANGCHAIN_TRACING_V2=true` + `LANGCHAIN_API_KEY=...`，验证启动日志含 `LangSmith tracing enabled: project=NL2SQL`
+        - mock 关闭场景验证日志为 `disabled`
+        - 验证 `LLMClient.invoke(..., run_name="cache-check")` 内部正确调用 `with_config`（通过 `RunnableBinding.config` 断言）
+        - 验证 `query_endpoint` 在 `graph.stream(...)` 时传入了完整 config dict（用 unittest.mock 拦截）
+
 - [ ] 8.2 开发 Terminal 交互式界面，支持流式输出 (框架已建立)
 - [ ] 8.3 实现思考过程可视化，显示各阶段执行状态
 
@@ -370,7 +440,7 @@
   - 子图节点：`group_by_result → find_majority → (条件分支) select_fastest | llm_final_decision`
   - 保持 `SelfConsistencyDecision.decide()` 公开签名
 - [x] 18.8 每个 Agent 类暴露 `build_graph() -> CompiledGraph` 方法（约定 API）
-- [ ] 18.9 集成 LangSmith 追踪：主图与所有子图节点自动产生 trace 链路（呼应 §8.1）
+- [ ] 18.9 见 §8.1（路径 A 下主图与子图 trace 由 LangGraph + ChatOpenAI 在 `LANGCHAIN_TRACING_V2=true` 时自动产生，无需在节点内额外接入）
 - [x] 18.10 编写 `tests/graph/test_main_graph.py`：
   - 端到端 Mock 测试整条主图能跑通
   - 验证状态在节点间正确流动

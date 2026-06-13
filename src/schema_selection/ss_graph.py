@@ -53,4 +53,4 @@ def build_ss_graph(selector):
     graph.add_edge("evaluate_relevance", "filter_columns")
     graph.add_edge("filter_columns", END)
 
-    return graph.compile()
+    return graph.compile().with_config(run_name="ss-graph")

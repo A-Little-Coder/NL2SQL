@@ -425,4 +425,4 @@ def build_decision_graph(decider):
     graph.add_edge("assemble_decision", "verify")
     graph.add_edge("verify", END)
 
-    return graph.compile()
+    return graph.compile().with_config(run_name="decision-graph")

@@ -91,4 +91,4 @@ def build_execution_graph(fix_loop):
         {"execute": "execute", END: END},
     )
 
-    return graph.compile()
+    return graph.compile().with_config(run_name="execution-graph")

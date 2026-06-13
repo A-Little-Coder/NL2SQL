@@ -129,7 +129,7 @@ class AnswerabilityChecker:
         )
 
         try:
-            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0, thinking=False))
+            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0, thinking=False, run_name="answer-check"))
             result = parse_json(raw)
 
             answerable = result.get("answerable", "uncertain").lower()

@@ -27,6 +27,7 @@ from src.api.routes import databases as databases_router
 from src.api.routes import query as query_router
 from src.api.routes import session as session_router
 from src.api.routes import user as user_router
+from utils.langsmith_bootstrap import log_langsmith_status
 
 
 @asynccontextmanager
@@ -38,6 +39,7 @@ async def lifespan(app: FastAPI):
     shutdown：释放所有 DbContext。
     """
     # startup
+    log_langsmith_status()  # §8.1.1：确认 LangSmith tracing 状态
     data_dir = getattr(app.state, "data_dir", None)
     init_globals(data_dir=data_dir)
 

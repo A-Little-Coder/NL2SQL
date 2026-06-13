@@ -214,7 +214,7 @@ class InformationRetrieval:
             else:
                 messages = KEYWORD_EXTRACTION_PROMPT.format_messages(query=query)
 
-            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0, thinking=False))
+            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0, thinking=False, run_name="ir-keywords"))
             result = parse_json(raw)
             keywords_raw = result.get("keywords", [])
 

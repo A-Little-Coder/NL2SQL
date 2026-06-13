@@ -137,4 +137,4 @@ def build_cg_graph(generator):
     graph.add_edge("select_few_shot", "llm_generate_and_validate")
     graph.add_edge("llm_generate_and_validate", END)
 
-    return graph.compile()
+    return graph.compile().with_config(run_name="cg-graph")

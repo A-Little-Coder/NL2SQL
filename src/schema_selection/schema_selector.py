@@ -269,7 +269,7 @@ class SchemaSelector:
                 user_query=user_query,
                 schema_text=schema_text,
             )
-            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0, thinking=False))
+            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0, thinking=False, run_name="ss-relevance"))
             result = parse_json(raw)
 
             # 应用评分

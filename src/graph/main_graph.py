@@ -25,6 +25,7 @@ Clarification 节点本期占位（pass-through），Phase 2 接入。
 from typing import Any, Callable, Dict, Optional
 
 from langgraph.graph import END, START, StateGraph
+from loguru import logger
 
 from src.graph.state import NL2SQLState
 
@@ -43,12 +44,18 @@ except Exception:  # pragma: no cover - 无 API 模块时（如离线脚本）
 # ---------------------------------------------------------------------------
 
 def _wrap_node(node_name: str, fn: Callable[[NL2SQLState], Dict[str, Any]]):
-    """给节点函数包一层：进入时发 stage started，退出时发 stage done"""
+    """给节点函数包一层：进入时发 stage started，退出时发 stage done
+
+    同时输出 [qid=<query_id>] 前缀的入口/出口/异常日志（§7b 决策 / §8.0.6 任务），
+    使一次请求的所有节点执行链路在日志中可串联。
+    """
 
     def wrapped(state: NL2SQLState) -> Dict[str, Any]:
         token = None
         if current_node is not None:
             token = current_node.set(node_name)
+        qid = state.get("query_id", "") if isinstance(state, dict) else ""
+        logger.info(f"[qid={qid}] [stage] node={node_name} status=started")
         emit_safe("stage", {"node": node_name, "status": "started"})
         try:
             result = fn(state) or {}
@@ -58,8 +65,15 @@ def _wrap_node(node_name: str, fn: Callable[[NL2SQLState], Dict[str, Any]]):
                 if key in result and result[key]:
                     done_payload[key] = result[key]
             emit_safe("stage", done_payload)
+            extra = ""
+            if "error" in done_payload:
+                extra = f" error={done_payload['error']!r}"
+            elif "rejection_reason" in done_payload:
+                extra = f" rejection={done_payload['rejection_reason']!r}"
+            logger.info(f"[qid={qid}] [stage] node={node_name} status=done{extra}")
             return result
         except Exception as e:
+            logger.exception(f"[qid={qid}] [stage] node={node_name} error={e!r}")
             emit_safe("error", {"node": node_name, "error": str(e)})
             raise
         finally:
@@ -140,6 +154,7 @@ def make_ir_node(retriever) -> Callable[[NL2SQLState], Dict[str, Any]]:
     """构造 IR 节点：调用 IR 子图，输出 keywords/retrieved_context"""
 
     def node(state: NL2SQLState) -> Dict[str, Any]:
+        qid = state.get("query_id", "")
         sub = retriever.build_graph()
         result = sub.invoke({
             "user_query": state["user_query"],
@@ -154,6 +169,17 @@ def make_ir_node(retriever) -> Callable[[NL2SQLState], Dict[str, Any]]:
             emit_safe("keywords", {"groups": _serialize_keywords(keywords)})
         if ctx is not None:
             emit_safe("schema_recall", _summarize_schema(ctx))
+
+        # §8.0.7：节点级业务摘要日志（带 qid）
+        try:
+            tbl_count = len(getattr(ctx, "tables", []) or []) if ctx is not None else 0
+            col_count = len(getattr(ctx, "columns", []) or []) if ctx is not None else 0
+        except Exception:
+            tbl_count = col_count = 0
+        logger.info(
+            f"[qid={qid}] [IR] keywords={len(keywords)} "
+            f"tables={tbl_count} columns={col_count}"
+        )
 
         return {
             "keywords": keywords,
@@ -215,6 +241,7 @@ def make_ss_node(selector) -> Callable[[NL2SQLState], Dict[str, Any]]:
     """构造 SS 节点：调用 SS 子图，输出 selected_schema"""
 
     def node(state: NL2SQLState) -> Dict[str, Any]:
+        qid = state.get("query_id", "")
         ctx = state.get("retrieved_context")
         if ctx is None:
             return {"error": "IR 未产出 retrieved_context",
@@ -224,8 +251,17 @@ def make_ss_node(selector) -> Callable[[NL2SQLState], Dict[str, Any]]:
             "user_query": state["user_query"],
             "retrieved_context": ctx,
         })
+        selected = result.get("selected_schema", [])
+        try:
+            tbl_count = len(selected)
+            col_count = sum(len(getattr(t, "columns", []) or []) for t in selected)
+        except Exception:
+            tbl_count = col_count = 0
+        logger.info(
+            f"[qid={qid}] [SS] selected_tables={tbl_count} selected_columns={col_count}"
+        )
         return {
-            "selected_schema": result.get("selected_schema", []),
+            "selected_schema": selected,
             "trace_log": state.get("trace_log", []) + ["[SS] done"],
         }
 
@@ -271,6 +307,7 @@ def make_cg_node(generator) -> Callable[[NL2SQLState], Dict[str, Any]]:
     """构造 CG 节点：调用 CG 子图，输出 sql_candidates"""
 
     def node(state: NL2SQLState) -> Dict[str, Any]:
+        qid = state.get("query_id", "")
         schema = state.get("selected_schema", [])
         if not schema:
             return {"error": "SS 未产出 selected_schema",
@@ -292,6 +329,9 @@ def make_cg_node(generator) -> Callable[[NL2SQLState], Dict[str, Any]]:
                 for i, c in enumerate(candidates)
             ],
         })
+
+        # §8.0.7：节点级业务摘要日志（带 qid）
+        logger.info(f"[qid={qid}] [CG] candidates={len(candidates)}")
 
         return {
             "sql_candidates": candidates,
@@ -316,6 +356,7 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
     from src.schema_selection.schema_selector import MSchemaFormat
 
     def node(state: NL2SQLState) -> Dict[str, Any]:
+        qid = state.get("query_id", "")
         # 如果 history_cache 命中，从 cached_sql 构造候选
         if state.get("cache_hit", False):
             cached_sql = state.get("cached_sql", "")
@@ -347,6 +388,7 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
 
         # 决策 51：一次性执行每个候选，不触发 LLM 修复
         executor = fix_loop.executor
+        success_count = 0
         for cand in candidates:
             try:
                 exec_result = executor.execute(cand.sql)
@@ -360,6 +402,8 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
                 )
                 # 保留结构化错误供 SmartFix 使用
                 cand.structured_error = exec_result.error if not exec_result.success else None
+                if exec_result.success:
+                    success_count += 1
             except Exception as e:
                 cand.status = SQLStatus.FAILED
                 cand.error_message = str(e)
@@ -376,6 +420,12 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
                 "rows": rows,
                 "error": cand.error_message,
             })
+
+        # §8.0.7：节点级业务摘要日志（带 qid）
+        logger.info(
+            f"[qid={qid}] [ExecuteAll] total={len(candidates)} success={success_count} "
+            f"failed={len(candidates) - success_count}"
+        )
 
         return {
             "sql_candidates": candidates,
@@ -401,6 +451,7 @@ def make_decision_node(decider, fix_loop=None) -> Callable[[NL2SQLState], Dict[s
     """
 
     def node(state: NL2SQLState) -> Dict[str, Any]:
+        qid = state.get("query_id", "")
         cands = state.get("sql_candidates", [])
         sub = decider.build_graph()
         sub_input = {
@@ -432,6 +483,14 @@ def make_decision_node(decider, fix_loop=None) -> Callable[[NL2SQLState], Dict[s
             out["fix_rounds_used"] = decision.fix_rounds_used
             out["last_error"] = decision.last_error
             out["decision_path"] = decision.decision_path
+
+            # §8.0.7：节点级业务摘要日志（带 qid，含 SmartFix 子流程结果）
+            logger.info(
+                f"[qid={qid}] [Decision] path={decision.decision_path!r} "
+                f"selected_id={decision.selected_candidate_id} "
+                f"fix_failed={decision.fix_failed} "
+                f"fix_rounds={decision.fix_rounds_used}"
+            )
 
             # 决策 50：业务事件
             emit_safe("final_decision", {
@@ -590,4 +649,4 @@ def build_main_graph(
     graph.add_edge("decision", "memory_update")
     graph.add_edge("memory_update", END)
 
-    return graph.compile()
+    return graph.compile().with_config(run_name="nl2sql-pipeline")

@@ -172,6 +172,7 @@ class LLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         thinking: Optional[bool] = None,
+        run_name: Optional[str] = None,
     ) -> Union[str, Dict[str, Any]]:
         """
         同步阻塞调用 ChatOpenAI.invoke
@@ -181,6 +182,8 @@ class LLMClient:
             as_json: True 时绑定 response_format={"type":"json_object"}，返回 dict
             temperature / max_tokens: 按调用覆盖采样参数
             thinking: 按调用覆盖 enable_thinking（None=沿用构造时默认值）
+            run_name: LangSmith 上该次 LLM 调用的 span 名（如 "cache-check" / "ir-keywords"）；
+                      None 时使用 LangChain 默认（"ChatOpenAI"）
 
         Returns:
             as_json=False → 完整正文字符串
@@ -190,7 +193,7 @@ class LLMClient:
             TypeError: 传入了 dict 形式的 messages
         """
         lc_messages = self._prepare_lc_messages(messages)
-        bound = self._bind_runtime(temperature, max_tokens, as_json, thinking)
+        bound = self._bind_runtime(temperature, max_tokens, as_json, thinking, run_name)
 
         ai_msg: AIMessage = bound.invoke(lc_messages)
         text = self._extract_text_from_message(ai_msg)
@@ -204,12 +207,14 @@ class LLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         thinking: Optional[bool] = None,
+        run_name: Optional[str] = None,
     ) -> Iterator[Tuple[Optional[str], Optional[str]]]:
         """
         流式调用 ChatOpenAI.stream
 
         Args:
             thinking: 按调用覆盖 enable_thinking（None=沿用构造时默认值）
+            run_name: LangSmith 上该次 LLM 调用的 span 名
 
         Yields:
             (content_chunk, reasoning_chunk) 二元组
@@ -222,7 +227,7 @@ class LLMClient:
             **不解析 JSON**——解析由业务侧调 parse_json(accumulate(stream)) 完成
         """
         lc_messages = self._prepare_lc_messages(messages)
-        bound = self._bind_runtime(temperature, max_tokens, as_json, thinking)
+        bound = self._bind_runtime(temperature, max_tokens, as_json, thinking, run_name)
 
         for chunk in bound.stream(lc_messages):
             text_part, reasoning_part = self._extract_chunk_blocks(chunk)
@@ -238,10 +243,11 @@ class LLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         thinking: Optional[bool] = None,
+        run_name: Optional[str] = None,
     ) -> Union[str, Dict[str, Any]]:
         """异步版 invoke，签名一致"""
         lc_messages = self._prepare_lc_messages(messages)
-        bound = self._bind_runtime(temperature, max_tokens, as_json, thinking)
+        bound = self._bind_runtime(temperature, max_tokens, as_json, thinking, run_name)
 
         ai_msg: AIMessage = await bound.ainvoke(lc_messages)
         text = self._extract_text_from_message(ai_msg)
@@ -255,10 +261,11 @@ class LLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         thinking: Optional[bool] = None,
+        run_name: Optional[str] = None,
     ) -> AsyncIterator[Tuple[Optional[str], Optional[str]]]:
         """异步版 stream，yield 与同步 stream 相同的二元组"""
         lc_messages = self._prepare_lc_messages(messages)
-        bound = self._bind_runtime(temperature, max_tokens, as_json, thinking)
+        bound = self._bind_runtime(temperature, max_tokens, as_json, thinking, run_name)
 
         async for chunk in bound.astream(lc_messages):
             text_part, reasoning_part = self._extract_chunk_blocks(chunk)
@@ -329,11 +336,18 @@ class LLMClient:
         max_tokens: Optional[int],
         as_json: bool,
         thinking: Optional[bool] = None,
+        run_name: Optional[str] = None,
     ):
         """构造 bind() 参数，返回绑定后的 Runnable
 
         thinking=None 时沿用构造时 enable_thinking；
         thinking=True/False 时通过 bind(extra_body=...) 覆盖。
+
+        run_name 用于 LangSmith 上该次 LLM 调用的 span 名（§7a 决策）：
+        - None：沿用 LangChain 默认（"ChatOpenAI"）
+        - 给值：调用 with_config(run_name=...) 标注该次调用
+        - 注意顺序：先 with_config（runtime 配置）再 bind（model 参数），
+          避免 RunnableBinding 嵌套语义混乱。
         """
         kw: Dict[str, Any] = {}
         if temperature is not None:
@@ -345,7 +359,10 @@ class LLMClient:
         if thinking is not None:
             kw["extra_body"] = {"enable_thinking": bool(thinking)}
 
-        return self._chat_model.bind(**kw) if kw else self._chat_model
+        base = self._chat_model
+        if run_name is not None:
+            base = base.with_config(run_name=run_name)
+        return base.bind(**kw) if kw else base
 
     def _build_extra_body(self) -> Dict[str, Any]:
         """构造 ChatOpenAI 的 extra_body 顶层参数"""

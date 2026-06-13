@@ -20,6 +20,9 @@ from typing import Optional, Dict, Any
 # 添加根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from dotenv import load_dotenv
+from utils.langsmith_bootstrap import log_langsmith_status
+
 
 class NL2SQLAgent:
     """
@@ -146,6 +149,8 @@ class NL2SQLAgent:
 
 def main():
     """主函数 - 命令行入口"""
+    load_dotenv()
+    log_langsmith_status()  # §8.1.1：启动时确认 LangSmith tracing 状态
     print("NL2SQL Agent 系统启动中...")
 
     # 创建 Agent

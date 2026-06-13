@@ -142,4 +142,4 @@ def build_ir_graph(retriever):
     graph.add_edge("retrieve_schema", "assemble")
     graph.add_edge("assemble", END)
 
-    return graph.compile()
+    return graph.compile().with_config(run_name="ir-graph")

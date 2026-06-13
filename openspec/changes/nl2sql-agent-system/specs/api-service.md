@@ -222,4 +222,33 @@
 并且 LLMClient 的流式回调能成功调用 `emitter.emit(...)`
 并且事件最终到达 asyncio.Queue
 
+#### Scenario: 每次查询请求生成 query_id（请求级追踪）
+给定客户端发起 `POST /api/v1/query` 请求
+当 `query_endpoint` 进入处理时
+则应在入口第一时间生成 `query_id = uuid4().hex[:12]`（12 位短 hex）
+并且应输出入口日志 `[query_id={query_id}] 请求进入: user={user_id} session={session_id} db={db_id} query={query[:100]!r}`
+并且应将 `query_id` 写入 `initial_state["query_id"]`
+并且 `NL2SQLState` TypedDict 应声明 `query_id: str` 字段
+并且两个并发请求的 `query_id` 互不相同
+
+#### Scenario: 所有 SSE 事件 payload 都包含 query_id
+给定一次查询请求生成了 `query_id="a3f8b2c91d04"`
+当服务推送任意 SSE 事件（`stage` / `cache_check` / `keywords` / `schema_recall` / `answerability` / `sql_candidates` / `execution` / `final_decision` / `result` / `error` / `llm_thinking` / `done`）时
+则该事件 payload 应包含 `"query_id": "a3f8b2c91d04"` 字段
+并且前端可按 `query_id` 分组渲染、定位上下文
+并且 `done` 事件应额外回带 `query_id` 让客户端最终确认
+
+#### Scenario: 查询出口与异常日志带 query_id
+给定一次查询请求处理完毕或抛出异常
+当 `query_endpoint` 推送 `done` 事件或捕获异常时
+则出口日志应输出 `[query_id={query_id}] 完成: has_result=... fix_failed=...`
+并且若发生异常，`logger.exception(f"[query_id={query_id}] graph.stream 异常")` 记录完整堆栈
+
+#### Scenario: 节点执行日志通过 query_id 串联
+给定 `main_graph._wrap_node` 装饰器包裹的任意节点正在执行
+当节点 enter / exit / 异常时
+则装饰器应输出形如 `[qid={query_id}] [stage] node={node_name} status=started`（或 `done` / 错误信息）的日志
+并且业务节点（IR / SS / CG / Decision / SmartFix 等）的关键内部日志应通过 `state.get("query_id", "")` 主动取出 query_id 拼接到日志前缀
+并且通过查询日志中的 `qid=<12位 hex>` 关键字可定位某次请求所有节点的执行链路
+
 

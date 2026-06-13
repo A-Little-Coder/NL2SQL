@@ -69,6 +69,7 @@ class NL2SQLState(TypedDict, total=False):
     user_query: str
     user_id: str
     database_filter: Optional[str]
+    query_id: str  # 单次请求的全局 ID（uuid4().hex[:12]，由 API 层生成；离线/CLI 可留空）
 
     # ===== IR =====
     keywords: List[str]
@@ -133,6 +134,7 @@ def create_initial_state(
     user_query: str,
     user_id: str = "default",
     database_filter: Optional[str] = None,
+    query_id: str = "",
 ) -> NL2SQLState:
     """
     构造一个完备的初始 State
@@ -141,6 +143,7 @@ def create_initial_state(
         user_query: 用户原始查询
         user_id: 用户标识，默认 "default"
         database_filter: 可选数据库限定
+        query_id: 单次请求的全局 ID（API 层生成；CLI/离线场景可留空）
 
     Returns:
         NL2SQLState: 已用默认空值填充所有字段的初始状态
@@ -149,6 +152,7 @@ def create_initial_state(
         user_query=user_query,
         user_id=user_id,
         database_filter=database_filter,
+        query_id=query_id,
         keywords=[],
         retrieved_context=None,
         clarification_count=0,

@@ -241,7 +241,7 @@ class SQLGenerator:
                 schema_text=schema_text,
                 num_candidates=self.num_candidates,
             )
-            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.3))
+            raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.3, run_name="cg-generate"))
             result = parse_json(raw)
 
             candidates = []

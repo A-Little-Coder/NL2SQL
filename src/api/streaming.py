@@ -26,15 +26,31 @@ class StreamEmitter:
     - 在 SSE handler 的 asyncio loop 中创建
     - 通过 contextvar 传递给同步线程（graph 执行）
     - emit() 用 loop.call_soon_threadsafe 把事件推入 asyncio.Queue
+    - 持有 query_id：emit() 时自动把 query_id 合并进 data，让所有 SSE 事件
+      payload 都带上请求级 ID（§7b 决策；Q4=b 全量带）
     """
 
-    def __init__(self, queue: "asyncio.Queue", loop: asyncio.AbstractEventLoop):
+    def __init__(
+        self,
+        queue: "asyncio.Queue",
+        loop: asyncio.AbstractEventLoop,
+        query_id: str = "",
+    ):
         self.queue = queue
         self.loop = loop
+        self.query_id = query_id
 
     def emit(self, event_type: str, data: Any) -> None:
-        """从任意线程往 asyncio.Queue 推一个 SSE 事件"""
-        evt = {"type": event_type, "data": data}
+        """从任意线程往 asyncio.Queue 推一个 SSE 事件
+
+        当 data 为 dict 且不含 query_id 时，自动注入 self.query_id；
+        非 dict 数据（罕见，例如纯字符串）按原样发送。
+        """
+        if isinstance(data, dict) and self.query_id and "query_id" not in data:
+            payload = {**data, "query_id": self.query_id}
+        else:
+            payload = data
+        evt = {"type": event_type, "data": payload}
         try:
             self.loop.call_soon_threadsafe(self.queue.put_nowait, evt)
         except RuntimeError:
