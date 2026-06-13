@@ -364,27 +364,6 @@ def build_decision_graph(decider):
             return "score_r2"  # 路径 B/C 前置
         return "pick_for_fix"  # 路径 D/E
 
-    def route_after_r2(state: DecisionGraphState) -> str:
-        return "finalize_r2"
-
-    def route_after_finalize_r1(state: DecisionGraphState) -> str:
-        return "verify"
-
-    def route_after_finalize_r2(state: DecisionGraphState) -> str:
-        return "verify"
-
-    def route_after_pick_for_fix(state: DecisionGraphState) -> str:
-        return "smart_fix"
-
-    def route_after_smart_fix(state: DecisionGraphState) -> str:
-        return "assemble_decision"
-
-    def route_after_all_failed(state: DecisionGraphState) -> str:
-        return "assemble_decision"
-
-    def route_after_assemble(state: DecisionGraphState) -> str:
-        return "verify"
-
     # ------------------------------------------------------------------
     # 构图
     # ------------------------------------------------------------------

@@ -16,11 +16,10 @@
 # ============================================================================
 
 
-import os
 import pickle
 import sqlite3
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Tuple
 from tqdm import tqdm
 
 from datasketch import MinHash, MinHashLSH

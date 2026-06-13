@@ -11,7 +11,7 @@
 import re
 import uuid
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from enum import Enum
 from loguru import logger
 

@@ -22,7 +22,7 @@ NL2SQL 主图：串联 IR → (Clarification) → SS → AnswerabilityCheck → 
 Clarification 节点本期占位（pass-through），Phase 2 接入。
 """
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict
 
 from langgraph.graph import END, START, StateGraph
 from loguru import logger
@@ -533,7 +533,6 @@ def build_main_graph(
     decider,
     *,
     answerability_checker=None,
-    enable_clarification: bool = False,
     history_cache=None,
     memory_updater=None,
 ):
@@ -547,7 +546,6 @@ def build_main_graph(
         fix_loop: SQLFixLoop 实例
         decider: SelfConsistencyDecision 实例
         answerability_checker: AnswerabilityChecker 实例（决策 23，可选）
-        enable_clarification: 是否启用 Clarification 节点（Phase 2）
         history_cache: HistoryCache 实例（决策 30，可选；None 时跳过）
         memory_updater: MemoryUpdater 实例（决策 29，可选；None 时跳过）
 

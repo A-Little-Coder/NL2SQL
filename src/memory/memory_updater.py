@@ -10,9 +10,8 @@
   4. 会话上下文摘要 — 更新 last_topic/last_tables/last_time_range
 """
 
-import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 
 # 简单聚合 SQL 检测正则

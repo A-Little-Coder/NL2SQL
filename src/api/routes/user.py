@@ -4,7 +4,7 @@
 - GET /api/v1/users/{user_id}/metrics — 获取指标定义
 """
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 
 from src.api.deps import get_user_memory
 from src.api.schemas import MetricDefinitionResponse, UserMemoryResponse

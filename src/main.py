@@ -15,7 +15,7 @@
 
 import os
 import sys
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 # 添加根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -104,7 +104,6 @@ class NL2SQLAgent:
         - 初始化 SelfConsistencyDecision
         - 初始化 LangSmithMonitor
         """
-        pass
 
     def query(self, user_query: str) -> dict:
         """
@@ -134,7 +133,6 @@ class NL2SQLAgent:
         6. Self-Consistency 决策
         7. 返回结果
         """
-        pass
 
     def run_interactive(self):
         """
@@ -144,7 +142,6 @@ class NL2SQLAgent:
         - 初始化 TerminalInterface
         - 启动 interactive_loop
         """
-        pass
 
 
 def main():

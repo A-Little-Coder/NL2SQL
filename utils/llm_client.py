@@ -35,7 +35,6 @@ from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple, Un
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
-    HumanMessage,
     SystemMessage,
 )
 from langchain_core.prompt_values import PromptValue

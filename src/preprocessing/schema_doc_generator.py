@@ -7,8 +7,7 @@
 # ============================================================================
 
 
-from typing import Dict, List, Any, Optional
-from loguru import logger
+from typing import Dict, List, Any
 
 
 class SchemaColumnDocGenerator:

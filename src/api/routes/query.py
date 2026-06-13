@@ -20,7 +20,7 @@ import asyncio
 import contextvars
 import json
 import os
-from typing import Any, AsyncGenerator, Dict, List
+from typing import Any, AsyncGenerator, Dict
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException

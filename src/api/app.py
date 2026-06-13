@@ -11,7 +11,6 @@
 每个 db_id 的 DbContext 通过 DbContextPool 按需懒加载（LRU）。
 """
 
-import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI

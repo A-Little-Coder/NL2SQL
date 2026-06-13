@@ -14,9 +14,7 @@
   本期内容以明文 JSON 存储，不做任何脱敏处理。
 """
 
-import copy
 from datetime import date, datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .storage import Storage

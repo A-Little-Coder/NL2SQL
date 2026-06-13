@@ -15,7 +15,7 @@ import pickle
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional
 
 # 确保从项目根目录导入
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -26,7 +26,6 @@ from src.preprocessing.manifest import (
     DiffResult,
     Manifest,
     TableDiff,
-    write_manifest_for_db,
 )
 from src.preprocessing.vector_store import VectorStoreManager
 from src.preprocessing.schema_graph_builder import SchemaGraphBuilder
@@ -471,7 +470,6 @@ class IncrementalUpdater:
             return ModuleReport(status="skipped", details="未构建，请先运行 build_schema_graphs")
 
         if not diff.has_changes and not cascade:
-            return ModuleReport(status="skipped", details="无变更")
             return ModuleReport(status="skipped", details="无变更")
 
         try:

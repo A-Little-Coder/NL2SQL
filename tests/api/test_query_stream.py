@@ -221,3 +221,44 @@ def test_heartbeat_when_idle(patched_app, monkeypatch):
                 heartbeat_count += 1
 
     assert heartbeat_count >= 1, "3 秒空闲应至少触发 1 次心跳"
+
+
+# ── 请求验证 ───────────────────────────────────────────────
+
+
+def test_missing_query_returns_422(patched_app):
+    """缺少 query 字段应返回 422"""
+    app, factory = patched_app
+    factory(_SlowGraph(delays=[]))
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/api/v1/query",
+        json={"session_id": "test", "user_id": "test", "db_id": "any"},
+    )
+    assert response.status_code == 422
+
+
+def test_missing_session_id_returns_422(patched_app):
+    """缺少 session_id 应返回 422"""
+    app, factory = patched_app
+    factory(_SlowGraph(delays=[]))
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/api/v1/query",
+        json={"query": "test", "user_id": "test", "db_id": "any"},
+    )
+    assert response.status_code == 422
+
+
+# ── 健康检查 ───────────────────────────────────────────────
+
+
+def test_health_endpoint(patched_app):
+    """健康检查应返回 ok"""
+    app, factory = patched_app
+    factory(_SlowGraph(delays=[]))
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.get("/api/v1/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"

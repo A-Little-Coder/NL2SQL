@@ -4,7 +4,7 @@ Execution Agent 子图
 依据 §18.6：execute → (条件分支：成功→END / 失败且未超限→llm_fix→execute)
 """
 
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 

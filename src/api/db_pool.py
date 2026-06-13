@@ -20,7 +20,7 @@ DbContextPool 采用 LRU + 引用计数：
 
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -226,7 +226,6 @@ class DbContextPool:
             answerability_checker=g.answerability_checker,
             history_cache=g.history_cache,
             memory_updater=g.memory_updater,
-            enable_clarification=False,
         )
 
         return DbContext(

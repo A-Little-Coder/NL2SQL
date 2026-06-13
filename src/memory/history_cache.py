@@ -10,7 +10,7 @@
   - 只复用 SQL，不复用 result（重新执行保证时效）
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 

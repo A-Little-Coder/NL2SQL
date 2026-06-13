@@ -7,7 +7,7 @@
 # ============================================================================
 
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from loguru import logger
 
 import chromadb

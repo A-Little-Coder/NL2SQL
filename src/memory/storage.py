@@ -20,7 +20,6 @@ JSON 文件读写 + 跨平台文件锁 + 原子写入
 
 import json
 import os
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional

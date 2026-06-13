@@ -17,11 +17,10 @@
 
 import sqlite3
 import os
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple
 from contextlib import contextmanager
 
 # 本地导入（避免循环依赖）
-# from .description_loader import DescriptionLoader
 
 
 class DatabaseConnector:

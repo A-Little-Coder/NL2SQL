@@ -1,6 +1,5 @@
 """API Pydantic 请求/响应模型"""
 
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -41,12 +40,6 @@ class TableListResponse(BaseModel):
     """表清单响应"""
     db_id: str
     tables: List[str]
-
-
-class SSEEvent(BaseModel):
-    """SSE 事件"""
-    type: str = Field(..., description="事件类型")
-    data: Optional[Any] = Field(None, description="事件数据")
 
 
 class SessionSummary(BaseModel):

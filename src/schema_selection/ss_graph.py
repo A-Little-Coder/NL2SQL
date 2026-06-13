@@ -4,7 +4,7 @@ SS Agent 子图
 依据 §18.4：to_mschema → evaluate_relevance → filter_columns
 """
 
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
