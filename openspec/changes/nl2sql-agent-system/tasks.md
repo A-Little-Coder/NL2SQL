@@ -342,77 +342,139 @@
   - `update_domain_context(**kwargs)`
 - [x] 9.4 编写 `tests/memory/test_user_memory.py`：覆盖创建/读写/并发锁/原子写入 + 新增 6 维记忆的读写
 
-## 10. WebSearchEnricher（Tavily 集成）
+## 10. TaskPlanner（意图理解 + 三选一裁决，决策 9/10）
 
-- [ ] 10.1 实现 `src/clarification/web_search.py`：
-  - `TavilySearcher` 类，封装 `tavily-python` 客户端
-  - `search(query: str) -> List[dict]` 带 10s 超时、3 条结果上限
-  - 会话级 LRU 缓存装饰器（基于 `query` 字符串去重）
-- [ ] 10.2 实现「术语是否为未知领域」的 LLM 判断函数
-- [ ] 10.3 编写 `tests/clarification/test_web_search.py`：Mock Tavily 响应 + 缓存命中测试
+依据 决策 9（反问前移到 IR 之前）/ 决策 10（反问粒度 LLM 自适应）。
+原 §10 WebSearch/Tavily 本期跳过，不实现。
 
-## 11. TriggerDetector
+- [x]10.1 创建 `src/clarification/task_planner.py` 的 `TaskPlanner` 类：
+  - `__init__(llm_client, max_clarify_rounds=5)`
+  - `plan(user_query, conversation_history, db_id=None, clarified=None) -> PlanResult`
+  - `PlanResult` dataclass：`verdict`/`intent_type`/`subqueries`/`ambiguities`/`clarify_question`/`reject_reason`/`clarify_round`，附 `to_dict()`
+- [x]10.2 实现 LLM 三选一裁决 Prompt（强制 JSON 输出）：
+  - EXECUTE（single/multi）/ CLARIFY / REJECT 判定
+  - 多意图分解：把复合查询拆为独立子查询，保持语义完整不拆碎
+  - CLARIFY 时生成 `clarify_question`（粗/细粒度自适应，决策 10）+ 标注 `ambiguities`
+  - REJECT 判定：写操作意图（INSERT/UPDATE/DELETE/DROP）/超范围/无法理解
+  - 输出全 JSON；解析失败降级为 `verdict="execute"` 单意图（不阻塞主流程）
+- [x]10.3 实现 reject 写操作检测：关键词 + 正则识别写操作意图
+- [x]10.4 编写 `tests/clarification/test_task_planner.py`：
+  - 单意图 EXECUTE、多意图 EXECUTE 分解、CLARIFY（实体多义）、CLARIFY（缺失维度）、REJECT（写操作）、REJECT（超范围）
+  - LLM JSON 解析失败降级 EXECUTE
+  - 多意图分解保持语义完整（不拆碎完整意图）
 
-- [ ] 11.1 实现 `src/clarification/trigger.py` 的 `TriggerDetector` 类
-  - 输入：IR 结果、用户查询、UserMemory 实例、配置开关
-  - 输出：`TriggerResult(triggered: bool, type: Literal["A","B","C","D",None], reason: str)`
-- [ ] 11.2 实现四类触发判断：
-  - A: 召回为空
-  - B: LLM 语义不匹配判断（带 Prompt 模板）
-  - C: 相似度阈值（向量 < 0.4 或 LSH < 0.3）
-  - D: 与 UserMemory.term_preferences 冲突
-- [ ] 11.3 添加配置项：`config/clarification.yaml` 控制各触发器开关
-- [ ] 11.4 编写 `tests/clarification/test_trigger.py`：四类触发各覆盖正负样本
+## 11. DialogManager（interrupt 暂停恢复，决策 12/13）
 
-## 12. QuestionGenerator
+依据 决策 12（interrupt + Command(resume) + InMemorySaver）/ 决策 13（5 次上限 + 拒答关键词）。
+原 §11 IR 后 TriggerDetector 跳过，不实现。
 
-- [ ] 12.1 实现 `src/clarification/question_generator.py`
-  - `generate(context: ClarificationContext) -> str`
-  - `ClarificationContext` 包含：原始查询、触发类型、IR 候选、用户记忆摘要、Web 搜索结果（可选）
-- [ ] 12.2 设计 Prompt 模板（中文，含粗/细粒度示例）
-- [ ] 12.3 编写 `tests/clarification/test_question_generator.py`：固定 LLM 响应下生成质量验证
+- [x]11.1 实现 `src/clarification/dialog.py` 的 `DialogManager` 类：
+  - `ask(clarify_context: dict, clarify_round: int) -> str` 包装 `langgraph.types.interrupt`
+  - interrupt value 为结构化反问上下文（question/ambiguities/round）
+  - resume 时返回用户回答字符串
+  - 拒答关键词识别（默认 ["不知道","跳过","算了","skip","不清楚","随便"]，可配置）
+  - 5 次硬上限：`clarify_round >= 5` 时不再 interrupt，返回拒答信号
+- [x]11.2 创建 `config/clarification.yaml`：
+  - `enabled: bool`（task_planner 整体开关）
+  - `max_clarify_rounds: 5`
+  - `decline_keywords: [...]`
+- [x]11.3 编写 `tests/clarification/test_dialog.py`：
+  - interrupt 首次执行抛暂停 vs resume 返回值
+  - 拒答关键词识别（正负样本）
+  - 5 次硬上限强制退出
+  - 计数器存 state（resume 后递增）
 
-## 13. UserDialog（LangGraph 中断）
+## 12. 反问子图组装 + 主图集成（决策 9/12）
 
-- [ ] 13.1 实现 `src/clarification/dialog.py`
-  - `DialogManager.ask(question: str) -> str` 包装 LangGraph `interrupt`
-  - 拒答关键词识别：["不知道","跳过","算了","skip","不清楚","随便"]
-  - 计数器管理 + 5 次硬上限
-- [ ] 13.2 编写 `tests/clarification/test_dialog.py`：模拟 interrupt/resume 流程
+原 §12 QuestionGenerator 已并入 TaskPlanner（决策 10）。
 
-## 14. ClarificationAgent 主类
+- [x]12.1 实现 `src/clarification/agent.py` 的反问编排逻辑（task_planner + dialog 组合）：
+  - task_planner 节点：裁决 EXECUTE → 放行；CLARIFY 且未达上限 → 调 `DialogManager.ask()` interrupt → resume 后带澄清重新 plan；REJECT → 设 rejection_reason
+  - 暴露供主图调用的节点工厂
+- [x]12.2 修改 `src/graph/state.py` 新增字段：
+  - `plan_result`、`subqueries`、`subquery_results`、`clarify_round`、`clarify_question`、`summary_text`
+  - `create_initial_state()` 填默认值
+- [x]12.3 修改 `src/graph/main_graph.py`：
+  - 新增 `task_planner` 节点（history_cache 之后、ir 之前）
+  - 移除原 IR 后 `clarification` 占位节点
+  - 条件边：REJECT → END；CLARIFY → interrupt 循环回 task_planner；EXECUTE → run_subqueries
+  - `graph.compile(checkpointer=InMemorySaver())`；config `thread_id=session_id`
+  - history_cache 命中时跳过 planner 直接执行
+- [x]12.4 编写 `tests/clarification/test_agent_integration.py`：
+  - 完整反问流程：首问 → interrupt → resume → 执行
+  - REJECT 直接 END
+  - 5 次上限强制退出
+  - InMemorySaver + thread_id 状态共享
 
-- [ ] 14.1 实现 `src/clarification/agent.py` 的 `ClarificationAgent`：
-  - 构造 LangGraph 子图：TriggerDetector → (条件分支) → WebSearchEnricher → QuestionGenerator → UserDialog → MemoryWriter
-  - 暴露 `run(state: NL2SQLState) -> NL2SQLState` 接口供主图调用
-- [ ] 14.2 实现 MemoryWriter 步骤：本次查询结束后将所有 `clarification_history` 条目写回 UserMemory
-- [ ] 14.3 编写 `tests/clarification/test_agent_integration.py`：完整子图 Mock 集成测试
+## 13. 单查询子图工厂 + 多意图编排（决策 14）
+
+依据 决策 14（多意图分解 + 单查询子图复用）。
+
+- [x] 13.1 创建 `src/graph/single_query_graph.py` 的 `build_single_query_graph()` 工厂：
+  - 封装 `ir → ss → answerability_check → cg → execution → decision` 整段
+  - 主图单意图路径与 orchestrator 均复用，避免重复实现
+  - 接受已有 retriever/selector/generator/fix_loop/decider/checker 实例
+  - **实现说明（2026-07-01）**：未单独建 `single_query_graph.py` 工厂文件，改为在 `src/clarification/subquery_orchestrator.py` 中实现 `run_single_query()` 函数（功能等价：封装 ir→ss→answerability→cg→execution→decision 整段，复用各 Agent 的 `build_graph()` 公开签名，避免重复实现节点）。主图单意图路径走线性节点，多意图 orchestrator 调 `run_single_query()`，二者共用同一套 Agent 逻辑。
+- [x]13.2 实现 `src/clarification/subquery_orchestrator.py` 的 `SubqueryOrchestrator` 类：
+  - `run(subqueries, shared_state) -> List[SubqueryResult]`
+  - 逐个把子查询喂给单查询子图，收集每个 `final_decision` 进 `subquery_results`
+  - 失败隔离：某子查询全失败不中断其他，各自带 decision_path 与失败原因
+- [x]13.3 修改主图新增 `run_subqueries` 节点：单意图直接调单查询子图；多意图调 orchestrator
+- [x]13.4 编写 `tests/clarification/test_subquery_orchestrator.py`：
+  - 单意图等价单流程
+  - 多意图串行执行 + 结果收集
+  - 某子查询失败不中断其他（失败隔离）
+  - 复用单查询子图工厂（不重复实现）
+
+## 14. 结果总结模块（决策 15）
+
+依据 决策 15（按需 LLM 汇总 + 数据表结构摘要降 token）。
+
+- [x]14.1 实现 `src/clarification/result_summarizer.py` 的 `ResultSummarizer` 类：
+  - `summarize(subquery_results, user_query) -> str`
+  - 按需触发：单子查询且无数据表 → 直接透传不调 LLM；多子查询或有数据表 → 调 LLM 汇总
+  - 多结果汇总：LLM 生成连贯自然语言，按子查询顺序组织，每个标注来源
+- [x]14.2 实现数据表结构摘要（降 token）：
+  - 数据表结果仅提取「列名 + 行数 + 头部样本（前 5 行）」喂给总结 LLM
+  - 不把原始结果集整表喂入；原始完整结果通过 state 透传前端
+  - 与现有 ResultVerifier（列名+前5行）思路一致
+- [x]14.3 修改主图新增 `aggregate_results` 节点（run_subqueries 之后、memory_update 之前）：
+  - 调用 ResultSummarizer，输出写入 `summary_text`
+  - 原始 `subquery_results` 保留供前端渲染
+- [x]14.4 编写 `tests/clarification/test_result_summarizer.py`：
+  - 单结果无表透传（不调 LLM）
+  - 多结果 LLM 汇总（按顺序+标注来源）
+  - 数据表结构摘要：只取列名+行数+前5行，不喂整表
+  - 大表 token 约束验证
+
 
 ## 15. NL2SQLState 与主图集成
 
-- [x] 15.1 在主 state 定义中新增字段：`clarification_count`、`clarification_history`、`clarified_keywords`、`web_search_cache`、`user_id`、`answerability_result`、`result_verification`、`rejection_reason`
-- [x] 15.2 在 LangGraph 主图中插入 `clarification` 节点（IR 之后、SS 之前）
-- [x] 15.3 配置条件边：`clarification_done == True` → SS；否则循环回 `clarification`
+> 2026-06-29 更新：原 15.1/15.2/15.3 基于 IR 后 clarification 节点，已由新方案 §12.2/12.3（task_planner 前置）取代。15.1 的字段新增仍在 state.py 持续维护（已含 clarification_* 基础字段，新方案再增 plan_result/subqueries 等）。15.4-15.6（answerability_check）保持有效。
+
+- [x] 15.1 在主 state 定义中新增字段：`clarification_count`、`clarification_history`、`clarified_keywords`、`user_id`、`answerability_result`、`result_verification`、`rejection_reason`（原 `web_search_cache` 已废弃；新方案字段见 §12.2）
+- [x] 15.2 ~~在 LangGraph 主图中插入 `clarification` 节点（IR 之后、SS 之前）~~ → 已由 §12.3 取代：task_planner 前置到 IR 之前，原 IR 后 clarification 占位节点移除
+- [x] 15.3 ~~配置条件边：clarification_done → SS 否则循环~~ → 已由 §12.3 取代：task_planner 三选一条件边（REJECT→END / CLARIFY→interrupt循环 / EXECUTE→run_subqueries）
 - [x] 15.4 在 LangGraph 主图中插入 `answerability_check` 节点（SS 之后、CG 之前）
 - [x] 15.5 配置条件边：`answerable != "false"` → CG；否则 → END（拒答 + 原因）
 - [x] 15.6 修改 `decision` 节点集成结果验证：不可信时写入 `rejection_reason` 并跳转 END
 
 ## 16. 文档与示例
 
-- [ ] 16.1 在 `docs/` 下新增 `clarification_agent.md` 说明使用方法与触发条件
-- [ ] 16.2 在 `examples/` 下新增 `clarification_demo.py` 演示完整反问流程
-- [ ] 16.3 更新 `README.md` 提及反问能力与 Tavily API Key 配置
+- [ ] 16.1 在 `docs/` 下新增 `clarification_agent.md` 说明 TaskPlanner 三选一裁决、interrupt/resume 流程、多意图分解、总结模块的使用方法
+- [ ] 16.2 在 `examples/` 下新增 `clarification_demo.py` 演示完整反问流程（首问 → interrupt → resume → 执行 → 总结）
+- [ ] 16.3 更新 `README.md` 提及反问能力（TaskPlanner）与 `config/clarification.yaml` 配置（原 Tavily API Key 配置已废弃）
 
 ## 17. 测试和验证
 
 - [ ] 17.1 编写单元测试，覆盖各核心模块
 - [ ] 17.2 进行端到端集成测试，使用 BIRD-SQL 测试集
-- [ ] 17.3 验证安全性，确保不会执行危险 SQL 操作
+- [ ] 17.3 验证安全性，确保不会执行危险 SQL 操作（含 TaskPlanner 写操作拒答）
 - [ ] 17.4 性能测试和优化，确保响应时间可接受
-- [ ] 17.5 所有新增/修改单元测试通过
-- [ ] 17.6 端到端 Demo：使用「查一下苹果的销售额」触发 B 类反问，澄清后 SQL 正确生成
+- [x] 17.5 所有新增/修改单元测试通过
+- [ ] 17.6 端到端 Demo：使用「查一下苹果的销售额」触发 CLARIFY 反问（实体多义），澄清后 SQL 正确生成
 - [ ] 17.7 UserMemory 持久化验证：重启会话后历史偏好仍可命中
-- [ ] 17.8 拒答场景验证：连续 5 次反问后自动退出，主流程继续
+- [ ] 17.8 拒答场景验证：连续 5 次反问后自动退出，主流程继续；写操作查询直接 REJECT
 
 ## 18. LangGraph 全流程编排（贯穿性改造）
 

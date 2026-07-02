@@ -28,6 +28,12 @@ from src.api.db_pool import DbContextPool, Globals
 from src.decision.self_consistency import SelfConsistencyDecision
 from src.memory.history_cache import HistoryCache
 from src.memory.memory_updater import MemoryUpdater
+from src.memory.session_recall import (
+    ChromaSessionQueryIndex,
+    HybridSessionRetriever,
+    JsonConversationStore,
+    SessionRecallConfig,
+)
 from src.memory.session_manager import SessionManager
 from src.memory.user_memory import UserMemory
 from src.preprocessing.schema_vectorizer import SchemaVectorizer
@@ -103,8 +109,30 @@ def init_globals(data_dir: Optional[str] = None) -> None:
     result_verifier = ResultVerifier(llm_client=llm_client, strictness="strict")
     decider = SelfConsistencyDecision(llm_client=llm_client, result_verifier=result_verifier)
     answerability_checker = AnswerabilityChecker(llm_client=llm_client, strictness="loose")
-    history_cache = HistoryCache(llm_client=llm_client, min_confidence=0.8)
-    memory_updater = MemoryUpdater(llm_client=llm_client)
+
+    # 4.5 SessionMemory v2 召回组件（demo: Chroma + JSON）
+    session_recall_config = SessionRecallConfig(
+        dense_top_k=int(os.getenv("SESSION_RECALL_DENSE_TOP_K", "10")),
+        bm25_top_k=int(os.getenv("SESSION_RECALL_BM25_TOP_K", "10")),
+        rrf_k=int(os.getenv("SESSION_RECALL_RRF_K", "60")),
+        rrf_threshold=float(os.getenv("SESSION_RECALL_RRF_THRESHOLD", "0.015")),
+        require_multi_channel_hit=os.getenv("SESSION_RECALL_REQUIRE_MULTI", "false").lower() == "true",
+    )
+    session_conversation_store = JsonConversationStore(
+        base_dir=str(Path(data_dir) / "session_memory_v2")
+    )
+    session_query_index = ChromaSessionQueryIndex(
+        vectorizer=vectorizer,
+        persist_directory=str(Path(data_dir) / "preprocessed" / "chroma"),
+        collection_name=session_recall_config.collection_name,
+    )
+    session_retriever = HybridSessionRetriever(
+        query_index=session_query_index,
+        conversation_store=session_conversation_store,
+        config=session_recall_config,
+    )
+    history_cache = HistoryCache(llm_client=llm_client, min_confidence=0.8, session_retriever=session_retriever)
+    memory_updater = MemoryUpdater(llm_client=llm_client, session_retriever=session_retriever)
 
     # 5. 会话管理器（文件存储 + 进程 LRU）
     _session_manager = SessionManager(
@@ -112,7 +140,33 @@ def init_globals(data_dir: Optional[str] = None) -> None:
         max_cache_size=200,
     )
 
-    # 6. 装配 Globals
+    # 6. 反问机制（决策 9-15）：按 config/clarification.yaml 启用
+    task_planner = None
+    dialog_manager = None
+    checkpointer = None
+    summarizer = None
+    try:
+        from src.clarification.config import is_enabled, get_max_rounds, get_decline_keywords
+        from src.clarification.task_planner import TaskPlanner
+        from src.clarification.dialog import DialogManager
+        from src.clarification.result_summarizer import ResultSummarizer
+        from langgraph.checkpoint.memory import InMemorySaver
+
+        if is_enabled():
+            task_planner = TaskPlanner(llm_client=llm_client, max_clarify_rounds=get_max_rounds())
+            dialog_manager = DialogManager(
+                max_rounds=get_max_rounds(),
+                decline_keywords=get_decline_keywords(),
+            )
+            checkpointer = InMemorySaver()  # 全局单例，interrupt 恢复依赖
+            summarizer = ResultSummarizer(llm_client=llm_client)  # 多意图结果汇总（决策 15）
+            logger.info(f"反问机制已启用: max_rounds={get_max_rounds()}")
+        else:
+            logger.info("反问机制未启用（clarification.enabled=false）")
+    except Exception as e:
+        logger.warning(f"反问机制初始化失败，主图退化为无反问模式: {e}")
+
+    # 7. 装配 Globals
     _globals = Globals(
         bge_vectorizer=vectorizer,
         vector_store=vector_store,
@@ -122,10 +176,15 @@ def init_globals(data_dir: Optional[str] = None) -> None:
         answerability_checker=answerability_checker,
         history_cache=history_cache,
         memory_updater=memory_updater,
+        session_retriever=session_retriever,
         data_dir=data_dir,
+        task_planner=task_planner,
+        dialog_manager=dialog_manager,
+        checkpointer=checkpointer,
+        summarizer=summarizer,
     )
 
-    # 7. DbContextPool
+    # 8. DbContextPool
     _db_pool = DbContextPool(max_size=pool_max_size, globals_=_globals)
     logger.info(f"DbContextPool 初始化: max_size={pool_max_size}")
 

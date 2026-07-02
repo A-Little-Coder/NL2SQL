@@ -33,6 +33,14 @@ class NL2SQLState(TypedDict, total=False):
         clarified_keywords: 经澄清后的关键词
         clarification_done: 是否结束反问流程
 
+        # ===== TaskPlanner / 反问机制（决策 9-15）=====
+        plan_result: TaskPlanner 三选一裁决输出（verdict/subqueries/ambiguities...）
+        subqueries: 多意图分解后的子查询列表
+        subquery_results: 每个子查询的最终结果（含 final_decision / decision_path）
+        clarify_round: 反问轮次计数（存 state，checkpoint 持久化）
+        clarify_question: 当前要问用户的问题（interrupt 用）
+        summary_text: 总结模块（aggregate_results）输出
+
         # ===== SS 产出 =====
         selected_schema: List[MSchemaTable] 经裁剪后的 schema
 
@@ -53,12 +61,13 @@ class NL2SQLState(TypedDict, total=False):
         trace_log: 各节点产生的轨迹日志（便于调试）
 
         # ===== 会话历史（由 API 层/调用方注入）=====
-        conversation_history: 当前会话的历史对话轮次
+        conversation_history: 当前会话最近轮次
         cache_hit: 历史命中标记
         cached_sql: 命中的缓存 SQL
         cache_source: 命中来源
         cache_confidence: 命中置信度
         metric_definitions: 用户记忆中的指标定义（由 API 层注入）
+        historical_sql_refs: HistoryCache 不复用时保留的历史 query/sql 弱参考
 
         # ===== 内部注入（API 层注入，graph 节点内部使用）=====
         _user_memory: Any  # UserMemory 实例
@@ -80,6 +89,13 @@ class NL2SQLState(TypedDict, total=False):
     clarification_history: List[Dict[str, Any]]
     clarified_keywords: List[str]
     clarification_done: bool
+    # ===== TaskPlanner / 反问机制（决策 9-15，2026-06-29）=====
+    plan_result: Dict[str, Any]              # TaskPlanner 输出（verdict/subqueries/ambiguities...）
+    subqueries: List[str]                    # 分解后的子查询列表
+    subquery_results: List[Dict[str, Any]]   # 每个子查询的最终结果
+    clarify_round: int                       # 反问轮次计数（checkpoint 持久化）
+    clarify_question: str                    # 当前要问用户的问题（interrupt 用）
+    summary_text: str                        # 总结模块输出（aggregate_results）
 
     # ===== SS =====
     selected_schema: List[Any]  # List[MSchemaTable]
@@ -120,6 +136,7 @@ class NL2SQLState(TypedDict, total=False):
     cache_source: Optional[str]
     cache_confidence: float
     metric_definitions: List[Dict[str, Any]]
+    historical_sql_refs: List[Dict[str, Any]]  # 不可复用历史的 query/sql 弱参考
 
     # ===== 内部注入 =====
     _user_memory: Any
@@ -159,6 +176,12 @@ def create_initial_state(
         clarification_history=[],
         clarified_keywords=[],
         clarification_done=True,  # Phase 1 默认跳过反问
+        plan_result={},
+        subqueries=[],
+        subquery_results=[],
+        clarify_round=0,
+        clarify_question="",
+        summary_text="",
         selected_schema=[],
         sql_candidates=[],
         execution_results=[],
@@ -183,6 +206,7 @@ def create_initial_state(
         cache_source=None,
         cache_confidence=0.0,
         metric_definitions=[],
+        historical_sql_refs=[],
         _user_memory=None,
         _session_memory=None,
         error=None,

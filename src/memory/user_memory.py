@@ -20,6 +20,30 @@ from typing import Any, Dict, List, Optional
 from .storage import Storage
 
 
+ALLOWED_TOPICS = {
+    "term_preferences",
+    "frequently_used_tables",
+    "metric_definitions",
+    "query_preferences",
+    "domain_context",
+    "clarification_history",
+}
+
+_BLOCKED_MEMORY_KEYS = {
+    "few_shot",
+    "few_shots",
+    "few_shot_examples",
+    "examples",
+    "sql_examples",
+    "final_result",
+    "result",
+    "result_rows",
+    "execution_results",
+    "llm_thinking",
+    "graph_state",
+    "intermediate_state",
+}
+
 class UserMemory:
     """用户长期记忆，管理六维记忆结构的读写"""
 
@@ -46,6 +70,30 @@ class UserMemory:
             "clarification_history": [],
         }
 
+    @staticmethod
+    def _normalize_memory(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """规范化为固定 UserMemory topic schema，过滤未知顶层 key"""
+        base = UserMemory._empty_memory(user_id)
+        if not isinstance(data, dict):
+            return base
+        for key in ("created_at", "updated_at"):
+            if data.get(key):
+                base[key] = data[key]
+        for topic in ALLOWED_TOPICS:
+            if topic in data and isinstance(data[topic], type(base[topic])):
+                base[topic] = data[topic]
+        return base
+
+    @staticmethod
+    def _sanitize_mapping(data: Dict[str, Any]) -> Dict[str, Any]:
+        """过滤 few-shot、结果数据和中间状态等不应进入长期记忆的字段"""
+        if not isinstance(data, dict):
+            return {}
+        return {
+            k: v for k, v in data.items()
+            if k not in _BLOCKED_MEMORY_KEYS
+        }
+
     def _touch(self):
         self._data["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
@@ -61,12 +109,14 @@ class UserMemory:
         if data is None:
             data = self._empty_memory(self.user_id)
             self._storage.atomic_write(self._file_path, data)
+        data = self._normalize_memory(self.user_id, data)
         self._data = data
         self._loaded = True
         return self._data
 
     def save(self):
         """原子写入用户记忆到磁盘"""
+        self._data = self._normalize_memory(self.user_id, self._data)
         self._touch()
         self._storage.atomic_write(self._file_path, self._data)
 
@@ -84,12 +134,13 @@ class UserMemory:
         source: str = "user_taught",
     ):
         self._ensure_loaded()
-        self._data["term_preferences"][term] = {
+        entry = self._sanitize_mapping({
             "resolved_to": resolved_to,
             "confidence": confidence,
             "source": source,
             "last_used": date.today().isoformat(),
-        }
+        })
+        self._data["term_preferences"][term] = entry
         self.save()
 
     # ── 2. 常用表 ─────────────────────────────────────────────
@@ -151,14 +202,14 @@ class UserMemory:
             if len(sql_pattern) > len(old.get("sql_pattern", "")):
                 old["sql_pattern"] = sql_pattern
         else:
-            metrics[name] = {
+            metrics[name] = self._sanitize_mapping({
                 "description": description,
                 "sql_pattern": sql_pattern,
                 "source": source,
                 "confidence": confidence,
                 "times_used": 1,
                 "last_used": date.today().isoformat(),
-            }
+            })
         self.save()
 
     def get_metric_definitions(self, min_confidence: float = 0.7) -> List[Dict[str, Any]]:
@@ -166,8 +217,9 @@ class UserMemory:
         self._ensure_loaded()
         result = []
         for name, metric in self._data["metric_definitions"].items():
-            if metric.get("confidence", 0) >= min_confidence:
-                result.append({"name": name, **metric})
+            clean = self._sanitize_mapping(metric)
+            if clean.get("confidence", 0) >= min_confidence:
+                result.append({"name": name, **clean})
         return result
 
     # ── 4. 查询偏好 ───────────────────────────────────────────
@@ -175,6 +227,8 @@ class UserMemory:
     def update_query_preference(self, key: str, value: str):
         """更新查询偏好（如 default_time_range = "last_30_days"）"""
         self._ensure_loaded()
+        if key in _BLOCKED_MEMORY_KEYS:
+            return
         self._data["query_preferences"][key] = value
         self.save()
 
@@ -188,7 +242,7 @@ class UserMemory:
     def update_domain_context(self, **kwargs):
         """更新领域上下文（industry/department/focus_areas 等）"""
         self._ensure_loaded()
-        self._data["domain_context"].update(kwargs)
+        self._data["domain_context"].update(self._sanitize_mapping(kwargs))
         self.save()
 
     def get_domain_context(self) -> Dict[str, Any]:
@@ -201,6 +255,7 @@ class UserMemory:
     def append_clarification(self, entry: Dict[str, Any]):
         """追加一条反问澄清历史"""
         self._ensure_loaded()
+        entry = self._sanitize_mapping(entry)
         if "timestamp" not in entry:
             entry["timestamp"] = datetime.now().isoformat(timespec="seconds")
         self._data["clarification_history"].append(entry)

@@ -68,6 +68,14 @@ def build_decision_graph(decider):
     from src.execution.executor import SQLFixLoop
     from src.sql_generation.sql_generator import SQLStatus
 
+    # 决策 12：fix_loop 是 per-db 的 Python 对象，不能进 state（checkpointer 序列化报错），
+    # 改从 ContextVar 取；离线/无 API 模块时 fallback 到 state 或 decider.fix_loop
+    try:
+        from src.api.streaming import get_fix_loop_ctx
+    except Exception:  # pragma: no cover
+        def get_fix_loop_ctx():  # type: ignore
+            return None
+
     # ------------------------------------------------------------------
     # 节点
     # ------------------------------------------------------------------
@@ -158,8 +166,8 @@ def build_decision_graph(decider):
                 "decision_path": "E",
             }
 
-        # 决策 51：优先用子图 state 注入的 fix_loop（每 DB 独立），fallback 到 decider.fix_loop
-        fix_loop = state.get("fix_loop") or getattr(decider, "fix_loop", None)
+        # 决策 51：优先用 ContextVar 的 fix_loop（每 DB 独立），fallback 到 state/decider.fix_loop
+        fix_loop = get_fix_loop_ctx() or state.get("fix_loop") or getattr(decider, "fix_loop", None)
         if fix_loop is None:
             executor = getattr(decider, "executor", None)
             if executor is None:
@@ -209,8 +217,8 @@ def build_decision_graph(decider):
                 "decision_path": "H",
             }
 
-        # 准备 fix_loop（优先用子图 state 注入的）
-        fix_loop = state.get("fix_loop") or getattr(decider, "fix_loop", None)
+        # 准备 fix_loop（优先用 ContextVar，fallback 到 state/decider.fix_loop）
+        fix_loop = get_fix_loop_ctx() or state.get("fix_loop") or getattr(decider, "fix_loop", None)
         if fix_loop is None:
             executor = getattr(decider, "executor", None)
             if executor is None:

@@ -25,6 +25,7 @@ class CGGraphState(TypedDict, total=False):
     sql_candidates: List[Any]       # List[SQLCandidate]
     query_preferences: Dict[str, str]  # 用户查询偏好（由主图注入）
     metric_definitions: List[Dict[str, Any]]  # 用户指标定义（由主图注入）
+    historical_sql_refs: List[Dict[str, Any]]  # 不可复用历史的 query/sql 弱参考
 
 
 def build_cg_graph(generator):
@@ -85,6 +86,16 @@ def build_cg_graph(generator):
                     metric_lines.append(f"- {m.get('name', '')}: {m.get('description', '')} → {m.get('sql_pattern', '')}")
             metric_text = "\n".join(metric_lines) if metric_lines else ""
 
+            # 注入历史 SQL 弱参考（仅供写法/口径参考，不得突破当前 schema）
+            refs = state.get("historical_sql_refs", []) or []
+            ref_lines = []
+            for ref in refs[:3]:
+                q = ref.get("historical_query", "")
+                sql = ref.get("historical_sql", "")
+                if q and sql:
+                    ref_lines.append(f"- 历史问题：{q}\n  历史 SQL：{sql}")
+            historical_ref_text = "\n".join(ref_lines) if ref_lines else ""
+
             from src.sql_generation.prompts import SQL_GENERATION_PROMPT
             from utils.llm_client import parse_json, stream_with_sse
             from langchain_core.messages import HumanMessage
@@ -103,6 +114,14 @@ def build_cg_graph(generator):
                 base_messages.append(HumanMessage(
                     f"## 已知指标定义\n{metric_text}\n"
                     "如果当前查询匹配以上指标定义，请优先使用对应的 SQL 模式。"
+                ))
+            if historical_ref_text:
+                base_messages.append(HumanMessage(
+                    "## 历史 SQL 弱参考\n"
+                    f"{historical_ref_text}\n"
+                    "以上历史 SQL 仅供写法、指标口径或聚合方式参考。"
+                    "必须以当前用户问题和当前 selected schema 为准，"
+                    "不得使用当前 schema 中不存在的表或列。"
                 ))
             raw = stream_with_sse(generator.llm_client.stream(base_messages, as_json=True, temperature=0.3))
             result = parse_json(raw)

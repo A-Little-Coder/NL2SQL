@@ -66,6 +66,34 @@ current_node: ContextVar[Optional[str]] = ContextVar(
     "current_node", default=None
 )
 
+# 运行时注入对象（决策 12：checkpointer 会序列化 state，Python 对象实例不能进 state，
+# 改用 ContextVar 传递；API 层在 run_graph 里 set，节点里 get）
+current_user_memory: ContextVar[Optional[Any]] = ContextVar(
+    "current_user_memory", default=None
+)
+current_session_memory: ContextVar[Optional[Any]] = ContextVar(
+    "current_session_memory", default=None
+)
+# per-db 的 SQLFixLoop（决策 51：SmartFix 用；每 db 独立，不能进 state，否则 checkpointer 序列化报错）
+current_fix_loop: ContextVar[Optional[Any]] = ContextVar(
+    "current_fix_loop", default=None
+)
+
+
+def get_user_memory_ctx() -> Optional[Any]:
+    """从 ContextVar 取当前请求的 UserMemory 实例（无则 None）。"""
+    return current_user_memory.get()
+
+
+def get_session_memory_ctx() -> Optional[Any]:
+    """从 ContextVar 取当前请求的 SessionMemory 实例（无则 None）。"""
+    return current_session_memory.get()
+
+
+def get_fix_loop_ctx() -> Optional[Any]:
+    """从 ContextVar 取当前 db 的 SQLFixLoop 实例（无则 None）。"""
+    return current_fix_loop.get()
+
 
 def emit_safe(event_type: str, data: Any) -> None:
     """便捷函数：当前线程有 emitter 时推送事件，否则静默不发

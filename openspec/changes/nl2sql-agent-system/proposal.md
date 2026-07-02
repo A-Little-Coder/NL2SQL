@@ -8,14 +8,17 @@
 
 参考CHESS项目的优秀实践，结合BIRD-SQL数据集和Qwen大模型的能力，我们需要构建一个完整的多Agent NL2SQL系统，以满足生产级别的准确性和安全性要求。
 
-此外，NL2SQL Pipeline 在 IR（信息检索）阶段存在两类「无声失败」：
+此外，NL2SQL Pipeline 在用户意图层面存在三类需要前置处理的场景：
 
-1. **召回为空 / 召回过弱**：用户提到的关键词在 LSH/向量检索中找不到匹配，或最高相似度低于阈值。系统继续向下走会导致 SQL 生成偏离用户意图。
-2. **语义不匹配**：召回到了值，但召回的值与用户的常用语境或当前上下文明显不符（例如用户说"苹果"，期望水果，但系统召回了"苹果公司"）。
+1. **表述歧义**：用户提到的实体多义（"苹果"指公司或水果）、粒度不明、缺失关键限定（时间/维度）。盲目进入 IR 召回会基于错误假设生成偏离意图的 SQL。
+2. **多意图复合查询**：用户一句话包含多个独立问数意图（"查苹果的销售额和利润，再对比去年"），单次 SQL 无法覆盖，需分解为多个子查询逐个执行。
+3. **越权 / 超范围**：用户查询包含写操作意图（删除/更新/插入）或问及当前数据库完全不包含的业务域，应直接拒答而非尝试生成。
 
-这些情况下，与其让 Agent 盲目猜测继续生成错误 SQL，不如**主动反问用户**澄清意图。同时：
-- 反问需要**领域知识支撑**：当系统不理解某个领域术语时，应能通过联网搜索补充背景知识，再生成更精准的反问。
-- 反问需要**用户画像支撑**：不同用户的用词习惯不同（"销售额"对 A 用户指 GMV，对 B 用户指净收入），需基于用户长期记忆判断是否触发反问，以及如何反问。
+这些情况下，与其让 Agent 盲目进入 IR 召回并生成错误 SQL，不如在 IR 之前新增**意图理解层（TaskPlanner）**做三选一裁决：清晰→分解执行、歧义→反问澄清、不可答→拒答。反问采用 LangGraph 1.x 的 `interrupt()` 暂停等用户回答后恢复。同时：
+- 反问需要**用户画像支撑**：不同用户的用词习惯不同（"销售额"对 A 用户指 GMV，对 B 用户指净收入），需基于用户长期记忆判断歧义与反问方式。
+- 多次查询结果需**总结汇总**：多子查询的结果要汇总成连贯回答，且数据表结果要避免整表喂给 LLM 浪费 token。
+
+> 2026-06-29 重大重新定义：原方案（IR 之后基于召回结果触发四类反问 + Tavily 联网）已废弃，改为 IR 之前的前置 TaskPlanner + interrupt + 多意图分解 + 结果总结。WebSearch/Tavily 与 IR 后 TriggerDetector 本期跳过。
 
 ## What Changes
 
@@ -28,7 +31,7 @@
 5. **候选SQL生成器(CG)模块**：支持实体掩码、few-shot选择、多SQL生成和安全验证
 6. **执行与决策模块**：实现安全的SQL执行、错误修正循环和self-consistency投票决策
 7. **监控集成**：与LangSmith集成，提供全流程监控和流式输出
-8. **反问 Agent (ClarificationAgent) 与用户记忆 (UserMemory)**：插入到 IR 与 SS 之间的 LangGraph 流程中，主动澄清歧义并积累用户长期偏好
+8. **反问机制（TaskPlanner）与用户记忆（UserMemory）**：在 IR 之前插入意图理解层，三选一裁决（执行/反问/拒答），支持多意图分解、interrupt 暂停恢复与结果总结，并积累用户长期偏好
 9. **可回答性检查 (Answerability Check)**：SS 之后、CG 之前插入的轻量判断节点，宽松原则——只有明确无法回答时才拦截，避免浪费后续 LLM 调用
 10. **结果可信度验证 (Result Verification)**：增强 Decision 节点，严格验证最终 SQL 语义是否与用户问题对齐，防止"答非所问"的硬凑输出
 
@@ -36,27 +39,27 @@
 用户输入
    │
    ▼
-[IR 信息检索]   ─→ 召回结果 + 检索元数据（相似度分数、命中数等）
+[history_cache 历史命中]  ─→ 命中 → 直接执行缓存 SQL
+   │ 未命中
+   ▼
+[task_planner 意图理解]  ─→ 三选一裁决（LLM 强制 JSON）
+   ├─ EXECUTE (single/multi) → 分解子查询
+   ├─ CLARIFY → interrupt 暂停 → 等用户回答 → resume 重新规划（最多 5 轮，拒答放行）
+   └─ REJECT → 拒答(含原因) → END
+   │ EXECUTE
+   ▼
+[run_subqueries]  ─→ 单意图直接执行 / 多意图 orchestrator 串行
+   │                  复用 build_single_query_graph(): ir→ss→answerability→cg→execution→decision
+   ▼
+[aggregate_results 总结]  ─→ 按需 LLM 汇总；数据表用结构摘要（列名+行数+前5行）降 token
    │
    ▼
-[ClarificationAgent]
-   ├─ ① TriggerDetector：判断是否需要反问（4 类触发条件）
-   ├─ ② WebSearchEnricher（条件 B 时启用）：通过 Tavily MCP 补充领域知识
-   ├─ ③ QuestionGenerator：基于上下文 + 用户记忆 + 搜索结果生成反问
-   ├─ ④ UserDialog：暂停流程，等待用户回答（最多 5 轮，拒答则放行）
-   └─ ⑤ MemoryWriter：将本轮澄清结果写回 UserMemory
+[memory_update 记忆学习]  ─→ 反问历史回写 UserMemory + 自动学习
    │
    ▼
-[SS Schema 选择]  ─→ 携带澄清后的关键词与上下文继续后续流程
+[可回答性检查]（单查询子图内，SS 之后）→ 宽松判断：明显缺失/粒度不匹配 → 拒答 → END
    │
-   ▼
-[可回答性检查]   ─→ 宽松判断：有明显缺失/粒度不匹配 → 拒答(含原因) → END
-   │                      否则/不确定 → 继续
-   ▼
-[CG SQL 生成] → [Execution] → [Decision + 结果验证]
-                                      │
-                                      ├─ 可信 → 返回结果
-                                      └─ 不可信 → 拒答(含原因) → END
+[CG] → [Execution] → [Decision + 结果验证] → 可信返回结果 / 不可信拒答
 ```
 
 系统将在conda虚拟环境NL2SQL中运行，通过Terminal提供交互式对话界面。
@@ -73,7 +76,7 @@
 - `self-consistency`: 基于多数一致性和LLM最终决策的投票机制
 - `monitoring-integration`: LangSmith全流程监控和Terminal流式输出
 - `user-memory`: 基于 JSON 文件的用户长期记忆管理，支持按 `user_id` 维度记录用户的术语偏好、领域上下文、历史澄清结果
-- `clarification`: 多步反问 Agent，含触发检测、联网搜索补充、反问生成、用户对话循环、记忆回写五个子流程
+- `clarification`: IR 之前的意图理解层（TaskPlanner），三选一裁决（执行/反问/拒答）+ 多意图分解 + interrupt 暂停恢复 + 结果总结，含反问对话循环与记忆回写
 - `answerability-verification`: 两阶段拒答机制——SS 后的可回答性检查（宽松）+ Decision 后的结果可信度验证（严格），防止 LLM 在信息不足时硬凑答非所问的 SQL
 
 ## Impact
@@ -81,17 +84,18 @@
 **受影响的代码和系统**：
 - 新增核心模块目录：`src/preprocessing/`, `src/retrieval/`, `src/schema_selection/`, `src/sql_generation/`, `src/execution/`, `src/decision/`
 - 新增预处理产物：`data/preprocessed/schema_graphs/{db_id}.json`（表关联图JSON邻接表）
-- 新增模块：`src/clarification/`（含 `agent.py`、`trigger.py`、`web_search.py`、`question_generator.py`、`dialog.py`）
+- 新增模块：`src/clarification/`（含 `task_planner.py`、`dialog.py`、`subquery_orchestrator.py`、`result_summarizer.py`、`agent.py`）
+- 新增模块：`src/graph/single_query_graph.py`（单查询子图工厂）
 - 新增模块：`src/memory/`（含 `user_memory.py`、`storage.py`）
 - 数据目录：新增 `data/user_memory/{user_id}.json` 存储用户长期记忆
-- LangGraph 工作流：新增 `clarification` 节点，位置在 IR 之后、SS 之前；新增 `answerability_check` 节点，位置在 SS 之后、CG 之前；增强 `decision` 节点，内含结果可信度验证
-- 依赖新增：BGE-M3 embedding模型、ChromaDB向量数据库、sqlglot SQL验证库、nltk实体识别、`tavily-python`（MCP 协议接入）
+- LangGraph 工作流：新增 `task_planner` 节点（IR 之前）、`run_subqueries`、`aggregate_results` 节点；主图编译启用 `InMemorySaver` checkpointer（interrupt 必需）；移除原 IR 后 `clarification` 占位节点；保留 `answerability_check`（SS 之后）
+- 依赖新增：BGE-M3 embedding模型、ChromaDB向量数据库、sqlglot SQL验证库、nltk实体识别（原 `tavily-python` 本期跳过）
 - 数据库连接：支持SQLite（优先）和MySQL数据库格式
-- 环境配置：conda虚拟环境NL2SQL，已配置Qwen API和LangSmith密钥；新增 Tavily API Key 环境变量（`TAVILY_API_KEY`）
-- 用户界面：Terminal交互式对话，流式输出执行过程和思考过程
+- 环境配置：conda虚拟环境NL2SQL，已配置Qwen API和LangSmith密钥；新增 `config/clarification.yaml`（反问开关/上限/拒答关键词）
+- 用户界面：Terminal交互式对话，流式输出执行过程和思考过程；支持反问 interrupt/resume
 - 检索接口微调：`InformationRetriever.retrieve()` 返回值需包含 `scores` 与 `metadata`
 
 **非功能影响**：
-- **延迟**：触发反问时单次澄清增加 ~3-5s（含 1 次 LLM + 可选 1 次 Tavily 调用）；未触发时无影响。可回答性检查增加 ~2-3s（1 次 LLM 调用），但拦截时可省去后续 CG + Exec 的 ~30-120s 开销。
-- **成本**：Tavily 免费层 1000 次/月，搜索结果会话内缓存，避免重复调用。
-- **用户体验**：交互模式从「一问一 SQL」变为「可能多轮澄清」，需在 Terminal UI 明确告知用户。
+- **延迟**：触发反问时单次澄清增加 ~2-3s（1 次 LLM 裁决 + interrupt 暂停等待）；未触发时仅增加 1 次 TaskPlanner LLM 调用 ~2s。可回答性检查增加 ~2-3s，但拦截时可省去后续 CG + Exec 的 ~30-120s 开销。
+- **成本**：TaskPlanner 每次查询 1 次 LLM（可配置关闭）；总结模块按需调用（单结果无表不调 LLM）；数据表结构摘要避免大表 token 爆炸。
+- **用户体验**：交互模式从「一问一 SQL」变为「可能多轮澄清」，需在 Terminal UI 明确告知用户；多意图查询会得到汇总后的连贯回答。

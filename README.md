@@ -176,13 +176,38 @@ python run_api.py
 | `src/sql_generation/` | SQL 生成子图：生成 N 个候选 SQL + 基础校验 |
 | `src/execution/` | SQL 执行子图：多引擎执行 + SmartFix 自动修复 |
 | `src/decision/` | 自洽性决策子图：多候选评分、并列重评、最终决策、结果验证 |
-| `src/memory/` | 持久化存储：会话管理、用户记忆、历史缓存、Memory Updater |
+| `src/memory/` | 持久化存储：会话管理、用户记忆、SessionMemory v2 混合召回、历史缓存、Memory Updater |
 | `src/preprocessing/` | 离线预处理：数据库连接、Schema 向量化、LSH 索引构建、增量更新 |
 | `utils/` | 共享工具：LLM 客户端封装（Qwen / OpenAI 协议兼容） |
 
+
+## 记忆与历史召回
+
+系统包含两类记忆：
+
+- **SessionMemory**：会话级短期记忆。成功查数的历史 query 会写入 SessionMemory v2 召回库；召回时先按当前 `user_id`、`session_id`、`db_id`、`success=true` 过滤，只在本 session 内执行 BGE-M3 向量召回和本地 BM25 召回，再通过 RRF 融合排序。只有 `rrf_score >= SESSION_RECALL_RRF_THRESHOLD` 的记忆会进入 HistoryCache 判断。
+- **UserMemory**：用户长期偏好记忆，固定 JSON topics：`term_preferences`、`frequently_used_tables`、`metric_definitions`、`query_preferences`、`domain_context`、`clarification_history`。系统会过滤 few-shot 示例、结果数据和中间 graph state，避免污染长期记忆。
+
+SessionMemory v2 的 demo 存储实现为：
+
+| 层级 | demo 实现 | 说明 |
+|------|-----------|------|
+| Query Recall Index | Chroma collection `nl2sql_session_queries` | 存 query embedding 和过滤 metadata |
+| Conversation Store | `data/session_memory_v2/` JSON 文件 | 存 query/final_sql 等无结果历史对话 |
+| 融合排序 | 本地 RRF | 允许单路召回，最终按 RRF 阈值过滤 |
+
+相关配置：
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `SESSION_RECALL_DENSE_TOP_K` | `10` | 本 session 向量召回数量 |
+| `SESSION_RECALL_BM25_TOP_K` | `10` | 本 session BM25 召回数量 |
+| `SESSION_RECALL_RRF_K` | `60` | RRF 排序参数 |
+| `SESSION_RECALL_RRF_THRESHOLD` | `0.015` | RRF 召回阈值 |
+| `SESSION_RECALL_REQUIRE_MULTI` | `false` | 是否要求 dense 与 BM25 双路同时命中 |
+
 ---
 
-## API 参考
 
 ### 启动服务
 

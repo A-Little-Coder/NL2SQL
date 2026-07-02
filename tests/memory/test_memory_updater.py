@@ -271,3 +271,65 @@ class TestUpdaterNoLLM:
         assert len(metrics) >= 1
         # 简单提取使用 SUM_amount 命名
         assert any("SUM" in m.get("name", "") for m in metrics)
+
+
+class TestSessionRecallWrite:
+    """SessionMemory v2 写入策略"""
+
+    def test_success_query_writes_session_recall_memory(self, user_memory, session_memory):
+        from src.memory.session_recall import HybridSessionRetriever, JsonConversationStore, SessionRecallConfig
+
+        class FakeIndex:
+            def __init__(self):
+                self.items = []
+
+            def upsert(self, memory):
+                self.items.append(memory)
+                return True
+
+            def query_dense(self, *args, **kwargs):
+                return []
+
+        index = FakeIndex()
+        store = JsonConversationStore("data/test_session_recall_tmp")
+        retriever = HybridSessionRetriever(index, store, SessionRecallConfig())
+        updater = MemoryUpdater(llm_client=None, session_retriever=retriever)
+        session_memory.session_id = "s1"
+        session_memory.get_turn_count = lambda: 0
+        state = {
+            "user_query": "查询苹果销售额",
+            "user_id": "u1",
+            "database_filter": "db1",
+            "final_sql": "SELECT SUM(amount) FROM sales",
+            "final_result": [{"x": 1}],
+            "clarification_history": [],
+        }
+
+        updater.update(user_memory, session_memory, state)
+
+        assert len(index.items) == 1
+        assert index.items[0].session_id == "s1"
+        assert index.items[0].db_id == "db1"
+
+    def test_failed_query_does_not_write_session_recall_memory(self, user_memory, session_memory):
+        class FakeRetriever:
+            def __init__(self):
+                self.query_index = MagicMock()
+                self.conversation_store = MagicMock()
+
+        retriever = FakeRetriever()
+        updater = MemoryUpdater(llm_client=None, session_retriever=retriever)
+        session_memory.session_id = "s1"
+        state = {
+            "user_query": "查询苹果销售额",
+            "user_id": "u1",
+            "database_filter": "db1",
+            "final_sql": "",
+            "error": "failed",
+            "clarification_history": [],
+        }
+
+        updater.update(user_memory, session_memory, state)
+
+        retriever.query_index.upsert.assert_not_called()
+        retriever.conversation_store.upsert_turn.assert_not_called()

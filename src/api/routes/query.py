@@ -29,8 +29,32 @@ from starlette.responses import StreamingResponse
 
 from src.api.deps import get_db_pool, get_session_manager, get_user_memory
 from src.api.schemas import QueryRequest
-from src.api.streaming import StreamEmitter, current_emitter
+from src.api.streaming import (
+    StreamEmitter,
+    current_emitter,
+    current_user_memory,
+    current_session_memory,
+    current_fix_loop,
+)
 from src.graph.state import create_initial_state
+
+
+def _should_write_session_turn(accumulated: Dict[str, Any]) -> bool:
+    """判断本次请求是否应写入会话历史（fix-keyword-history-pollution）
+
+    仅当非反问挂起且产出了最终 SQL 时才写会话。拒答 / fail-fast 早退 /
+    SmartFix 失败等无 final_sql 的轮次不入会话，避免无结果历史污染后续
+    follow-up 的关键词提取与理解。
+
+    Args:
+        accumulated: graph.stream 累积的最终 state 片段
+
+    Returns:
+        True 表示应调用 session.add_turn
+    """
+    if accumulated.get("__interrupted__"):
+        return False
+    return bool(accumulated.get("final_sql"))
 
 router = APIRouter()
 
@@ -121,7 +145,8 @@ async def query_endpoint(
         logger.exception(f"[query_id={query_id}] 加载数据库失败: {body.db_id}")
         raise HTTPException(status_code=500, detail=f"加载数据库失败: {e}")
 
-    # 4. 构建初始 state
+    # 4. 构建初始 state（resume 请求时不用 initial_state，改用 Command(resume=...)）
+    is_resume = body.resume is not None
     initial_state = create_initial_state(
         user_query=body.query,
         user_id=body.user_id,
@@ -131,8 +156,9 @@ async def query_endpoint(
     recent_turns = session.get_recent_turns(n=5)
     initial_state["conversation_history"] = [t for t in recent_turns]
     initial_state["metric_definitions"] = user_memory.get_metric_definitions(min_confidence=0.7)
-    initial_state["_user_memory"] = user_memory
-    initial_state["_session_memory"] = session
+    # 决策 12：_user_memory / _session_memory 是 Python 对象实例，不能放进 state
+    # （checkpointer 会序列化 state，对象不可 msgpack 序列化）。改用 ContextVar 传递，
+    # 在 run_graph 里 set；节点通过 get_user_memory_ctx() / get_session_memory_ctx() 取。
 
     async def event_stream() -> AsyncGenerator[str, None]:
         loop = asyncio.get_event_loop()
@@ -162,8 +188,27 @@ async def query_endpoint(
                 },
             }
             token = current_emitter.set(emitter)
+            um_token = current_user_memory.set(user_memory)
+            sm_token = current_session_memory.set(session)
+            fl_token = current_fix_loop.set(db_ctx.fix_loop) if db_ctx.fix_loop else None
             try:
-                for update in db_ctx.graph.stream(initial_state, config=config):
+                # 决策 12：resume 请求用 Command(resume=...) 恢复挂起的图；首次用 initial_state
+                from langgraph.types import Command
+                stream_input = Command(resume=body.resume) if is_resume else initial_state
+                for update in db_ctx.graph.stream(stream_input, config=config):
+                    # 检测反问中断（决策 12）：update 含 __interrupt__ → 推 clarification 事件
+                    if "__interrupt__" in update:
+                        interrupts = update["__interrupt__"]
+                        if interrupts:
+                            clarify_ctx = interrupts[0].value
+                            emitter.emit("clarification", {
+                                "question": clarify_ctx.get("question", "") if isinstance(clarify_ctx, dict) else str(clarify_ctx),
+                                "ambiguities": clarify_ctx.get("ambiguities", []) if isinstance(clarify_ctx, dict) else [],
+                                "round": clarify_ctx.get("round", 1) if isinstance(clarify_ctx, dict) else 1,
+                                "awaiting_answer": True,
+                            })
+                        accumulated["__interrupted__"] = True
+                        continue
                     # 累积到本地 state 字典（_wrap_node 已发 stage 事件，这里只攒结果）
                     for _, node_output in update.items():
                         if isinstance(node_output, dict):
@@ -173,6 +218,10 @@ async def query_endpoint(
                 emitter.emit("error", {"error": str(e)})
             finally:
                 current_emitter.reset(token)
+                current_user_memory.reset(um_token)
+                current_session_memory.reset(sm_token)
+                if fl_token is not None:
+                    current_fix_loop.reset(fl_token)
                 # sentinel 表示线程结束
                 try:
                     loop.call_soon_threadsafe(queue.put_nowait, sentinel)
@@ -214,42 +263,51 @@ async def query_endpoint(
             except Exception as e:
                 yield _format_sse("error", _with_qid({"error": str(e)}, query_id))
 
-            # 推送最终 result
-            rejection = accumulated.get("rejection_reason")
-            if rejection:
-                yield _format_sse("error", _with_qid({"error": rejection, "rejection": True}, query_id))
-            elif accumulated.get("final_sql"):
-                yield _format_sse("result", _with_qid({
-                    "sql": accumulated["final_sql"],
-                    "result": _serialize(accumulated.get("final_result")),
-                }, query_id))
+            # 推送最终 result（反问挂起时不推 result/rejection，前端已收 clarification 事件，等 resume）
+            if accumulated.get("__interrupted__"):
+                logger.info(f"[query_id={query_id}] 反问挂起，等待用户回答（resume）")
+            else:
+                rejection = accumulated.get("rejection_reason")
+                if rejection:
+                    yield _format_sse("error", _with_qid({"error": rejection, "rejection": True}, query_id))
+                elif accumulated.get("final_sql"):
+                    yield _format_sse("result", _with_qid({
+                        "sql": accumulated["final_sql"],
+                        "result": _serialize(accumulated.get("final_result")),
+                    }, query_id))
 
             # 更新会话历史
-            try:
-                turn_data = {
-                    "user_query": body.query,
-                    "final_sql": accumulated.get("final_sql", ""),
-                    "cache_hit": accumulated.get("cache_hit", False),
-                    "db_id": body.db_id,
-                }
-                if accumulated.get("error"):
-                    turn_data["error"] = accumulated["error"]
-                if accumulated.get("rejection_reason"):
-                    turn_data["rejection_reason"] = accumulated["rejection_reason"]
-                final_result = accumulated.get("final_result")
-                if isinstance(final_result, (list, tuple)) and final_result:
-                    first = final_result[0]
-                    columns = list(first.keys()) if hasattr(first, "keys") else []
-                    turn_data["result_meta"] = {
-                        "row_count": len(final_result),
-                        "columns": columns,
+            # 更新会话历史（反问挂起时跳过，等 resume 完成后再写）
+            # fix-keyword-history-pollution：拒答/未产出 final_sql 的轮次不入会话，
+            # 避免无结果历史污染后续 follow-up 的关键词提取与理解
+            if _should_write_session_turn(accumulated):
+                try:
+                    turn_data = {
+                        "user_query": body.query,
+                        "final_sql": accumulated.get("final_sql", ""),
+                        "cache_hit": accumulated.get("cache_hit", False),
+                        "db_id": body.db_id,
                     }
-                session.add_turn(turn_data)
-            except Exception as e:
-                logger.warning(f"[query_id={query_id}] 更新会话历史失败: {e}")
+                    if accumulated.get("error"):
+                        turn_data["error"] = accumulated["error"]
+                    if accumulated.get("rejection_reason"):
+                        turn_data["rejection_reason"] = accumulated["rejection_reason"]
+                    final_result = accumulated.get("final_result")
+                    if isinstance(final_result, (list, tuple)) and final_result:
+                        first = final_result[0]
+                        columns = list(first.keys()) if hasattr(first, "keys") else []
+                        turn_data["result_meta"] = {
+                            "row_count": len(final_result),
+                            "columns": columns,
+                        }
+                    session.add_turn(turn_data)
+                except Exception as e:
+                    logger.warning(f"[query_id={query_id}] 更新会话历史失败: {e}")
 
             done_payload = _with_qid({
                 "has_result": bool(accumulated.get("final_sql")),
+                # 决策 12：反问挂起标记，前端据此等待用户回答后发 resume 请求
+                "awaiting_clarification": bool(accumulated.get("__interrupted__")),
                 # 决策 51：暴露失败标记、决策路径、修复轮次给前端
                 "fix_failed": accumulated.get("fix_failed", False),
                 "decision_path": accumulated.get("decision_path", ""),

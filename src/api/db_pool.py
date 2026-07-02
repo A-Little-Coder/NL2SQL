@@ -70,6 +70,12 @@ class Globals:
     history_cache: Any
     memory_updater: Any
     data_dir: str  # data/ 根目录，用于定位 db 文件
+    session_retriever: Any = None
+    # 反问机制（决策 9-15）；None 时不启用反问，主图退化为直接 EXECUTE
+    task_planner: Any = None
+    dialog_manager: Any = None
+    checkpointer: Any = None  # InMemorySaver 单例，interrupt 恢复依赖
+    summarizer: Any = None    # ResultSummarizer，多意图结果汇总（决策 15）
 
 
 def _prepare_lsh_indexer(db_directory: str) -> Optional[LSHIndexer]:
@@ -217,6 +223,26 @@ class DbContextPool:
         executor = SQLExecutor(db_connector=connector)
         fix_loop = SQLFixLoop(executor=executor, llm_client=g.llm_client, max_retries=3)
 
+        # 单查询流水线编译图（refactor-single-query-graph）：主图与 orchestrator 共用同一实例
+        from src.graph.single_query_graph import build_single_query_graph
+        single_query_graph = build_single_query_graph(
+            retriever=retriever,
+            selector=selector,
+            generator=g.generator,
+            fix_loop=fix_loop,
+            decider=g.decider,
+            answerability_checker=g.answerability_checker,
+        )
+
+        # 多意图编排器（决策 14）：持有同一 single_query_graph 实例串行编排
+        orchestrator = None
+        if g.task_planner is not None:
+            try:
+                from src.clarification.subquery_orchestrator import SubqueryOrchestrator
+                orchestrator = SubqueryOrchestrator(single_query_graph)
+            except Exception as e:
+                logger.warning(f"SubqueryOrchestrator 构造失败，多意图降级: {e}")
+
         graph = build_main_graph(
             retriever=retriever,
             selector=selector,
@@ -226,6 +252,12 @@ class DbContextPool:
             answerability_checker=g.answerability_checker,
             history_cache=g.history_cache,
             memory_updater=g.memory_updater,
+            task_planner=g.task_planner,
+            dialog_manager=g.dialog_manager,
+            checkpointer=g.checkpointer,
+            orchestrator=orchestrator,
+            summarizer=g.summarizer,
+            single_query_graph=single_query_graph,
         )
 
         return DbContext(

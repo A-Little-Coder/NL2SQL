@@ -7,9 +7,30 @@
 #   - MemoryUpdater: 自动学习（指标定义、常用表、查询偏好）
 
 from .storage import Storage
-from .user_memory import UserMemory
+from .user_memory import UserMemory, ALLOWED_TOPICS
+from .session_recall import (
+    ChromaSessionQueryIndex,
+    HistoricalSQLReference,
+    HybridSessionRetriever,
+    JsonConversationStore,
+    LocalBM25Retriever,
+    QueryRecallIndex,
+    RRFRanker,
+    SessionQueryMemory,
+    SessionRecallConfig,
+)
 
 __all__ = [
     "Storage",
     "UserMemory",
+    "ALLOWED_TOPICS",
+    "SessionRecallConfig",
+    "SessionQueryMemory",
+    "HistoricalSQLReference",
+    "QueryRecallIndex",
+    "ChromaSessionQueryIndex",
+    "JsonConversationStore",
+    "LocalBM25Retriever",
+    "RRFRanker",
+    "HybridSessionRetriever",
 ]

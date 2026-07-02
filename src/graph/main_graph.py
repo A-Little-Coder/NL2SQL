@@ -22,21 +22,36 @@ NL2SQL 主图：串联 IR → (Clarification) → SS → AnswerabilityCheck → 
 Clarification 节点本期占位（pass-through），Phase 2 接入。
 """
 
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, List
 
 from langgraph.graph import END, START, StateGraph
 from loguru import logger
 
 from src.graph.state import NL2SQLState
+from src.clarification.dialog import DialogManager
 
 # 流式 SSE 基础设施（决策 50）；导入失败时退化为静默
 try:
-    from src.api.streaming import current_node, emit_safe
+    from src.api.streaming import (
+        current_node,
+        emit_safe,
+        get_user_memory_ctx,
+        get_session_memory_ctx,
+        current_fix_loop,
+    )
 except Exception:  # pragma: no cover - 无 API 模块时（如离线脚本）
     current_node = None  # type: ignore
 
     def emit_safe(event_type, data):  # type: ignore
         return
+
+    def get_user_memory_ctx():  # type: ignore
+        return None
+
+    def get_session_memory_ctx():  # type: ignore
+        return None
+
+    current_fix_loop = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -97,24 +112,42 @@ def make_history_cache_node(history_cache) -> Callable[[NL2SQLState], Dict[str, 
                 "trace_log": state.get("trace_log", []) + ["[HistoryCache] disabled"],
             }
 
-        session_memory = state.get("_session_memory")
-        user_memory = state.get("_user_memory")
+        session_memory = get_session_memory_ctx()
+        user_memory = get_user_memory_ctx()
         conversation_history = state.get("conversation_history", [])
         metric_definitions = state.get("metric_definitions", [])
 
+        user_id = state.get("user_id", "")
+        session_id = getattr(session_memory, "session_id", "") if session_memory is not None else ""
+        db_id = state.get("database_filter", "") or ""
+        recalled_refs = []
+        if user_id and session_id and db_id and hasattr(history_cache, "recall_session_history"):
+            recalled_refs = history_cache.recall_session_history(
+                state["user_query"],
+                user_id=user_id,
+                session_id=session_id,
+                db_id=db_id,
+            )
+
+        recalled_history = [ref.to_turn() for ref in recalled_refs]
+        check_history = recalled_history or conversation_history
+
         result = history_cache.check(
             user_query=state["user_query"],
-            session_history=conversation_history,
+            session_history=check_history,
             metric_definitions=metric_definitions,
         )
+
+        historical_sql_refs = [] if result.hit else [ref.to_dict() for ref in recalled_refs]
 
         out: Dict[str, Any] = {
             "cache_hit": result.hit,
             "cached_sql": result.cached_sql,
             "cache_source": result.source,
             "cache_confidence": result.confidence,
+            "historical_sql_refs": historical_sql_refs,
             "trace_log": state.get("trace_log", [])
-                         + [f"[HistoryCache] hit={result.hit}, source={result.source}, confidence={result.confidence}"],
+                         + [f"[HistoryCache] hit={result.hit}, source={result.source}, confidence={result.confidence}, recalled={len(recalled_refs)}"],
         }
         # 决策 50：业务事件
         emit_safe("cache_check", {
@@ -122,6 +155,8 @@ def make_history_cache_node(history_cache) -> Callable[[NL2SQLState], Dict[str, 
             "source": result.source,
             "confidence": result.confidence,
             "cached_sql": result.cached_sql,
+            "recalled": len(recalled_refs),
+            "historical_sql_refs": historical_sql_refs,
         })
         return out
 
@@ -137,8 +172,8 @@ def make_memory_update_node(updater) -> Callable[[NL2SQLState], Dict[str, Any]]:
                 "trace_log": state.get("trace_log", []) + ["[MemoryUpdate] disabled"],
             }
 
-        session_memory = state.get("_session_memory")
-        user_memory = state.get("_user_memory")
+        session_memory = get_session_memory_ctx()
+        user_memory = get_user_memory_ctx()
 
         if user_memory is not None and session_memory is not None:
             updater.update(user_memory, session_memory, state)
@@ -148,6 +183,126 @@ def make_memory_update_node(updater) -> Callable[[NL2SQLState], Dict[str, Any]]:
         }
 
     return node
+
+
+def make_run_subqueries_node(orchestrator) -> Callable[[NL2SQLState], Dict[str, Any]]:
+    """构造 run_subqueries 节点（决策 14）：多意图时串行执行所有子查询
+
+    orchestrator 为 None 或单意图时不触发（单意图走主图线性 ir→ss→...→decision）。
+    """
+
+    def node(state: NL2SQLState) -> Dict[str, Any]:
+        qid = state.get("query_id", "")
+        subqueries = state.get("subqueries", [])
+        plan = state.get("plan_result") or {}
+
+        # 单意图不走 orchestrator（由条件边保证，此处兜底）
+        if orchestrator is None or plan.get("intent_type") != "multi" or len(subqueries) <= 1:
+            return {
+                "trace_log": state.get("trace_log", []) + ["[RunSubqueries] skipped (single)"],
+            }
+
+        logger.info(f"[qid={qid}] 多意图执行: {len(subqueries)} 个子查询")
+        emit_safe("stage", {"node": "run_subqueries", "subqueries": subqueries})
+
+        shared_state = {
+            "database_filter": state.get("database_filter"),
+            "conversation_history": state.get("conversation_history", []),
+            "metric_definitions": state.get("metric_definitions", []),
+            "historical_sql_refs": state.get("historical_sql_refs", []),
+            "_user_memory": get_user_memory_ctx(),
+        }
+        results = orchestrator.run(subqueries, shared_state=shared_state)
+
+        subquery_dicts = [r.to_dict() for r in results]
+        # 多结果汇总：取第一个成功结果作为主 final_sql/final_result（aggregate_results 会做完整汇总）
+        primary = next((r for r in results if r.success), None)
+
+        emit_safe("final_decision", {
+            "multi_intent": True,
+            "subquery_count": len(results),
+            "success_count": sum(1 for r in results if r.success),
+        })
+
+        return {
+            "subquery_results": subquery_dicts,
+            "final_sql": primary.final_sql if primary else "",
+            "final_result": primary.final_result if primary else None,
+            "final_decision": None,  # 多意图无单一 decision
+            "decision_path": "MULTI",
+            "trace_log": state.get("trace_log", []) + [
+                f"[RunSubqueries] {sum(1 for r in results if r.success)}/{len(results)} 成功"
+            ],
+        }
+
+    return node
+
+
+def make_aggregate_results_node(summarizer=None) -> Callable[[NL2SQLState], Dict[str, Any]]:
+    """构造 aggregate_results 节点（决策 15）：结果汇总
+
+    - 单结果无表 → 直接透传，不调 LLM
+    - 多结果 / 有表 → 调 ResultSummarizer 汇总（数据表用结构摘要降 token）
+    summarizer 为 None 时退化为简单拼接。
+    """
+
+    def node(state: NL2SQLState) -> Dict[str, Any]:
+        subquery_results = state.get("subquery_results", [])
+
+        # 非多意图场景：无 subquery_results，直接透传（single 走 decision 已有 final_sql）
+        if not subquery_results:
+            return {
+                "trace_log": state.get("trace_log", []) + ["[Aggregate] no subquery results, passthrough"],
+            }
+
+        # 单结果且无表 → 透传不调 LLM（决策 15 按需）
+        if len(subquery_results) == 1 and not _has_table_data(subquery_results[0]):
+            single = subquery_results[0]
+            summary = single.get("final_sql", "")
+            logger.info("[Aggregate] 单结果无表，透传不调 LLM")
+            return {
+                "summary_text": summary,
+                "trace_log": state.get("trace_log", []) + ["[Aggregate] single passthrough"],
+            }
+
+        # 多结果 / 有表 → 调 summarizer
+        if summarizer is not None:
+            try:
+                summary = summarizer.summarize(
+                    subquery_results=subquery_results,
+                    user_query=state.get("user_query", ""),
+                )
+            except Exception as e:
+                logger.error(f"[Aggregate] summarizer 失败，降级拼接: {e}")
+                summary = _fallback_summary(subquery_results)
+        else:
+            summary = _fallback_summary(subquery_results)
+
+        return {
+            "summary_text": summary,
+            "trace_log": state.get("trace_log", []) + ["[Aggregate] summarized"],
+        }
+
+    return node
+
+
+def _has_table_data(subquery_result: Dict[str, Any]) -> bool:
+    """判断子查询结果是否为数据表（多行多列）。"""
+    final_result = subquery_result.get("final_result")
+    if isinstance(final_result, list):
+        return len(final_result) > 0
+    return False
+
+
+def _fallback_summary(subquery_results: List[Dict[str, Any]]) -> str:
+    """summarizer 不可用时的降级汇总（简单拼接）。"""
+    parts = []
+    for i, r in enumerate(subquery_results, 1):
+        if r.get("success"):
+            parts.append(f"子查询{i}：{r.get('subquery', '')} → {r.get('final_sql', '')}")
+        else:
+            parts.append(f"子查询{i}：{r.get('subquery', '')} → 失败（{r.get('error', '')}）")
+    return "\n".join(parts)
 
 
 def make_ir_node(retriever) -> Callable[[NL2SQLState], Dict[str, Any]]:
@@ -220,19 +375,112 @@ def _summarize_schema(ctx) -> dict:
     return summary
 
 
-def make_clarification_node() -> Callable[[NL2SQLState], Dict[str, Any]]:
+def make_task_planner_node(task_planner, dialog_manager=None) -> Callable[[NL2SQLState], Dict[str, Any]]:
     """
-    Clarification 节点占位（Phase 2 接入）
+    构造 TaskPlanner 节点（决策 9-13）：IR 之前的意图理解 + 三选一裁决
 
-    本期默认设置 clarification_done=True 让流程继续；
-    Phase 2 时替换为 ClarificationAgent.build_graph() 调用。
+    三选一：
+      - EXECUTE：意图清晰 → 写 subqueries，放行执行
+      - CLARIFY：表述歧义 → 调 DialogManager.ask() interrupt 暂停等用户回答
+                  → resume 后在节点内带澄清上下文重新 plan，直到定论或达上限/拒答
+      - REJECT：拒答 → 设 rejection_reason，主图走 END
+
+    设计：CLARIFY 的"重新裁决"在节点内完成（while 循环），不依赖条件边回环，
+    避免额外的 state 字段。条件边只按 verdict 分流（reject→END / 其余→ir）。
+
+    Args:
+        task_planner: TaskPlanner 实例（None 时退化为直接 EXECUTE 单意图）
+        dialog_manager: DialogManager 实例（CLARIFY 时用；None 时无法反问，CLARIFY 降级执行）
     """
 
     def node(state: NL2SQLState) -> Dict[str, Any]:
-        return {
-            "clarification_done": True,
-            "trace_log": state.get("trace_log", []) + ["[Clarification] skipped"],
-        }
+        qid = state.get("query_id", "")
+        user_query = state["user_query"]
+        round_now = state.get("clarify_round", 0)
+        trace = state.get("trace_log", [])
+
+        # task_planner 未启用 → 直接 EXECUTE 单意图（向后兼容）
+        if task_planner is None:
+            return {
+                "plan_result": {"verdict": "execute", "intent_type": "single"},
+                "subqueries": [user_query],
+                "clarification_done": True,
+                "trace_log": trace + ["[TaskPlanner] disabled, single execute"],
+            }
+
+        # 1. 首次裁决
+        clarified = None
+        plan = task_planner.plan(
+            user_query=user_query,
+            conversation_history=state.get("conversation_history", []),
+            db_id=state.get("database_filter"),
+            clarified=clarified,
+        )
+
+        # 2. CLARIFY 循环：interrupt 反问 → 带回答重新 plan，直到定论/达上限/拒答
+        while plan.verdict == "clarify":
+            # dialog_manager 未提供 → 无法反问，降级执行
+            if dialog_manager is None:
+                logger.warning(f"[qid={qid}] CLARIFY 但无 DialogManager，降级执行")
+                plan = None
+                break
+
+            # 调 interrupt（首次挂起；resume 返回用户回答或 DECLINED/MAX_REACHED 信号）
+            answer = dialog_manager.ask(
+                clarify_question=plan.clarify_question,
+                clarify_round=round_now,
+                ambiguities=plan.ambiguities,
+            )
+
+            # 达上限 / 拒答 → 降级执行（用原始 query 最佳猜测）
+            if DialogManager.is_declined_signal(answer):
+                logger.info(f"[qid={qid}] 反问结束({answer})，降级执行")
+                trace = trace + [f"[TaskPlanner] clarify ended: {answer}"]
+                emit_safe("clarification", {"verdict": "clarify_ended", "signal": answer})
+                plan = None
+                break
+
+            # 用户有效回答 → 轮次 +1，带回答重新 plan
+            round_now += 1
+            clarified = answer
+            trace = trace + [f"[TaskPlanner] clarified round {round_now}: {answer[:50]}"]
+            emit_safe("clarification", {"verdict": "clarify", "answer": answer, "round": round_now})
+            plan = task_planner.plan(
+                user_query=user_query,
+                conversation_history=state.get("conversation_history", []),
+                db_id=state.get("database_filter"),
+                clarified=clarified,
+            )
+
+        # 3. 汇总输出
+        out: Dict[str, Any] = {"clarify_round": round_now}
+
+        # 降级执行（plan 被 None 化：无 dialog 或反问结束）
+        if plan is None or plan.verdict == "clarify":
+            out["plan_result"] = {"verdict": "execute", "intent_type": "single", "degraded": True}
+            out["subqueries"] = [user_query]
+            out["clarification_done"] = True
+            out["trace_log"] = trace + ["[TaskPlanner] degraded execute"]
+            return out
+
+        out["plan_result"] = plan.to_dict()
+        out["clarify_question"] = plan.clarify_question
+
+        # REJECT → 拒答（拒答信息走 error 事件 + rejection_reason，不发 clarification）
+        if plan.verdict == "reject":
+            out["rejection_reason"] = plan.reject_reason
+            out["error"] = f"拒答: {plan.reject_reason}"
+            out["clarification_done"] = True
+            out["trace_log"] = trace + [f"[TaskPlanner] reject: {plan.reject_reason}"]
+            return out
+
+        # EXECUTE → 写 subqueries 放行（意图信息随 stage done 透传，不发 clarification）
+        out["subqueries"] = plan.subqueries or [user_query]
+        out["clarification_done"] = True
+        out["trace_log"] = trace + [
+            f"[TaskPlanner] execute ({plan.intent_type}): {len(out['subqueries'])} subqueries"
+        ]
+        return out
 
     return node
 
@@ -316,9 +564,10 @@ def make_cg_node(generator) -> Callable[[NL2SQLState], Dict[str, Any]]:
         result = sub.invoke({
             "user_query": state["user_query"],
             "selected_schema": schema,
-            "query_preferences": state.get("_user_memory").get_query_preferences()
-                                  if state.get("_user_memory") else {},
+            "query_preferences": get_user_memory_ctx().get_query_preferences()
+                                  if get_user_memory_ctx() else {},
             "metric_definitions": state.get("metric_definitions", []),
+            "historical_sql_refs": state.get("historical_sql_refs", []),
         })
         candidates = result.get("sql_candidates", [])
 
@@ -459,11 +708,17 @@ def make_decision_node(decider, fix_loop=None) -> Callable[[NL2SQLState], Dict[s
             "user_query": state["user_query"],
             "schema_text": state.get("schema_text", ""),
             "mschema": state.get("selected_schema", []),
+            # 决策 12：fix_loop 不进 state（checkpointer 序列化 SQLFixLoop 会报错），
+            # 改用 ContextVar 传递，decision 子图节点从 get_fix_loop_ctx() 取
         }
-        if fix_loop is not None:
-            sub_input["fix_loop"] = fix_loop
 
-        result = sub.invoke(sub_input)
+        # set ContextVar 供 decision 子图 SmartFix 节点使用（per-db fix_loop）
+        fl_token = current_fix_loop.set(fix_loop) if fix_loop is not None else None
+        try:
+            result = sub.invoke(sub_input)
+        finally:
+            if fl_token is not None:
+                current_fix_loop.reset(fl_token)
         decision = result.get("final_decision")
 
         out: Dict[str, Any] = {
@@ -521,6 +776,31 @@ def make_decision_node(decider, fix_loop=None) -> Callable[[NL2SQLState], Dict[s
     return node
 
 
+def make_run_single_query_node(single_query_graph) -> Callable[[NL2SQLState], Dict[str, Any]]:
+    """构造 run_single_query 节点（refactor-single-query-graph）
+
+    invoke 编译好的 single_query_graph，把其产出的 partial NL2SQLState
+    （final_sql / final_result / decision_path / rejection_reason / error 等）
+    合并回主图 state。单意图路径、cache 命中路径共用此节点。
+
+    单查询流水线胶水（ir/ss/cg/execution/decision 的顺序与 fail-fast）只存在于
+    single_query_graph 一处，主图与 orchestrator 不再平行重写。
+    """
+
+    def node(state: NL2SQLState) -> Dict[str, Any]:
+        qid = state.get("query_id", "")
+        # 子图在同线程内 invoke，ContextVar（fix_loop/user_memory/session_memory）
+        # 对子图各节点天然可见，无需额外传递
+        out = single_query_graph.invoke(state) or {}
+        logger.info(
+            f"[qid={qid}] [RunSingleQuery] decision_path={out.get('decision_path')!r} "
+            f"fix_failed={out.get('fix_failed', False)} has_sql={bool(out.get('final_sql'))}"
+        )
+        return out
+
+    return node
+
+
 # ---------------------------------------------------------------------------
 # 主图构建
 # ---------------------------------------------------------------------------
@@ -535,116 +815,108 @@ def build_main_graph(
     answerability_checker=None,
     history_cache=None,
     memory_updater=None,
+    task_planner=None,
+    dialog_manager=None,
+    checkpointer=None,
+    orchestrator=None,
+    summarizer=None,
+    single_query_graph=None,
 ):
     """
-    构造并编译 NL2SQL 主图
+    构造并编译 NL2SQL 主图（refactor-single-query-graph 后瘦身版）
+
+    主图只负责「分流 + 记忆」：history_cache → task_planner →
+    (run_single_query | run_subqueries | END) → memory_update。
+    单查询流水线 ir/ss/cg/execution/decision 已下沉到 single_query_graph。
 
     Args:
-        retriever: InformationRetrieval 实例（须实现 build_graph()）
-        selector: SchemaSelector 实例
-        generator: SQLGenerator 实例
-        fix_loop: SQLFixLoop 实例
-        decider: SelfConsistencyDecision 实例
+        retriever/selector/generator/fix_loop/decider: Agent 实例（用于在
+            single_query_graph 未传入时内部编译；显式传入 single_query_graph 时仍需保留以兼容）
         answerability_checker: AnswerabilityChecker 实例（决策 23，可选）
         history_cache: HistoryCache 实例（决策 30，可选；None 时跳过）
         memory_updater: MemoryUpdater 实例（决策 29，可选；None 时跳过）
+        task_planner: TaskPlanner 实例（决策 9，可选；None 时退化为直接 EXECUTE 单意图）
+        dialog_manager: DialogManager 实例（决策 12/13，可选；CLARIFY 反问用）
+        checkpointer: LangGraph checkpointer（决策 12；interrupt 必需，None 时不启用持久化）
+        orchestrator: SubqueryOrchestrator 实例（决策 14，可选；多意图串行编排）
+        summarizer: ResultSummarizer 实例（决策 15，可选；多结果汇总）
+        single_query_graph: 已编译的单查询流水线图（refactor-single-query-graph）。
+            None 时内部用 retriever/selector/... 自动编译，向后兼容旧调用方式。
 
     Returns:
         CompiledGraph: 已编译主图，可调用 .invoke(initial_state)
     """
-    graph = StateGraph(NL2SQLState)
-
-    # 新增节点：历史命中检测（START 之后，IR 之前）
-    graph.add_node("history_cache", _wrap_node("history_cache", make_history_cache_node(history_cache)))
-    graph.add_node("ir", _wrap_node("ir", make_ir_node(retriever)))
-    graph.add_node("clarification", _wrap_node("clarification", make_clarification_node()))
-    graph.add_node("ss", _wrap_node("ss", make_ss_node(selector)))
-
-    # 可回答性检查节点（决策 23）：SS 之后、CG 之前
-    if answerability_checker is not None:
-        graph.add_node(
-            "answerability_check",
-            _wrap_node(
-                "answerability_check",
-                make_answerability_check_node(answerability_checker),
-            ),
+    # single_query_graph 未显式注入时，内部编译（向后兼容 build_main_graph(r,s,g,f,d) 旧调用）
+    if single_query_graph is None:
+        from src.graph.single_query_graph import build_single_query_graph
+        single_query_graph = build_single_query_graph(
+            retriever=retriever,
+            selector=selector,
+            generator=generator,
+            fix_loop=fix_loop,
+            decider=decider,
+            answerability_checker=answerability_checker,
         )
 
-    graph.add_node("cg", _wrap_node("cg", make_cg_node(generator)))
-    graph.add_node("execution", _wrap_node("execution", make_execution_node(fix_loop)))
-    graph.add_node("decision", _wrap_node("decision", make_decision_node(decider, fix_loop=fix_loop)))
+    graph = StateGraph(NL2SQLState)
 
-    # 新增节点：记忆自动学习（decision 之后，END 之前）
+    # 节点：历史命中检测（START 之后）
+    graph.add_node("history_cache", _wrap_node("history_cache", make_history_cache_node(history_cache)))
+    # 节点：TaskPlanner 意图理解（决策 9，IR 之前）
+    graph.add_node("task_planner", _wrap_node("task_planner", make_task_planner_node(task_planner, dialog_manager)))
+    # 节点：单查询流水线（ir/ss/cg/execution/decision 下沉至此，refactor-single-query-graph）
+    graph.add_node("run_single_query", _wrap_node("run_single_query", make_run_single_query_node(single_query_graph)))
+
+    # 多意图编排 + 结果总结（决策 14/15）
+    graph.add_node("run_subqueries", _wrap_node("run_subqueries", make_run_subqueries_node(orchestrator)))
+    graph.add_node("aggregate_results", _wrap_node("aggregate_results", make_aggregate_results_node(summarizer)))
+
+    # 记忆自动学习（流水线之后，END 之前）
     graph.add_node("memory_update", _wrap_node("memory_update", make_memory_update_node(memory_updater)))
 
     # 入口 → history_cache
     graph.add_edge(START, "history_cache")
 
-    # HistoryCache 条件分支：命中 → execution（复用缓存 SQL）；否则 → ir
+    # HistoryCache 条件分支（refactor-single-query-graph）：
+    #   命中 → run_single_query（跳过 task_planner；cache 短路在子图入口直奔 execution）
+    #   未命中 → task_planner
     def route_after_cache(state: NL2SQLState) -> str:
         if state.get("cache_hit", False):
-            return "execution"
-        return "ir"
+            return "run_single_query"
+        return "task_planner"
 
     graph.add_conditional_edges(
         "history_cache",
         route_after_cache,
-        {"ir": "ir", "execution": "execution"},
+        {"task_planner": "task_planner", "run_single_query": "run_single_query"},
     )
-    graph.add_edge("ir", "clarification")
 
-    # Clarification 条件分支：done → SS，否则循环回自身（Phase 2 实装）
-    def route_after_clarification(state: NL2SQLState) -> str:
-        return "ss" if state.get("clarification_done", True) else "clarification"
+    # TaskPlanner 三选一条件分支（决策 9/14）：
+    #   REJECT → END（拒答）
+    #   EXECUTE single → run_single_query（单查询流水线）
+    #   EXECUTE multi → run_subqueries（多意图 orchestrator 串行编排）
+    def route_after_planner(state: NL2SQLState) -> str:
+        plan = state.get("plan_result") or {}
+        if plan.get("verdict") == "reject":
+            return END
+        if plan.get("intent_type") == "multi" and len(state.get("subqueries", [])) > 1:
+            return "run_subqueries"
+        return "run_single_query"
 
     graph.add_conditional_edges(
-        "clarification",
-        route_after_clarification,
-        {"ss": "ss", "clarification": "clarification"},
+        "task_planner",
+        route_after_planner,
+        {"run_single_query": "run_single_query", "run_subqueries": "run_subqueries", END: END},
     )
 
-    # SS 后：无 schema → END；有 schema → answerability_check 或 CG
-    if answerability_checker is not None:
-        def route_after_ss(state: NL2SQLState) -> str:
-            if not state.get("selected_schema"):
-                return END
-            return "answerability_check"
-
-        graph.add_conditional_edges(
-            "ss", route_after_ss,
-            {"answerability_check": "answerability_check", END: END},
-        )
-
-        # 可回答性检查条件分支（决策 23）：false → END（拒答），否则 → CG
-        def route_after_answerability(state: NL2SQLState) -> str:
-            check = state.get("answerability_result")
-            if check and check.get("answerable") == "false":
-                return END
-            return "cg"
-
-        graph.add_conditional_edges(
-            "answerability_check",
-            route_after_answerability,
-            {"cg": "cg", END: END},
-        )
-    else:
-        def route_after_ss(state: NL2SQLState) -> str:
-            return "cg" if state.get("selected_schema") else END
-
-        graph.add_conditional_edges(
-            "ss", route_after_ss, {"cg": "cg", END: END},
-        )
-
-    # CG 后：无候选直接结束
-    def route_after_cg(state: NL2SQLState) -> str:
-        return "execution" if state.get("sql_candidates") else END
-
-    graph.add_conditional_edges(
-        "cg", route_after_cg, {"execution": "execution", END: END}
-    )
-
-    graph.add_edge("execution", "decision")
-    graph.add_edge("decision", "memory_update")
+    # 单查询路径：run_single_query → memory_update
+    graph.add_edge("run_single_query", "memory_update")
+    # 多意图路径：run_subqueries → aggregate_results → memory_update（决策 14/15）
+    graph.add_edge("run_subqueries", "aggregate_results")
+    graph.add_edge("aggregate_results", "memory_update")
     graph.add_edge("memory_update", END)
 
+    # 决策 12：启用 task_planner 反问时必须配 checkpointer（interrupt 恢复依赖它）
+    if checkpointer is not None:
+        return graph.compile(checkpointer=checkpointer).with_config(run_name="nl2sql-pipeline")
     return graph.compile().with_config(run_name="nl2sql-pipeline")

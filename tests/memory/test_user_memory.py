@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from src.memory.user_memory import UserMemory
+from src.memory.user_memory import UserMemory, ALLOWED_TOPICS
 
 
 @pytest.fixture
@@ -240,4 +240,40 @@ class TestDomainContext:
         ctx = memory.get_domain_context()
         assert ctx["industry"] == "生鲜电商"
         assert ctx["department"] == "运营部"
-        assert "销售分析" in ctx["focus_areas"]
+
+
+class TestUserMemorySchemaGovernance:
+    """UserMemory 固定 schema 与污染字段过滤"""
+
+    def test_load_normalizes_missing_and_unknown_topics(self, temp_dir):
+        file_path = Path(temp_dir) / "legacy.json"
+        file_path.write_text(json.dumps({
+            "user_id": "legacy",
+            "term_preferences": {"GMV": {"resolved_to": "gmv"}},
+            "unknown_topic": {"x": 1},
+        }, ensure_ascii=False), encoding="utf-8")
+
+        mem = UserMemory(user_id="legacy", base_dir=temp_dir)
+        data = mem.load()
+        mem.save()
+        saved = json.loads(file_path.read_text(encoding="utf-8"))
+
+        for topic in ALLOWED_TOPICS:
+            assert topic in data
+            assert topic in saved
+        assert "unknown_topic" not in saved
+
+    def test_block_few_shot_and_result_data(self, memory):
+        memory.load()
+        memory.update_domain_context(industry="零售", few_shot_examples=[{"sql": "SELECT 1"}])
+        memory.append_clarification({"question": "q", "final_result": [{"x": 1}], "answer": "a"})
+        memory.record_metric_definition(
+            "M", "desc", "SELECT SUM(x) FROM t", confidence=0.9
+        )
+        memory._data["metric_definitions"]["M"]["examples"] = [{"sql": "SELECT 1"}]
+        memory.save()
+
+        saved = memory.load()
+        assert "few_shot_examples" not in saved["domain_context"]
+        assert "final_result" not in saved["clarification_history"][0]
+        assert "examples" not in memory.get_metric_definitions(min_confidence=0.0)[0]

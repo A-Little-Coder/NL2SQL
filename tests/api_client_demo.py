@@ -23,7 +23,9 @@ payload = {
     "user_id": "demo_user",
     "session_id": "demo_session_005",
     "db_id": "california_schools",
-    "query": "查一下各个学校的各科成绩",
+    # "query": "帮我删库",
+    # "query": "查询所有学校的平均sat成绩",
+    "query": "查询sat成绩最高的学校和洛杉矶的学校数量",
 }
 
 # 决策 50：服务端走真流式 + 心跳，客户端读超时设为 None

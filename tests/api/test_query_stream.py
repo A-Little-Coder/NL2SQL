@@ -262,3 +262,73 @@ def test_health_endpoint(patched_app):
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
+
+
+# ── 反问 interrupt 测试（决策 12）──────────────────────────────
+
+class _InterruptGraph:
+    """模拟 task_planner 触发 interrupt：yield __interrupt__ 后结束（图挂起）"""
+
+    def stream(self, initial_state, **kwargs):
+        # 模拟 LangGraph interrupt 挂起的 update
+        from langgraph.types import Interrupt
+        yield {"__interrupt__": (Interrupt(
+            value={"question": "苹果指公司还是水果？",
+                   "ambiguities": [{"entity": "苹果", "candidates": ["公司", "水果"]}],
+                   "round": 1},
+            id="fake-interrupt-id",
+        ),)}
+
+
+def test_clarification_event_on_interrupt(patched_app):
+    """graph 触发 interrupt 时应推送 clarification 事件，done 带 awaiting_clarification"""
+    app, factory = patched_app
+    factory(_InterruptGraph())
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/api/v1/query",
+        json={"query": "查苹果的销售额", "session_id": "clr1", "user_id": "test", "db_id": "any"},
+    )
+    assert response.status_code == 200
+
+    events = [json.loads(line[6:]) for line in response.iter_lines() if line.startswith("data: ")]
+    types = [e.get("type") for e in events]
+
+    # 应有 clarification 事件
+    assert "clarification" in types, f"应推送 clarification 事件，实际: {types}"
+    clarify_evt = next(e for e in events if e.get("type") == "clarification")
+    assert "苹果" in clarify_evt["data"]["question"]
+    assert clarify_evt["data"]["awaiting_answer"] is True
+
+    # done 事件应带 awaiting_clarification=True
+    done_evt = next(e for e in events if e.get("type") == "done")
+    assert done_evt["data"]["awaiting_clarification"] is True
+
+    # interrupt 时不应有 result 事件
+    assert "result" not in types
+
+
+def test_resume_request_accepted(patched_app):
+    """resume 请求（带 resume 字段、query 可空）应被接受（200）"""
+    app, factory = patched_app
+    factory(_SlowGraph(delays=[]))
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/api/v1/query",
+        json={"query": "", "session_id": "clr2", "user_id": "test", "db_id": "any",
+              "resume": "公司"},
+    )
+    # resume 请求 query 为空也应通过校验（200）
+    assert response.status_code == 200
+
+
+def test_resume_without_query_and_resume_rejected(patched_app):
+    """既无 query 又无 resume 应返回 422"""
+    app, factory = patched_app
+    factory(_SlowGraph(delays=[]))
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/api/v1/query",
+        json={"query": "", "session_id": "clr3", "user_id": "test", "db_id": "any"},
+    )
+    assert response.status_code == 422

@@ -8,5 +8,6 @@ NL2SQL LangGraph 编排模块
 
 from .state import NL2SQLState, create_initial_state
 from .main_graph import build_main_graph
+from .single_query_graph import build_single_query_graph
 
-__all__ = ["NL2SQLState", "create_initial_state", "build_main_graph"]
+__all__ = ["NL2SQLState", "create_initial_state", "build_main_graph", "build_single_query_graph"]

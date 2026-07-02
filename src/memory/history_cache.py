@@ -25,15 +25,37 @@ class CacheResult:
 
 # Prompt 已迁移至 src/memory/prompts.py
 from src.memory.prompts import CACHE_CHECK_PROMPT
+from src.memory.session_recall import HistoricalSQLReference
 
 
 class HistoryCache:
     """历史命中检测器"""
 
-    def __init__(self, llm_client, min_confidence: float = 0.8):
+    def __init__(self, llm_client, min_confidence: float = 0.8, session_retriever=None):
         self._llm = llm_client
         self.min_confidence = min_confidence
+        self.session_retriever = session_retriever
 
+    def recall_session_history(
+        self,
+        user_query: str,
+        *,
+        user_id: str,
+        session_id: str,
+        db_id: str,
+    ) -> List[HistoricalSQLReference]:
+        """召回当前 session 内的成功历史 query，异常时安全降级为空"""
+        if self.session_retriever is None:
+            return []
+        try:
+            return self.session_retriever.retrieve(
+                user_query,
+                user_id=user_id,
+                session_id=session_id,
+                db_id=db_id,
+            )
+        except Exception:
+            return []
     def check(
         self,
         user_query: str,
@@ -88,10 +110,12 @@ class HistoryCache:
         """将会话历史格式化为文本"""
         lines = []
         for turn in history[-5:]:  # 最多 5 轮
-            idx = turn.get("turn_index", "?")
-            query = turn.get("user_query", "")
-            sql = turn.get("final_sql", "")
-            lines.append(f"轮次 {idx}: \"{query}\" -> SQL: {sql}")
+            idx = turn.get("turn_index", turn.get("turn_id", "?"))
+            query = turn.get("user_query", turn.get("historical_query", ""))
+            sql = turn.get("final_sql", turn.get("historical_sql", ""))
+            score = turn.get("rrf_score")
+            suffix = f" | RRF: {score:.4f}" if isinstance(score, (int, float)) else ""
+            lines.append(f"轮次 {idx}: \"{query}\" -> SQL: {sql}{suffix}")
         return "\n".join(lines)
 
     def _format_metrics(self, metrics: List[Dict[str, Any]]) -> str:

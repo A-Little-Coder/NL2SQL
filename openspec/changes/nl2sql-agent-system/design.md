@@ -15,7 +15,7 @@
 - 提供Terminal交互式界面和LangSmith全流程监控
 - 支持SQLite和MySQL数据库连接
 - 在conda虚拟环境NL2SQL中运行
-- 提供反问 Agent 在 IR 失败/低质场景下主动澄清，并通过用户长期记忆持续优化
+- 提供反问机制（TaskPlanner）在 IR 之前做意图理解与三选一裁决（执行/反问/拒答），支持多意图分解、interrupt 暂停恢复与结果总结，并通过用户长期记忆持续优化
 
 **Non-Goals:**
 - 前端Web界面开发（仅Terminal交互）
@@ -103,23 +103,85 @@
 
 ---
 
-### 决策 9：联网搜索的用途定位为「领域知识补充」
+> ⚠️ **2026-06-29 重大重新定义**：反问机制从「IR 之后基于召回结果触发四类反问 + Tavily 联网」改为「IR 之前的前置意图理解（TaskPlanner）+ interrupt 暂停恢复 + 多意图分解 + 结果总结」。下方决策 9–15 已按新方案重写。原 WebSearch/Tavily（决策 9/14/15）与 IR 后 TriggerDetector 本期跳过，不实现。新方案三选一裁决：EXECUTE / CLARIFY / REJECT。决策 10/11/12/13 保留并按新方案调整语义。
 
-**决策**：Tavily 搜索仅用于补充系统不理解的**领域术语**，不用于直接回答用户的业务问题。搜索结果作为「上下文背景」喂给 `QuestionGenerator`，绝不直接展示给用户。
+### 决策 9（重写）：反问定位前移到 IR 之前，作为意图理解层
 
-**理由**：用户明确："联网搜索的用途应该是补充领域知识"。直接展示搜索结果会让 Agent 越权——它的本职是生成 SQL，不是百科问答。
+**决策**：反问机制不再放在 IR 之后基于召回结果触发，而是在 `history_cache` 之后、`ir` 之前新增 `task_planner` 节点，作为「意图理解 + 任务规划」层。TaskPlanner 对用户输入做三选一裁决：
 
-**触发条件**：仅当触发条件 B（语义不匹配）时启用搜索，且需 LLM 先判断关键词是否属于"未知领域术语"（不是常见数据库字段如 name/date）。
+- **EXECUTE（执行）**：意图清晰。单意图直接执行；多意图分解为 N 个子查询逐个执行。
+- **CLARIFY（反问）**：表述有歧义（实体多义、粒度不明、缺失关键限定）→ interrupt 暂停等用户澄清。
+- **REJECT（拒答）**：越权写操作 / 超出数据范围 / 无法理解 → 直接 END 带拒答原因。
+
+**理由**：用户明确"下一步需要开发反问这个机制，主要作用是消歧义，可以在一开始设计一个任务规划的节点，这个节点负责把多个查数的任务分解成一个个的问数工具可执行的 query。同时根据情况进行拒答。另外还需要对存在表述不清晰的问题进行反问"。前置到 IR 之前能在召回前就消除歧义，避免对错误召回结果做无谓的 SQL 生成；同时天然承担多意图分解职责。
+
+**与 answerability_check 的关系**：`task_planner`（IR 前）拦截"问得不清楚"（意图层）；`answerability_check`（SS 后，决策 23）拦截"答得不对题"（数据维度层）。二者并存分层，不互相替代。
 
 ---
 
-### 决策 10：反问粒度可粗可细，由 LLM 自适应
+### 决策 10（重写）：反问粒度由 TaskPlanner 内联 LLM 自适应生成
 
-**决策**：不固定反问的"细粒度模式"，由 `QuestionGenerator` 根据触发条件、用户历史、缺失信息量决定：
-- **粗粒度**：当用户输入歧义大、缺失关键维度时 → "您指的是哪类商品？食品类还是电子产品？"
-- **细粒度**：当只是某个具体值映射不确定时 → "您说的'苹果'，是指 product_name='Apple' 还是 brand='Apple Inc.'？"
+**决策**：不再单独建 `QuestionGenerator` 类。反问问题由 `TaskPlanner` 在裁决为 CLARIFY 时直接生成 `clarify_question`，根据歧义类型自适应粒度：
+- **粗粒度**：缺失关键维度时 → "您想查询哪类商品的销量？"
+- **细粒度**：具体值映射不确定时 → "您说的'苹果'是指 product_name='Apple' 还是 brand='Apple Inc.'？"
 
-**理由**：用户明确"两种反问的粒度都可能"。固定粒度会束缚 Agent 的判断。
+**理由**：用户明确"两种反问的粒度都可能"。TaskPlanner 已在做意图分析，内联生成问题避免额外一次 LLM 调用与类拆分开销。
+
+---
+
+### 决策 12（重写）：反问采用 LangGraph 1.x `interrupt()` + `Command(resume=...)` + `InMemorySaver`
+
+**决策**：反问暂停/恢复采用 LangGraph 1.x 函数式动态中断（非编译期 `interrupt_before/after`）：
+
+- 暂停：`task_planner` 节点内 `verdict=="clarify"` 时调用 `langgraph.types.interrupt(clarify_context)`，抛 `GraphInterrupt`，图挂起。
+- 恢复：用户回答后调用 `graph.stream(Command(resume=answer), config)`，graph 从中断点恢复，`interrupt()` 返回用户回答，TaskPlanner 重新规划。
+- 持久化：`graph.compile(checkpointer=InMemorySaver())`，`config["configurable"]["thread_id"] = session_id`。interrupt 必须配 checkpointer，否则无法恢复状态。
+- 检测暂停：流式时检查 `"__interrupt__" in chunk`；流结束后用 `graph.get_state(config).next` 二次确认。
+
+**理由**：用户确认 MemorySaver。`interrupt()` 函数式动态中断只有真正需要消歧时才暂停，避免无谓中断；thread_id 映射到 session_id 保证同一会话多轮反问共享状态。经实测 langgraph 1.2.4 API 准确。
+
+**API 准确性**（1.2.4 实测）：
+- `from langgraph.types import interrupt, Command, Interrupt`
+- `from langgraph.checkpoint.memory import InMemorySaver`（`MemorySaver` 为别名，推荐用 `InMemorySaver`）
+- 首次执行：传 `initial_state` + `config`；恢复执行：传 `Command(resume=...)` + 同一 `config`（不再传 initial_state）
+- resume 时节点从头重跑，`interrupt()` 不再抛异常而是返回 resume 值
+
+---
+
+### 决策 13（重写）：最多 5 轮反问，拒答则放行，计数器存 state
+
+**决策**：
+- 反问上限 5 次，计数器 `clarify_round` 存于 state（checkpoint 持久化），每次反问后递增。
+- 达到上限时不再 interrupt，降级为 EXECUTE 用最佳猜测执行（或 REJECT 若完全无法猜测）。
+- 用户输入「不知道 / 跳过 / 算了 / skip / 不清楚 / 随便」识别为拒答，立即退出反问循环，基于原始查询用最佳猜测继续。
+- 拒答关键词列表可配置（`config/clarification.yaml` 的 `decline_keywords`）。
+
+**实现模式**：硬上限检查 `if clarify_round >= 5` 放在 `interrupt()` 之前；计数器必须存 state（resume 时节点从头重跑，局部变量会丢失）。拒答识别后直接置 EXECUTE 路径。
+
+**理由**：用户明确"连问 5 次。用户拒答就继续按原来的流程走就行"。避免对话陷入无限循环。计数器存 state 是 LangGraph interrupt 恢复语义的硬约束。
+
+---
+
+### 决策 14（重写）：多意图分解为子查询，单查询子图工厂复用
+
+**决策**：TaskPlanner 裁决 EXECUTE 且 `intent_type=="multi"` 时，把用户查询分解为 N 个独立子查询。抽取出 `build_single_query_graph()` 工厂（封装 `ir → ss → answerability_check → cg → execution → decision` 整段），主图单意图路径和 `SubqueryOrchestrator` 多意图路径均复用该工厂，避免两套重复节点实现。
+
+- `SubqueryOrchestrator.run(subqueries, shared_state)` 逐个把子查询喂给单查询子图，收集每个的 `final_decision` 进 `subquery_results`。
+- **失败隔离**：某子查询全失败不中断其他子查询，各自带 decision_path 与失败原因。
+
+**理由**：用户明确"全做"（含多意图分解）。复用单查询子图工厂避免逻辑重复，保证单/多意图行为一致。
+
+---
+
+### 决策 15（重写）：新增总结模块，按需调用 LLM，数据表以结构摘要降 token
+
+**决策**：执行完成后新增 `aggregate_results` 节点做结果汇总：
+
+- **按需触发**：单子查询且无数据表 → 直接透传，不调 LLM；多子查询或有数据表 → 调 LLM 汇总。节约 token。
+- **多结果汇总**：多个子结果调 LLM 生成一段连贯自然语言回答，按子查询顺序组织，每个标注来源。
+- **数据表降 token**：某子查询结果为数据表时，**仅提取「列名 + 行数 + 头部样本（前 5 行）」作为结构摘要喂给总结 LLM**，不把原始结果集整表喂入；原始完整结果通过 state 透传给前端渲染。该策略与现有 ResultVerifier（列名+前5行）思路一致。
+
+**理由**：用户明确"最后应该有个总结模块，因为可能会执行多次查询。查询完的结果可能需要总结在一起输出。另外如果查数输出了数据表，这个看下怎么处理才能够节约总结模块的 token"。结构摘要降 token 是业界通用做法，避免大表撑爆 LLM 上下文。
 
 ---
 
@@ -154,47 +216,6 @@
 **理由**：用户明确"先用 JSON 就行"。后续可平滑迁移到 SQLite/Redis。
 
 **并发控制**：单用户串行写入，使用文件锁（`fcntl` on Unix / `msvcrt` on Windows）。
-
----
-
-### 决策 12：反问采用同步暂停 + MCP 协议
-
-**决策**：`UserDialog` 子流程在 LangGraph 中实现为「中断节点」：
-- 调用 LangGraph 的 `interrupt()` 机制（参考 `langgraph.types.interrupt`）。
-- 等待用户回答恢复后继续流程。
-- 通过 MCP 协议暴露给前端（Terminal UI / 未来 Web UI）。
-
-**理由**：用户明确"反问是暂停等待用户回答...遵守 MCP 协议那种"。
-
----
-
-### 决策 13：最多 5 轮反问，拒答则放行
-
-**决策**：
-- 单次用户查询的反问上限为 **5 次**（计数器 `clarification_count`）。
-- 用户输入「不知道 / 跳过 / 算了 / skip」等关键词识别为「拒答」，触发后立即退出反问流程，继续走原 IR 结果。
-- 5 次上限触发后强制退出，并在 `MemoryWriter` 中记录"未澄清成功"事件。
-
-**理由**：用户明确"连问 5 次。用户拒答就继续按原来的流程走就行"。避免对话陷入无限循环。
-
----
-
-### 决策 14：会话内搜索结果缓存
-
-**决策**：Tavily 搜索结果以 `query_keyword` 为 Key 缓存在 `ClarificationAgent` 实例的内存字典中，本次 LangGraph 运行内复用，不跨会话持久化。
-
-**理由**：用户明确"复用上次搜索结果"。避免单次会话内对同一术语的重复调用（同一查询可能触发多轮澄清）。
-
----
-
-### 决策 15：搜索服务商选用 Tavily
-
-**决策**：使用 `tavily-python` SDK，配置项：
-- `search_depth="basic"`（足够获取术语定义）
-- `max_results=3`
-- 超时 10s，失败则跳过 WebSearchEnricher 步骤（不阻塞反问主流程）
-
-**理由**：用户明确"Tavily"。Tavily 免费层 1000 次/月，返回结构化结果（标题+摘要），适合作为 LLM 的上下文。
 
 ---
 
@@ -393,52 +414,51 @@ for term in query_terms:
 
 **决策**：本服务全程基于 LangGraph 进行流程编排，分为两层：
 
-1. **主图（Top-Level Graph）**：编排端到端 NL2SQL 流水线，节点对应各 Agent：
-   `IR → Clarification → SS → CG → Execution → Decision → End`
+1. **主图（Top-Level Graph）**：编排端到端 NL2SQL 流水线，节点对应各 Agent（2026-06-29 更新，task_planner 前置 + summarize 后置）：
+   `history_cache → task_planner → (EXECUTE: run_subqueries | CLARIFY: interrupt | REJECT: END) → aggregate_results → memory_update → End`
+   单查询子图内部：`ir → ss → answerability_check → cg → execution → decision`
 2. **子图（Sub-Graph）**：每个 Agent 内部的多步功能也用 LangGraph `StateGraph` 串联，避免在 Agent 类里写隐式的命令式控制流。
 
-**主图节点示意**：
+**主图节点示意**（2026-06-29：task_planner 前置到 IR 之前，新增 summarize）：
 
 ```
                     ┌─────┐
                     │START│
                     └──┬──┘
                        ▼
-                  ┌─────────┐
-                  │ ir_node │  ← InformationRetrievalAgent.run()
-                  └────┬────┘
-                       ▼
                 ┌──────────────┐
-                │clarification │  ← ClarificationAgent.run()（子图）
-                │   _node      │     条件边：clarification_done → ss_node
-                └────┬─────────┘                  否则循环回 clarification
+                │ history_cache│  ← 决策 30：历史命中检测
+                └────┬─────────┘     命中 → 直接执行
                      ▼
-                  ┌─────────┐
-                  │ ss_node │  ← SchemaSelectorAgent.run()（子图）
-                  └────┬────┘
-                       ▼
-              ┌─────────────────────┐
-              │answerability_check  │  ← 决策 23：可回答性检查（宽松）
-              │        _node       │     false → END（拒答 + 原因）
-              └────┬────────────────┘     true/uncertain → 继续
+              ┌────────────────┐
+              │  task_planner  │  ← ★决策 9：意图理解 + 三选一裁决（IR 之前）
+              │     _node      │     REJECT → END(拒答)
+              └────┬───────────┘     CLARIFY → interrupt 暂停 → resume 回本节点
+                   │                  EXECUTE → run_subqueries
                    ▼
-                  ┌─────────┐
-                  │ cg_node │  ← CandidateGeneratorAgent.run()（子图）
-                  └────┬────┘
-                       ▼
-                  ┌──────────────┐
-                  │execution_node│  ← ExecutionAgent.run()
-                  └────┬─────────┘     内含错误修正循环子图
-                       ▼
-                  ┌─────────────┐
-                  │decision_node│  ← SelfConsistencyDecisionAgent.run()
-                  │  + 结果验证  │     内含决策 24：结果可信度验证（严格）
-                  └────┬────────┘     不可信 → END（拒答 + 原因）
-                       ▼
-                    ┌─────┐
-                    │ END │
-                    └─────┘
+            ┌──────────────────┐
+            │ run_subqueries   │  ← ★决策 14：单意图直接执行 / 多意图 orchestrator 串行
+            │   _node          │     内部复用 build_single_query_graph()
+            └────┬─────────────┘     单查询子图: ir→ss→answerability→cg→execution→decision
+                 ▼
+          ┌────────────────────┐
+          │ aggregate_results  │  ← ★决策 15：总结模块（按需 LLM + 数据表结构摘要）
+          │      _node         │
+          └────┬───────────────┘
+               ▼
+          ┌──────────────┐
+          │ memory_update│  ← 决策 29：记忆自动学习（含反问历史回写）
+          └────┬─────────┘
+               ▼
+            ┌─────┐
+            │ END │
+            └─────┘
+
+单查询子图 build_single_query_graph() 内部（每个子查询走一遍）：
+  ir → ss → answerability_check(false→END拒答) → cg → execution → decision(不可信→拒答)
 ```
+
+> 注：原 `clarification` 节点（IR 之后）已移除，反问职责前移到 `task_planner`。`answerability_check`（决策 23，SS 之后数据维度层）保留，与 `task_planner`（IR 之前意图层）分层并存。
 
 **典型子图示例：IR Agent 内部**
 
@@ -480,9 +500,9 @@ for term in query_terms:
 - LangGraph 提供：
   - **可观察性**：每个节点自动产生 trace，结合 LangSmith 可端到端追踪。
   - **状态管理**：`StateGraph` 显式声明状态字段，避免在 Agent 类里隐藏字段。
-  - **条件分支与循环**：原生支持（如 Clarification 反问循环、Execution 修正循环、Decision 全部失败兜底）。
-  - **interrupt/resume**：Clarification 子图的"暂停等用户回答"机制原生支持，无需自己实现。
-  - **可插拔**：节点可按配置启用/禁用（如 Clarification 可关闭）。
+  - **条件分支与循环**：原生支持（如 task_planner 反问 interrupt 循环、Execution 修正循环、Decision 全部失败兜底）。
+  - **interrupt/resume**：task_planner 的"暂停等用户回答"机制由 LangGraph 1.x `interrupt()` + `Command(resume=...)` + `InMemorySaver` 原生支持（决策 12），无需自己实现。
+  - **可插拔**：节点可按配置启用/禁用（如 task_planner 可通过 `config/clarification.yaml` 的 `enabled: false` 关闭，退化为直接 EXECUTE）。
 
 **实现约定**：
 
@@ -994,12 +1014,12 @@ reports = updater.update_all()
 
 | 维度 | 来源 | 下游用途 |
 |------|------|----------|
-| term_preferences | 用户澄清 / 主动教 | TriggerDetector D 类冲突检测、IR 关键词替换 |
+| term_preferences | 用户澄清 / 主动教 | TaskPlanner 歧义消解、IR 关键词替换 |
 | frequently_used_tables | 自动学习（从 SQL 提取表名） | IR 召回加权、SS 优先保留 |
 | metric_definitions | auto_learned + user_taught | CG 注入已知指标、历史命中检测 |
 | query_preferences | 自动学习（统计频率） | CG 注入默认参数（时间/排序/limit） |
 | domain_context | 从查询中推断 / 用户主动设定 | IR 关键词扩展、CG 生成策略 |
-| clarification_history | 反问流程写入 | QuestionGenerator 上下文 |
+| clarification_history | 反问流程写入 | TaskPlanner 反问上下文 |
 
 **metric_definitions 学习机制**：
 - `auto_learned`：每次查询完成后，如果 SQL 是简单聚合（SUM/COUNT/AVG + WHERE），调 LLM 提取"指标名 → SQL 模式"映射，confidence 从低开始（0.5），多次使用相同模式则递增
@@ -1153,114 +1173,159 @@ cache_confidence: float                     # 命中置信度
 
 ---
 
-## 触发条件详细规约
+## TaskPlanner 三选一裁决规约（2026-06-29 重写，替代原四类触发）
 
-| 条件 ID | 名称 | 检测逻辑 | 是否触发搜索 |
-|---------|------|----------|--------------|
-| A | 召回为空 | LSH + 向量检索后所有候选数为 0 | 否 |
-| B | 语义不匹配 | 召回的 Top-1 值与查询关键词在 LLM 判断下"语义不一致"（如"苹果"召回"Apple Inc."但上下文是食品） | **是** |
-| C | 低相似度 | Top-1 相似度 < 0.4（向量）或 < 0.3（LSH Jaccard） | 否 |
-| D | 用户记忆冲突 | 召回值与用户历史 `term_preferences` 中的映射冲突 | 否 |
+原「触发条件 A/B/C/D」基于 IR 召回结果，已废弃。新方案由 `TaskPlanner` 在 IR 之前做三选一裁决：
 
-**重要约束**：用户明确"反问的情况只在 2 的情况下触发"——这里指的是 B 类（语义不匹配）必然触发反问，而 A/C/D 在配置允许时也会触发但不调用搜索。
+| Verdict | 名称 | 检测逻辑 | 流向 |
+|---------|------|----------|------|
+| EXECUTE (single) | 清晰单意图 | 实体、度量、维度、时间均明确 | 单查询子图直接执行 |
+| EXECUTE (multi) | 清晰多意图 | 含多个独立问数意图，可分解 | 分解为 N 子查询逐个执行 |
+| CLARIFY | 表述歧义 | 实体多义 / 粒度不明 / 缺失关键限定 | interrupt 暂停等用户澄清 |
+| REJECT | 拒答 | 越权写操作 / 超出数据范围 / 无法理解 | 直接 END 带拒答原因 |
 
-> 待澄清项：是否所有 4 类都默认开启反问？设计采用「全部开启 + 配置可关」策略，配置文件中提供 `clarification.triggers.{A,B,C,D}: bool`。
+**裁决由 LLM 强制 JSON 输出完成**，解析失败降级为 EXECUTE 单意图（不阻塞主流程）。
+
+**反问上限**：5 轮，计数器 `clarify_round` 存 state（checkpoint 持久化）。达上限降级 EXECUTE 最佳猜测或 REJECT。拒答关键词（"不知道/跳过/算了/skip/不清楚/随便"）识别后立即放行。
+
+**与 answerability_check 分层**：TaskPlanner（IR 前）拦截意图层歧义；answerability_check（SS 后，决策 23）拦截数据维度层不可答。并存不替代。
 
 ---
 
-## 模块结构（反问相关）
+## 模块结构（反问相关，2026-06-29 重写）
 
 ```
 src/
 ├── clarification/
 │   ├── __init__.py
-│   ├── agent.py                # ClarificationAgent 主类（LangGraph 子图）
-│   ├── trigger.py              # TriggerDetector：判断是否反问
-│   ├── web_search.py           # WebSearchEnricher：Tavily 调用 + 会话缓存
-│   ├── question_generator.py   # QuestionGenerator：LLM 生成反问
-│   └── dialog.py               # UserDialog：interrupt + 循环
+│   ├── task_planner.py          # ★核心：意图理解 + 三选一裁决 + 多意图分解 + 反问问题生成
+│   ├── dialog.py                # interrupt 包装 + 5次硬上限 + 拒答关键词识别（决策 13）
+│   ├── subquery_orchestrator.py # 多子查询串行编排 + 失败隔离（决策 14）
+│   ├── result_summarizer.py     # ★总结模块：按需 LLM 汇总 + 数据表结构摘要降 token（决策 15）
+│   └── agent.py                 # 反问子图组装（task_planner + dialog 组合，原 §14）
+├── graph/
+│   ├── state.py                 # NL2SQLState（新增 plan_result/subqueries/subquery_results/clarify_round 等）
+│   ├── main_graph.py            # 主图（task_planner 前置 + checkpointer + interrupt）
+│   └── single_query_graph.py    # ★单查询子图工厂 build_single_query_graph()（ir→ss→answerability→cg→execution→decision）
 ├── verification/
 │   ├── __init__.py
-│   ├── answerability.py        # AnswerabilityChecker：可回答性检查（决策 23）
-│   └── result_verifier.py      # ResultVerifier：结果可信度验证（决策 24）
+│   ├── answerability.py         # AnswerabilityChecker：可回答性检查（决策 23，IR 后数据维度层）
+│   └── result_verifier.py       # ResultVerifier：结果可信度验证（决策 24）
 ├── memory/
 │   ├── __init__.py
-│   ├── user_memory.py          # UserMemory 主类（6 维长期记忆，决策 29）
-│   ├── session_memory.py       # SessionMemory 会话记忆（决策 28）
-│   ├── session_manager.py      # SessionManager 会话生命周期管理
-│   ├── history_cache.py        # HistoryCache 历史命中检测（决策 30）
-│   ├── memory_updater.py       # MemoryUpdater 自动学习模块（决策 29）
-│   └── storage.py              # JSON 文件读写 + 文件锁 + 原子写入
+│   ├── user_memory.py           # UserMemory 主类（6 维长期记忆，决策 29）
+│   ├── session_memory.py        # SessionMemory 会话记忆（决策 28）
+│   ├── session_manager.py       # SessionManager 会话生命周期管理
+│   ├── history_cache.py         # HistoryCache 历史命中检测（决策 30）
+│   ├── memory_updater.py        # MemoryUpdater 自动学习模块（决策 29）
+│   └── storage.py               # JSON 文件读写 + 文件锁 + 原子写入
 └── api/
     ├── __init__.py
-    ├── app.py                  # FastAPI 应用 + 生命周期
+    ├── app.py                   # FastAPI 应用 + 生命周期
     ├── routes/
     │   ├── __init__.py
-    │   ├── query.py            # POST /query（SSE 流式，决策 31）
-    │   ├── session.py          # 会话 CRUD
-    │   └── user.py             # 用户记忆查询
-    ├── schemas.py              # Pydantic 请求/响应模型
-    ├── deps.py                 # 依赖注入
-    └── stream.py               # SSE 事件生成器
+    │   ├── query.py             # POST /query（SSE 流式，决策 31）+ resume 支持
+    │   ├── session.py           # 会话 CRUD
+    │   └── user.py              # 用户记忆查询
+    ├── schemas.py               # Pydantic 请求/响应模型（新增 resume 字段）
+    ├── deps.py                  # 依赖注入
+    └── stream.py                # SSE 事件生成器（新增 clarification 事件 + interrupt 检测）
+
+# 已废弃（本期跳过）：web_search.py（Tavily）、trigger.py（IR 后 TriggerDetector 四类触发）、question_generator.py（并入 task_planner）
 ```
 
 ---
 
-## LangGraph 集成示意
+## LangGraph 集成示意（2026-06-29 重写：task_planner 前置 + interrupt + checkpointer）
 
 ```python
-from langgraph.graph import StateGraph
-from langgraph.types import interrupt
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.memory import InMemorySaver
 
 graph = StateGraph(NL2SQLState)
-graph.add_node("ir", retrieval_node)
-graph.add_node("clarification", clarification_node)  # 新增
-graph.add_node("ss", schema_selection_node)
-graph.add_node("answerability_check", answerability_check_node)  # 决策 23
-graph.add_node("cg", candidate_generation_node)
 
-graph.add_edge("ir", "clarification")
+# 节点
+graph.add_node("history_cache", history_cache_node)
+graph.add_node("task_planner", task_planner_node)          # ★新增：IR 前意图理解
+graph.add_node("run_subqueries", run_subqueries_node)      # ★新增：单/多子查询编排
+graph.add_node("aggregate_results", aggregate_results_node)# ★新增：总结模块
+graph.add_node("memory_update", memory_update_node)
+
+# 入口 → history_cache → task_planner
+graph.add_edge(START, "history_cache")
+
+# history_cache 命中 → 跳过 planner 直接执行
 graph.add_conditional_edges(
-    "clarification",
-    lambda s: "ss" if s["clarification_done"] else "clarification",  # 反问循环
+    "history_cache",
+    lambda s: "execution_single" if s.get("cache_hit") else "task_planner",
 )
-graph.add_edge("ss", "answerability_check")
+
+# task_planner 三选一：REJECT → END；CLARIFY → interrupt（恢复后回 task_planner）；EXECUTE → run_subqueries
 graph.add_conditional_edges(
-    "answerability_check",
-    lambda s: "cg" if s.get("answerability_result", {}).get("answerable") != "false" else END,  # 拒答
+    "task_planner",
+    route_after_planner,  # {"run_subqueries":..., "task_planner":...(clarify 循环), END: ...(reject)}
 )
-graph.add_edge("cg", "execution")
-# decision 内含结果可信度验证（决策 24），不可信 → END
-graph.add_conditional_edges(
-    "decision",
-    lambda s: END,  # 无论可信/不可信都到 END，但不可信时 state 中有 rejection_reason
-)
+
+# task_planner 节点内部（verdict=clarify 且未达上限时）：
+def task_planner_node(state):
+    plan = planner.plan(state["user_query"], state.get("conversation_history"), state.get("database_filter"))
+    if plan.verdict == "clarify" and state.get("clarify_round", 0) < 5:
+        # interrupt 暂停：value 送给前端，resume 时返回用户回答
+        answer = interrupt({"question": plan.clarify_question,
+                            "ambiguities": plan.ambiguities,
+                            "round": state.get("clarify_round", 0) + 1})
+        # 用户回答后重新规划（带澄清上下文）
+        plan = planner.plan(state["user_query"], ..., clarified=answer)
+    return {"plan_result": plan.to_dict(), "subqueries": plan.subqueries, ...}
+
+# run_subqueries：单意图直接调单查询子图；多意图 orchestrator 串行调用
+# aggregate_results：单结果无表透传；多结果/有表调 LLM 汇总（数据表用结构摘要）
+graph.add_edge("run_subqueries", "aggregate_results")
+graph.add_edge("aggregate_results", "memory_update")
+graph.add_edge("memory_update", END)
+
+# ★必须配 checkpointer 才能恢复 interrupt
+graph = graph.compile(checkpointer=InMemorySaver()).with_config(run_name="nl2sql-pipeline")
+
+# 首次执行
+config = {"configurable": {"thread_id": session_id}}
+for chunk in graph.stream(initial_state, config, stream_mode="updates"):
+    if "__interrupt__" in chunk:   # 反问暂停
+        emit clarification 事件；当前 SSE 流 done
+        break
+
+# 用户回答后 resume（同一 thread_id）
+for chunk in graph.stream(Command(resume=user_answer), config, stream_mode="updates"):
+    ...  # 从中断点恢复
 ```
 
-`NL2SQLState` 需新增字段：
+`NL2SQLState` 需新增字段（2026-06-29）：
 ```python
 class NL2SQLState(TypedDict):
     # ... existing fields ...
-    clarification_count: int            # 已反问次数
-    clarification_history: List[Dict]   # 本次查询的反问历史
-    clarified_keywords: Dict[str, str]  # 澄清后的关键词映射
-    web_search_cache: Dict[str, Any]    # 会话内搜索缓存
-    user_id: str                        # 用户标识
-    answerability_result: Optional[Dict]  # 可回答性检查结果（决策 23）
-    result_verification: Optional[Dict]   # 结果可信度验证结果（决策 24）
-    rejection_reason: Optional[str]       # 拒答原因（A 或 B 填入）
+    plan_result: Dict[str, Any]              # TaskPlanner 输出（verdict/subqueries/ambiguities...）
+    subqueries: List[str]                    # 分解后的子查询列表
+    subquery_results: List[Dict[str, Any]]   # 每个子查询的最终结果
+    clarify_round: int                       # 反问轮次计数（checkpoint 持久化）
+    clarify_question: str                    # 当前要问用户的问题（interrupt 用）
+    summary_text: str                        # 总结模块输出
+    # 保留：clarification_history / clarified_keywords / clarification_done（语义微调）
+    # 保留：answerability_result / result_verification / rejection_reason
 ```
+
 
 ---
 
-## 测试策略（反问相关）
+## 测试策略（反问相关，2026-06-29 重写）
 
 | 测试类型 | 覆盖场景 |
 |----------|----------|
-| 单元测试 | `TriggerDetector` 四类触发判断；`UserMemory` CRUD；JSON 文件锁并发 |
-| 集成测试 | 模拟 IR 结果 → ClarificationAgent → 反问/放行决策正确 |
-| Mock 测试 | Tavily 失败、LLM 超时、用户拒答等异常路径 |
-| 端到端 | LangGraph 完整运行一次含反问的查询，验证 MemoryWriter 正确写入 |
+| 单元测试 | `TaskPlanner.plan()` 三选一裁决（EXECUTE单/EXECUTE多/CLARIFY/REJECT）；多意图分解；`DialogManager` 拒答关键词识别 + 5 次上限；`UserMemory` CRUD；JSON 文件锁并发 |
+| Mock 测试 | LLM 解析失败降级 EXECUTE；interrupt 首次/resume 行为；LLM 超时；用户拒答；多子查询某条失败不中断其他 |
+| 集成测试 | `SubqueryOrchestrator` 多子查询串行 + 失败隔离；`aggregate_results` 按需 LLM + 数据表结构摘要 |
+| interrupt 测试 | `InMemorySaver` checkpointer 配置；首次 stream 检测 `__interrupt__`；`Command(resume=...)` 恢复；同 thread_id 多轮反问状态共享；5 次上限强制退出 |
+| 端到端 | LangGraph 完整运行含反问的查询（首问→interrupt→resume→执行→总结→memory_update）；MemoryWriter 正确写入反问历史 |
 
 ---
 
@@ -1277,15 +1342,18 @@ class NL2SQLState(TypedDict):
 2. **功能完整性 vs 开发复杂度**: 专注于核心NL2SQL功能，暂不实现高级特性
 3. **本地开发 vs 生产部署**: 优先保证本地开发体验，后续再考虑生产优化
 
-**反问 Agent 相关风险与缓解**:
+**反问 Agent 相关风险与缓解（2026-06-29 重写）**:
 
 | 风险 | 缓解方案 |
 |------|----------|
-| Tavily API 配额耗尽 | 会话缓存 + 失败降级（跳过搜索直接生成反问） |
-| 用户被反问烦扰 | 5 次硬上限 + 拒答关键词识别 |
+| 用户被反问烦扰 | 5 次硬上限 + 拒答关键词识别（可配置） |
 | 记忆文件损坏 | 写入采用「先写临时文件 + 原子 rename」+ 备份上次版本 |
-| LLM 误判触发条件 | TriggerDetector 提供配置开关，可逐项关闭 |
-| 反问粒度不自然 | QuestionGenerator 的 Prompt 中提供粗/细粒度示例，并要求 LLM 解释选择理由（日志记录） |
+| TaskPlanner LLM 误判 verdict | 解析失败降级 EXECUTE 单意图（不阻塞主流程）；可通过 `config/clarification.yaml` 的 `enabled: false` 整体关闭 planner |
+| interrupt 恢复失败（thread_id 不匹配/checkpointer 丢失） | InMemorySaver 进程内有效；thread_id 严格用 session_id；恢复前用 `graph.get_state(config)` 校验状态存在 |
+| InMemorySaver 进程重启丢失反问状态 | 本期接受（用户确认 MemorySaver）；生产化时换 PostgresSaver |
+| 多意图分解过度（把完整意图拆碎） | Prompt 约束"保持语义完整"；单意图不分解 |
+| 总结模块对大表 token 爆炸 | 数据表只取「列名+行数+前5行」结构摘要喂 LLM，原始结果透传前端 |
+| TaskPlanner 与 answerability_check 职责重叠 | 分层明确：planner 拦意图层（IR前），answerability 拦数据层（SS后），并存不替代 |
 
 **可回答性验证相关风险与缓解**：
 

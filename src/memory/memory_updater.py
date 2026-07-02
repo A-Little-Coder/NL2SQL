@@ -13,6 +13,10 @@
 import re
 from typing import Any, Dict
 
+from loguru import logger
+
+from src.memory.session_recall import SessionQueryMemory
+
 
 # 简单聚合 SQL 检测正则
 AGG_PATTERN = re.compile(
@@ -33,8 +37,9 @@ from src.memory.prompts import METRIC_EXTRACT_PROMPT
 class MemoryUpdater:
     """记忆自动学习器"""
 
-    def __init__(self, llm_client=None):
+    def __init__(self, llm_client=None, session_retriever=None):
         self._llm = llm_client
+        self.session_retriever = session_retriever
 
     def update(
         self,
@@ -64,6 +69,9 @@ class MemoryUpdater:
 
         # 5. 写入澄清历史
         self._update_clarification_history(user_memory, state)
+
+        # 6. 成功查数后写入 SessionMemory v2 召回库
+        self._update_session_recall_memory(session_memory, state)
 
     # ── 1. 常用表 ─────────────────────────────────────────────
 
@@ -202,3 +210,56 @@ class MemoryUpdater:
         clarification_history = state.get("clarification_history", []) or []
         for entry in clarification_history:
             user_memory.append_clarification(entry)
+
+    # ── 6. SessionMemory v2 召回库 ──────────────────────────────
+
+    def _is_successful_for_session_recall(self, state: Dict[str, Any]) -> bool:
+        """判断本轮是否可以进入 SessionMemory v2 召回库"""
+        if not state.get("final_sql"):
+            return False
+        if state.get("error") or state.get("rejection_reason"):
+            return False
+        verification = state.get("result_verification") or {}
+        if isinstance(verification, dict) and verification.get("should_reject"):
+            return False
+        candidates = state.get("sql_candidates") or []
+        if candidates:
+            try:
+                return any(getattr(c, "status", None).value == "success" for c in candidates)
+            except Exception:
+                pass
+        return bool(state.get("final_result") is not None or state.get("cache_hit"))
+
+    def _update_session_recall_memory(self, session_memory, state: Dict[str, Any]):
+        """成功查数后写入 query recall index 和 conversation store"""
+        if self.session_retriever is None:
+            return
+        if not self._is_successful_for_session_recall(state):
+            return
+
+        query = state.get("user_query", "") or ""
+        sql = state.get("final_sql", "") or ""
+        user_id = state.get("user_id", "default") or "default"
+        db_id = state.get("database_filter", "") or state.get("db_id", "") or ""
+        session_id = getattr(session_memory, "session_id", state.get("session_id", "")) or ""
+        if not query or not sql or not session_id or not db_id:
+            return
+
+        try:
+            turn_id = 1
+            if hasattr(session_memory, "get_turn_count"):
+                turn_id = int(session_memory.get_turn_count()) + 1
+            memory = SessionQueryMemory(
+                historical_query=query,
+                historical_sql=sql,
+                user_id=user_id,
+                session_id=session_id,
+                db_id=db_id,
+                conversation_id=session_id,
+                turn_id=turn_id,
+                success=True,
+            )
+            self.session_retriever.conversation_store.upsert_turn(memory)
+            self.session_retriever.query_index.upsert(memory)
+        except Exception as e:
+            logger.warning(f"SessionMemory v2 写入失败，已安全降级: {e}")

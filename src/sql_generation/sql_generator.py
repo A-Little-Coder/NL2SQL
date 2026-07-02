@@ -205,7 +205,8 @@ class SQLGenerator:
             return [e for e in base_examples if e["is_multi_table"]]
         return base_examples
 
-    def generate(self, schema: List[MSchemaTable], user_query: str) -> List[SQLCandidate]:
+    def generate(self, schema: List[MSchemaTable], user_query: str,
+                 historical_sql_refs: List[Dict[str, Any]] = None) -> List[SQLCandidate]:
         """
         生成多个 SQL 候选
 
@@ -241,6 +242,23 @@ class SQLGenerator:
                 schema_text=schema_text,
                 num_candidates=self.num_candidates,
             )
+            historical_sql_refs = historical_sql_refs or []
+            if historical_sql_refs:
+                from langchain_core.messages import HumanMessage
+                ref_lines = []
+                for ref in historical_sql_refs[:3]:
+                    q = ref.get("historical_query", "")
+                    sql = ref.get("historical_sql", "")
+                    if q and sql:
+                        ref_lines.append(f"- 历史问题：{q}\n  历史 SQL：{sql}")
+                if ref_lines:
+                    messages.append(HumanMessage(
+                        "## 历史 SQL 弱参考\n"
+                        + "\n".join(ref_lines)
+                        + "\n以上历史 SQL 仅供写法、指标口径或聚合方式参考。"
+                          "必须以当前用户问题和当前 schema 为准，"
+                          "不得使用当前 schema 中不存在的表或列。"
+                    ))
             raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.3, run_name="cg-generate"))
             result = parse_json(raw)
 
