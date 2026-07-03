@@ -27,6 +27,7 @@ from src.graph.main_graph import (
     make_decision_node,
     make_execution_node,
     make_ir_node,
+    make_schema_finalize_node,
     make_ss_node,
 )
 from src.graph.state import NL2SQLState
@@ -39,6 +40,7 @@ def build_single_query_graph(
     fix_loop,
     decider,
     answerability_checker=None,
+    data_dir: str = None,
 ):
     """构造并编译单查询流水线图。
 
@@ -49,6 +51,8 @@ def build_single_query_graph(
         fix_loop: SQLFixLoop 实例
         decider: SelfConsistencyDecision 实例
         answerability_checker: AnswerabilityChecker 实例（可选；None 时不启用该阶段）
+        data_dir: data/ 根目录（可选；定位 schema_graphs/，供 schema_finalize 用）。
+            None 时 schema_finalize 内部取默认路径。
 
     Returns:
         CompiledGraph：以 ``NL2SQLState`` 为输入/输出，run_name="single-query"
@@ -58,6 +62,8 @@ def build_single_query_graph(
     # ---- 节点（复用 main_graph 节点工厂 + _wrap_node 装饰，SSE/qid 日志照常）----
     graph.add_node("ir", _wrap_node("ir", make_ir_node(retriever)))
     graph.add_node("ss", _wrap_node("ss", make_ss_node(selector)))
+    # schema_finalize（relocate-join-path-injection）：SS 之后、answerability_check/cg 之前
+    graph.add_node("schema_finalize", _wrap_node("schema_finalize", make_schema_finalize_node(retriever, data_dir=data_dir)))
     if answerability_checker is not None:
         graph.add_node(
             "answerability_check",
@@ -73,16 +79,18 @@ def build_single_query_graph(
 
     graph.add_conditional_edges(START, route_start, {"ir": "ir", "execution": "execution"})
 
-    # ---- ir → ss（固定边）----
+    # ---- ir → ss → schema_finalize（固定边）----
     graph.add_edge("ir", "ss")
+    graph.add_edge("ss", "schema_finalize")
 
-    # ---- ss 后：无 schema → END；有 schema → answerability_check（启用时）/ cg ----
+    # ---- schema_finalize 后：无 schema → END；有 schema → answerability_check（启用时）/ cg ----
+    # 注：ss 未选出 schema 时，schema_finalize 也收不到有效 schema，故 fail-fast 仍在此守卫。
     if answerability_checker is not None:
-        def route_after_ss(state: NL2SQLState) -> str:
+        def route_after_schema_finalize(state: NL2SQLState) -> str:
             return "answerability_check" if state.get("selected_schema") else END
 
         graph.add_conditional_edges(
-            "ss", route_after_ss,
+            "schema_finalize", route_after_schema_finalize,
             {"answerability_check": "answerability_check", END: END},
         )
 
@@ -98,10 +106,10 @@ def build_single_query_graph(
             {"cg": "cg", END: END},
         )
     else:
-        def route_after_ss(state: NL2SQLState) -> str:
+        def route_after_schema_finalize(state: NL2SQLState) -> str:
             return "cg" if state.get("selected_schema") else END
 
-        graph.add_conditional_edges("ss", route_after_ss, {"cg": "cg", END: END})
+        graph.add_conditional_edges("schema_finalize", route_after_schema_finalize, {"cg": "cg", END: END})
 
     # ---- cg 后：无候选 → END，否则 → execution ----
     def route_after_cg(state: NL2SQLState) -> str:

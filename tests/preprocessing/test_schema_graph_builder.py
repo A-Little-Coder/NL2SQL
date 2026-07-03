@@ -459,70 +459,188 @@ class TestFormatJoinPathsForPrompt(unittest.TestCase):
 
 
 # ============================================================================
-# 桥接表 M-Schema 补充测试
+# enrich_schema_with_join_paths 测试（relocate-join-path-injection）
+# JOIN 路径注入 + 桥接表 M-Schema 补全，从 IR 阶段迁移到 SS→CG 之间
 # ============================================================================
 
-class TestBridgeTableMSchema(unittest.TestCase):
-    def test_add_bridge_tables(self):
-        """测试桥接表列从向量库补充到 RetrievedContext"""
-        from src.retrieval.information_retrieval import (
-            InformationRetrieval, RetrievedContext, RetrievedItem,
-        )
+class TestEnrichSchemaWithJoinPaths(unittest.TestCase):
+    """测试 enrich_schema_with_join_paths 纯函数。"""
 
+    def _make_graph(self):
+        return {
+            "california_schools": {
+                "nodes": {
+                    "schools": {"columns": ["CDSCode", "School"]},
+                    "satscores": {"columns": ["cds", "AvgScrRead"]},
+                    "frpm": {"columns": ["CDSCode", "SchoolName"]},
+                },
+                "edges": [
+                    {
+                        "from": "satscores",
+                        "to": "schools",
+                        "join_keys": [["satscores.cds", "schools.CDSCode"]],
+                        "type": "explicit_fk",
+                    },
+                    {
+                        "from": "frpm",
+                        "to": "schools",
+                        "join_keys": [["frpm.CDSCode", "schools.CDSCode"]],
+                        "type": "vector_similarity",
+                    },
+                ],
+            }
+        }
+
+    def _write_graph(self, tmpdir, db_id="california_schools"):
+        """在 tmpdir/preprocessed/schema_graphs/{db_id}.json 写图文件。"""
+        graph_dir = Path(tmpdir) / "preprocessed" / "schema_graphs"
+        graph_dir.mkdir(parents=True, exist_ok=True)
+        graph_path = graph_dir / f"{db_id}.json"
+        SchemaGraphBuilder.save(self._make_graph(), str(graph_path))
+        return str(tmpdir)
+
+    def _mock_vector_store(self, table_name="schools"):
+        """mock 向量库：对指定表返回其列。"""
         mock_vs = MagicMock()
         mock_vs.query.return_value = [
             {
-                "id": "db.schools.CDSCode",
                 "metadata": {
-                    "database": "db",
-                    "table_name": "schools",
+                    "database": "california_schools",
+                    "table_name": table_name,
                     "original_column_name": "CDSCode",
-                    "column_name": "CDSCode",
+                    "data_type": "TEXT",
+                    "description": "学校代码",
+                    "sample_values": ["12345"],
+                    "is_primary_key": True,
                 },
-                "document": "schools | cdscode | ",
-                "distance": 0.3,
-            },
+                "document": f"{table_name} | cdscode | ",
+            }
         ]
+        return mock_vs
 
-        mock_vectorizer = MagicMock()
-        mock_vectorizer.embed_texts.return_value = {"dense": [[0.1] * 1024]}
+    def _mock_vectorizer(self):
+        mock_vec = MagicMock()
+        mock_vec.model = MagicMock()  # 非空，通过有效性守卫
+        mock_vec.embed_texts.return_value = {"dense": [[0.1] * 1024]}
+        return mock_vec
 
-        ir = InformationRetrieval(vector_store=mock_vs)
-        ir._vectorizer = mock_vectorizer
+    def _mschema_table(self, name):
+        from src.schema_selection.schema_selector import MSchemaTable, MSchemaColumn
+        return MSchemaTable(name=name, columns=[MSchemaColumn(name="x", data_type="TEXT")])
 
-        ctx = RetrievedContext(
-            tables=[RetrievedItem(item_type="table", name="satscores")],
-            columns=[RetrievedItem(item_type="column", name="cds", table_name="satscores")],
-            values=[],
-        )
+    def test_bridge_table_enriched_as_mschema(self):
+        """桥接表应被补成 MSchemaTable 并加入 selected_schema，且 join_paths_text 非空。"""
+        from src.preprocessing.schema_graph_builder import enrich_schema_with_join_paths
 
-        ir._add_bridge_tables(ctx, ["schools"], "db")
-
-        # schools 表应被添加
-        self.assertTrue(any(t.name == "schools" for t in ctx.tables))
-        # schools.CDSCode 列应被添加
-        self.assertTrue(any(c.name == "CDSCode" and c.table_name == "schools" for c in ctx.columns))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = self._write_graph(tmpdir)
+            selected = [self._mschema_table("satscores"), self._mschema_table("frpm")]
+            result_schema, join_text = enrich_schema_with_join_paths(
+                selected_schema=selected,
+                database_filter="california_schools",
+                vector_store=self._mock_vector_store("schools"),
+                vectorizer=self._mock_vectorizer(),
+                data_dir=data_dir,
+            )
+            # schools 是 satscores→schools→frpm 的桥接表，应被补进 schema
+            self.assertTrue(any(getattr(t, "name", "") == "schools" for t in result_schema))
+            # 桥接表的列 CDSCode 应存在
+            schools_tbl = next(t for t in result_schema if getattr(t, "name", "") == "schools")
+            self.assertTrue(any(c.name == "CDSCode" for c in schools_tbl.columns))
+            # join_paths_text 非空
+            self.assertTrue(join_text)
+            self.assertIn("JOIN", join_text)
 
     def test_bridge_table_not_duplicated(self):
-        """已存在的表不应重复添加"""
-        from src.retrieval.information_retrieval import (
-            InformationRetrieval, RetrievedContext, RetrievedItem,
+        """已存在的桥接表不应重复添加。"""
+        from src.preprocessing.schema_graph_builder import enrich_schema_with_join_paths
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = self._write_graph(tmpdir)
+            # schools 已在 schema 中，又同时是 satscores↔frpm 的桥接表 → 不应重复
+            selected = [
+                self._mschema_table("satscores"),
+                self._mschema_table("schools"),
+                self._mschema_table("frpm"),
+            ]
+            result_schema, join_text = enrich_schema_with_join_paths(
+                selected_schema=selected,
+                database_filter="california_schools",
+                vector_store=self._mock_vector_store(),
+                vectorizer=self._mock_vectorizer(),
+                data_dir=data_dir,
+            )
+            # schools 只出现一次
+            schools_count = sum(1 for t in result_schema if getattr(t, "name", "") == "schools")
+            self.assertEqual(schools_count, 1)
+
+    def test_no_database_filter_degrades(self):
+        """database_filter 为空 → schema 原样、join_paths_text 为空。"""
+        from src.preprocessing.schema_graph_builder import enrich_schema_with_join_paths
+
+        selected = [self._mschema_table("a"), self._mschema_table("b")]
+        result_schema, join_text = enrich_schema_with_join_paths(
+            selected_schema=selected,
+            database_filter=None,
+            vector_store=None,
+            vectorizer=None,
+            data_dir="/nonexistent",
         )
+        self.assertEqual(len(result_schema), 2)
+        self.assertEqual(join_text, "")
 
-        mock_vs = MagicMock()
-        ir = InformationRetrieval(vector_store=mock_vs)
+    def test_single_table_degrades(self):
+        """表数 < 2 → schema 原样、join_paths_text 为空。"""
+        from src.preprocessing.schema_graph_builder import enrich_schema_with_join_paths
 
-        ctx = RetrievedContext(
-            tables=[RetrievedItem(item_type="table", name="schools")],
-            columns=[RetrievedItem(item_type="column", name="CDSCode", table_name="schools")],
-            values=[],
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = self._write_graph(tmpdir)
+            selected = [self._mschema_table("schools")]
+            result_schema, join_text = enrich_schema_with_join_paths(
+                selected_schema=selected,
+                database_filter="california_schools",
+                vector_store=None,
+                vectorizer=None,
+                data_dir=data_dir,
+            )
+            self.assertEqual(len(result_schema), 1)
+            self.assertEqual(join_text, "")
+
+    def test_graph_not_found_degrades(self):
+        """关联图不存在 → schema 原样、join_paths_text 为空。"""
+        from src.preprocessing.schema_graph_builder import enrich_schema_with_join_paths
+
+        selected = [self._mschema_table("a"), self._mschema_table("b")]
+        result_schema, join_text = enrich_schema_with_join_paths(
+            selected_schema=selected,
+            database_filter="nonexistent_db",
+            vector_store=None,
+            vectorizer=None,
+            data_dir=tempfile.gettempdir(),
         )
+        self.assertEqual(len(result_schema), 2)
+        self.assertEqual(join_text, "")
 
-        ir._add_bridge_tables(ctx, ["schools"], "db")
+    def test_exception_fallback(self):
+        """函数内部异常应兜底：schema 原样、join_paths_text 为空，不抛异常。"""
+        from src.preprocessing.schema_graph_builder import enrich_schema_with_join_paths
 
-        # schools 只出现一次
-        self.assertEqual(len([t for t in ctx.tables if t.name == "schools"]), 1)
-        self.assertEqual(len([c for c in ctx.columns if c.table_name == "schools"]), 1)
+        # 给一个会在 extract_join_paths 前就抛异常的 vectorizer（model 非空但 embed 抛异常），
+        # 但桥接表补全在 extract 之后；这里用破坏的 graph load 触发异常路径。
+        with tempfile.TemporaryDirectory() as tmpdir:
+            graph_dir = Path(tmpdir) / "preprocessed" / "schema_graphs"
+            graph_dir.mkdir(parents=True, exist_ok=True)
+            (graph_dir / "bad.json").write_text("not a json")  # 损坏的图文件
+            selected = [self._mschema_table("a"), self._mschema_table("b")]
+            result_schema, join_text = enrich_schema_with_join_paths(
+                selected_schema=selected,
+                database_filter="bad",
+                vector_store=None,
+                vectorizer=None,
+                data_dir=tmpdir,
+            )
+            self.assertEqual(len(result_schema), 2)
+            self.assertEqual(join_text, "")
 
 
 # ============================================================================

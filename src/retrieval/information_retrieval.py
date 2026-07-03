@@ -95,8 +95,6 @@ class RetrievedContext:
     keywords: List[str] = None
     keyword_groups: List[KeywordGroup] = None       # 关键词分组（保留结构化信息）
     keyword_columns_map: Dict[str, List[str]] = None  # 关键词→召回列映射 {"各科score": ["satscores.AvgScrRead", ...]}
-    join_paths: List[Dict[str, Any]] = None          # 表关联图的 JOIN 路径（决策 26）
-    join_paths_text: str = ""                         # 格式化的 JOIN 条件文本（用于 Prompt 注入）
     # 3.5 新增：检索元数据
     lsh_hit_count: int = 0           # LSH 命中数量
     vector_top_scores: List[float] = field(default_factory=list)  # 向量检索 top_k 分数列表
@@ -114,8 +112,6 @@ class RetrievedContext:
             self.keyword_groups = []
         if self.keyword_columns_map is None:
             self.keyword_columns_map = {}
-        if self.join_paths is None:
-            self.join_paths = []
 
     def get_all_table_names(self) -> List[str]:
         """获取所有涉及的表名（去重）"""
@@ -633,8 +629,8 @@ class InformationRetrieval:
         # 6. 根据检索到的值补充 schema
         context = self.enhance_with_schema(context)
 
-        # 7. 注入 JOIN 路径（决策 26）
-        context = self._inject_join_paths(context, database_filter)
+        # 注：JOIN 路径注入已迁移到 schema_finalize 节点（SS→CG 之间），
+        # 见 relocate-join-path-injection / schema_graph_builder.enrich_schema_with_join_paths。
 
         logger.info(
             f"检索完成: {len(context.tables)} 个表, "
@@ -682,130 +678,6 @@ class InformationRetrieval:
                     existing_col_keys.add(col_key)
 
         return context
-
-    def _inject_join_paths(
-        self, context: RetrievedContext, database_filter: str = None
-    ) -> RetrievedContext:
-        """
-        根据 RetrievedContext 中涉及的表，从预构建的表关联图中提取 JOIN 路径
-
-        依据决策 26：IR 召回后，根据召回的表集合从图中提取 JOIN 路径和连接键，注入 Prompt。
-        桥接表（路径中出现但未被 IR 召回的表）的 M-Schema 自动补充到 context 中。
-        """
-        if not database_filter:
-            logger.debug("未指定 database_filter，跳过 JOIN 路径注入")
-            return context
-
-        table_names = context.get_all_table_names()
-        if len(table_names) < 2:
-            logger.debug("涉及表不足 2 个，无需 JOIN 路径")
-            return context
-
-        try:
-            from src.preprocessing.schema_graph_builder import (
-                SchemaGraphBuilder,
-                extract_join_paths,
-                format_join_paths_for_prompt,
-            )
-
-            # 加载预构建的图
-            graph_dir = Path(__file__).parent.parent.parent / "data" / "preprocessed" / "schema_graphs"
-            graph_path = graph_dir / f"{database_filter}.json"
-
-            if not graph_path.exists():
-                logger.debug(f"表关联图不存在: {graph_path}")
-                return context
-
-            graph = SchemaGraphBuilder.load(str(graph_path))
-            join_paths_result = extract_join_paths(graph, table_names)
-
-            edges = join_paths_result.get("edges", [])
-            bridge_tables = join_paths_result.get("bridge_tables", [])
-
-            if edges:
-                context.join_paths = edges
-                context.join_paths_text = format_join_paths_for_prompt(join_paths_result)
-                logger.info(f"JOIN 路径注入: {len(edges)} 条关联")
-
-                # 补充桥接表的 M-Schema
-                if bridge_tables:
-                    self._add_bridge_tables(context, bridge_tables, database_filter)
-            else:
-                logger.debug("未找到相关 JOIN 路径")
-
-        except Exception as e:
-            logger.warning(f"JOIN 路径注入失败: {e}")
-
-        return context
-
-    def _add_bridge_tables(
-        self, context: RetrievedContext, bridge_tables: List[str], database_filter: str
-    ) -> None:
-        """
-        将桥接表的列从向量库补充到 RetrievedContext 中
-
-        桥接表未被关键词召回，但 JOIN 路径需要它，LLM 必须知道这些表的 schema 才能写 JOIN。
-        """
-        if not self.vector_store or not hasattr(self, "_vectorizer") or self._vectorizer is None:
-            return
-
-        existing_table_names = {t.name for t in context.tables}
-        existing_col_keys = {f"{c.table_name}.{c.name}" for c in context.columns}
-
-        for table_name in bridge_tables:
-            if table_name in existing_table_names:
-                continue
-
-            # 从向量库查询该表的所有列
-            try:
-                where_filter = {
-                    "$and": [
-                        {"database": database_filter},
-                        {"table_name": table_name},
-                    ]
-                }
-                # 用一个通用的 query 获取该表的列（用表名做 query）
-                embedding_result = self._vectorizer.embed_texts([table_name], return_dense=True)
-                query_vec = embedding_result["dense"][0]
-                results = self.vector_store.query(
-                    query_embedding=query_vec,
-                    n_results=50,  # 取足够多确保覆盖该表所有列
-                    where_filter=where_filter,
-                )
-
-                # 添加桥接表
-                context.tables.append(RetrievedItem(
-                    item_type="table",
-                    name=table_name,
-                    table_name=table_name,
-                    score=0.0,
-                    metadata={"database": database_filter, "source": "bridge_table"},
-                ))
-                existing_table_names.add(table_name)
-
-                # 添加桥接表的列
-                for r in results:
-                    meta = r.get("metadata", {})
-                    col_name = meta.get("original_column_name", meta.get("column_name", ""))
-                    t_name = meta.get("table_name", "")
-                    if t_name != table_name or not col_name:
-                        continue
-                    col_key = f"{t_name}.{col_name}"
-                    if col_key in existing_col_keys:
-                        continue
-                    context.columns.append(RetrievedItem(
-                        item_type="column",
-                        name=col_name,
-                        table_name=t_name,
-                        score=0.0,
-                        metadata={**meta, "source": "bridge_table"},
-                    ))
-                    existing_col_keys.add(col_key)
-
-                logger.info(f"桥接表补充: {table_name}")
-
-            except Exception as e:
-                logger.warning(f"桥接表 {table_name} 补充失败: {e}")
 
     # ------------------------------------------------------------------
     # LangGraph 子图接口（依据 决策 22 / §18.3 / §18.8）

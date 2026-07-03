@@ -3,30 +3,34 @@
 ## Purpose
 
 单查询流水线编排能力。定义一条编译图 `single_query_graph`，以 `NL2SQLState` 为输入/输出，
-依次执行 ir → ss → answerability_check（可选）→ cg → execution → decision，对无 schema /
-不可回答 / 无候选 SQL 等情形做 fail-fast 早退（END），并对 history_cache 命中做短路
-（跳过 ir/ss/cg 直奔 execution）。该图作为单意图路径、cache 命中路径、多意图串行编排
+依次执行 ir → ss → schema_finalize → answerability_check（可选）→ cg → execution → decision，
+对无 schema / 不可回答 / 无候选 SQL 等情形做 fail-fast 早退（END），并对 history_cache 命中做短路
+（跳过 ir / ss / schema_finalize / cg 直奔 execution）。该图作为单意图路径、cache 命中路径、多意图串行编排
 三处的单一事实来源，消除主图节点链与 orchestrator 平行重写的重复胶水。
 
 ## Requirements
 
 ### Requirement: Single Query Pipeline Graph
-系统 SHALL 提供一个编译好的 `single_query_graph`，以 `NL2SQLState` 为输入与输出 schema，依次执行 ir → ss → answerability_check（若启用）→ cg → execution → decision 六个阶段，作为单意图路径、history_cache 命中路径与多意图串行编排三处共用的单一事实来源。
+系统 SHALL 提供一个编译好的 `single_query_graph`，以 `NL2SQLState` 为输入与输出 schema，依次执行 ir → ss → schema_finalize → answerability_check（若启用）→ cg → execution → decision 七个阶段，作为单意图路径、history_cache 命中路径与多意图串行编排三处共用的单一事实来源。`schema_finalize` 节点 SHALL 位于 `ss` 之后、`answerability_check`（或未启用时的 `cg`）之前，负责基于收窄后的 `selected_schema` 计算表间 JOIN 路径、补充桥接表 M-Schema、产出 `join_paths_text`。
 
 #### Scenario: 正常单意图查询
 - **WHEN** 输入 `NL2SQLState` 的 `cache_hit` 为 False 且各阶段均成功产出
-- **THEN** 图依次经过 ir → ss → answerability_check → cg → execution → decision，最终在 `final_sql` 写入选定 SQL、`final_result` 写入执行结果、`decision_path` 写入决策路径标识
+- **THEN** 图依次经过 ir → ss → schema_finalize → answerability_check → cg → execution → decision，最终在 `final_sql` 写入选定 SQL、`final_result` 写入执行结果、`decision_path` 写入决策路径标识
 
 #### Scenario: 复用现有节点工厂
 - **WHEN** 编译 `single_query_graph`
-- **THEN** 图节点 SHALL 复用 `make_ir_node` / `make_ss_node` / `make_answerability_check_node` / `make_cg_node` / `make_execution_node` / `make_decision_node` 节点工厂，适配逻辑与主图原实现一致，不重复实现 Agent 子图调用胶水
+- **THEN** 图节点 SHALL 复用 `make_ir_node` / `make_ss_node` / `make_schema_finalize_node` / `make_answerability_check_node` / `make_cg_node` / `make_execution_node` / `make_decision_node` 节点工厂，适配逻辑与主图原实现一致，不重复实现 Agent 子图调用胶水
+
+#### Scenario: ss 出口路由经 schema_finalize
+- **WHEN** `ss` 阶段产出非空 `selected_schema`
+- **THEN** 图 SHALL 路由至 `schema_finalize` 节点（而非直接进 answerability_check / cg），由其完成 JOIN 路径注入与桥接表补全后再放行
 
 ### Requirement: Fail-Fast Early Exit
 `single_query_graph` SHALL 对流水线中的失败情形做 fail-fast 早退（直接 END），并在 partial `NL2SQLState` 中保留已产出字段与失败原因，使调用方可据 `final_sql` / `decision_path` / `rejection_reason` / `error` 判定成败。
 
 #### Scenario: SS 未选出 schema
 - **WHEN** `ss` 阶段未产出 `selected_schema`（空列表）
-- **THEN** 图经条件边直接 END，不进入 answerability_check / cg / execution / decision，返回的 state 中 `selected_schema` 为空
+- **THEN** 图经条件边直接 END，不进入 schema_finalize / answerability_check / cg / execution / decision，返回的 state 中 `selected_schema` 为空、`join_paths_text` 为空
 
 #### Scenario: 不可回答拦截
 - **WHEN** `answerability_check` 判定 `answerable == "false"`
@@ -36,12 +40,16 @@
 - **WHEN** `cg` 阶段未产出 `sql_candidates`（空列表）
 - **THEN** 图经条件边直接 END，不进入 execution / decision
 
+#### Scenario: Schema Finalization 异常降级
+- **WHEN** `schema_finalize` 节点内部 `enrich_schema_with_join_paths` 抛出异常
+- **THEN** 节点 SHALL 捕获异常，保持 `selected_schema` 原样、`join_paths_text` 置空，SHALL NOT 阻断流水线（降级为无 JOIN 提示）
+
 ### Requirement: History Cache Hit Short-Circuit
-`single_query_graph` SHALL 在入口条件边识别 `cache_hit == True`，跳过 ir / ss / cg 直奔 `execution` 节点（从 `cached_sql` 构造候选并执行），随后正常进入 `decision`。
+`single_query_graph` SHALL 在入口条件边识别 `cache_hit == True`，跳过 ir / ss / schema_finalize / cg 直奔 `execution` 节点（从 `cached_sql` 构造候选并执行），随后正常进入 `decision`。
 
 #### Scenario: history_cache 命中
 - **WHEN** 输入 state 的 `cache_hit` 为 True 且 `cached_sql` 非空
-- **THEN** 图入口条件边路由至 `execution`，不执行 ir / ss / cg；`execution` 节点从 `cached_sql` 构造候选并执行，随后进入 `decision` 产出 `final_sql`
+- **THEN** 图入口条件边路由至 `execution`，不执行 ir / ss / schema_finalize / cg；`execution` 节点从 `cached_sql` 构造候选并执行，随后进入 `decision` 产出 `final_sql`
 
 #### Scenario: cache 命中但 cached_sql 为空
 - **WHEN** `cache_hit` 为 True 但 `cached_sql` 为空
@@ -77,12 +85,32 @@
 - **WHEN** 重构完成
 - **THEN** `src/clarification/subquery_orchestrator.py` 中的 `run_single_query()` 函数 SHALL 被删除，单查询流水线胶水逻辑只存在于 `single_query_graph` 一处
 
+### Requirement: Schema Finalization Node
+`schema_finalize` 节点 SHALL 以 SS 产出的 `selected_schema`（`List[MSchemaTable]`）与 `database_filter` 为输入，调用 `schema_graph_builder.enrich_schema_with_join_paths()` 计算选中表之间的 JOIN 路径，把桥接表 M-Schema 补入 `selected_schema`，并把格式化后的 `join_paths_text` 写入 `NL2SQLState`。节点 SHALL 在桥接表补全完成后才放行至 `answerability_check`，使可回答性判断能看到桥接表存在。
+
+#### Scenario: 多表查询产出 join_paths_text
+- **WHEN** `selected_schema` 含 2 张及以上表且 `database_filter` 指定了已构建关联图的数据库
+- **THEN** 节点 SHALL 调用 `enrich_schema_with_join_paths` 计算选中表之间的最短 JOIN 路径
+- **AND** 节点 SHALL 把 `format_join_paths_for_prompt` 的输出写入 state 的 `join_paths_text`
+- **AND** 节点 SHALL 把路径上的桥接表转为 `MSchemaTable` 补入 `selected_schema` 并回写 state
+
+#### Scenario: 桥接表补全先于可回答性检查
+- **WHEN** JOIN 路径识别出桥接表（路径中出现但未被 SS 选中的表）
+- **THEN** 节点 SHALL 在放行至 `answerability_check` 之前完成桥接表 M-Schema 补全
+- **AND** 使 answerability_check 能据含桥接表的 `selected_schema` 判断表间可连接性
+
+#### Scenario: 单表或无 database_filter 降级
+- **WHEN** `selected_schema` 表数 < 2，或 `database_filter` 为空，或关联图文件不存在，或未提取到任何 JOIN 边
+- **THEN** 节点 SHALL 保持 `selected_schema` 不变
+- **AND** 节点 SHALL 将 `join_paths_text` 置为空字符串
+- **AND** 节点 SHALL 正常放行，不阻断流水线
+
 ### Requirement: Invariants Preserved
 重构 SHALL 保持以下不变项：多意图串行执行（不引入并行 fan-out）、`current_fix_loop` / `current_user_memory` / `current_session_memory` ContextVar 串行传递约束、SSE 事件类型与 payload、各 Agent 子图 `build_graph()` 公开签名、history_cache / memory_update / aggregate_results 节点行为。
 
 #### Scenario: SSE 事件契约不变
 - **WHEN** 重构后运行单意图与多意图查询
-- **THEN** `emit_safe` 发出的 stage / keywords / schema_recall / answerability / sql_candidates / execution / final_decision / clarification 等 event_type 及其 payload 结构与重构前一致
+- **THEN** `emit_safe` 发出的 stage / keywords / schema_recall / answerability / sql_candidates / execution / final_decision / clarification / schema_finalize 等 event_type 及其 payload 结构与重构前一致
 
 #### Scenario: ContextVar 在子图内可见
 - **WHEN** `single_query_graph` 在主图线程内被 invoke

@@ -43,6 +43,8 @@ class NL2SQLState(TypedDict, total=False):
 
         # ===== SS 产出 =====
         selected_schema: List[MSchemaTable] 经裁剪后的 schema
+        # ===== SchemaFinalize 产出（relocate-join-path-injection）=====
+        join_paths_text: 表关联格式化文本（SS 之后计算，供 CG/SmartFix 双消费）
 
         # ===== CG 产出 =====
         sql_candidates: List[SQLCandidate] 候选 SQL
@@ -99,6 +101,8 @@ class NL2SQLState(TypedDict, total=False):
 
     # ===== SS =====
     selected_schema: List[Any]  # List[MSchemaTable]
+    # ===== SchemaFinalize（relocate-join-path-injection）=====
+    join_paths_text: str  # 表关联格式化文本，供 CG 生成 Prompt + SmartFix 修复 Prompt 双消费
 
     # ===== CG =====
     sql_candidates: List[Any]  # List[SQLCandidate]
@@ -183,6 +187,7 @@ def create_initial_state(
         clarify_question="",
         summary_text="",
         selected_schema=[],
+        join_paths_text="",
         sql_candidates=[],
         execution_results=[],
         schema_text="",

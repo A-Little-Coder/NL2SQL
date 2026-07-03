@@ -123,11 +123,8 @@ def build_ir_graph(retriever):
             vector_top_scores=[c.score for c in state.get("schema_columns", [])[:10]],
         )
         ctx = retriever.enhance_with_schema(ctx)
-        # 注入 JOIN 路径（决策 26）
-        try:
-            ctx = retriever._inject_join_paths(ctx, state.get("database_filter"))
-        except Exception:
-            pass
+        # JOIN 路径注入已迁移到 schema_finalize 节点（SS→CG 之间），
+        # 见 relocate-join-path-injection / schema_graph_builder.enrich_schema_with_join_paths。
         return {"retrieved_context": ctx}
 
     graph = StateGraph(IRGraphState)

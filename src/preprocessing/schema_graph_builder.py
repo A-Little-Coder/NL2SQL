@@ -817,3 +817,172 @@ def format_join_paths_for_prompt(join_paths_result: dict) -> str:
         lines.append(f"桥接表: {', '.join(bridge_tables)}")
 
     return "\n".join(lines)
+
+
+# ============================================================================
+# 运行时：基于收窄后的 schema 计算 JOIN 路径 + 桥接表 M-Schema 补全
+# ============================================================================
+# relocate-join-path-injection：JOIN 注入从 IR 阶段迁移到 SS→CG 之间。
+# 本函数是纯函数，运行时依赖（vector_store/vectorizer/data_dir）通过参数注入，
+# 操作对象是 SS 产出的 List[MSchemaTable]（而非 IR 的 RetrievedContext）。
+# ============================================================================
+
+
+def _vectorizer_or_none(vectorizer):
+    """向量化器有效性判断（与 IR 的 has_semantic 守卫一致）。"""
+    if vectorizer is None:
+        return False
+    model = getattr(vectorizer, "model", None)
+    return model is not None
+
+
+def enrich_schema_with_join_paths(
+    selected_schema: list,
+    database_filter: Optional[str],
+    vector_store,
+    vectorizer,
+    data_dir: str,
+) -> Tuple[list, str]:
+    """
+    基于 SS 收窄后的 selected_schema 计算表间 JOIN 路径，补充桥接表 M-Schema。
+
+    取代 IR 阶段的 `_inject_join_paths` / `_add_bridge_paths`（决策 26 实现位置变更）：
+    在 schema 收窄之后、CG 之前，对真正参与查询的表集合做最短路径 BFS，把桥接表
+    （路径中出现但未被 SS 选中的表）的列从向量库查出转成 MSchemaTable 补进 schema，
+    并产出格式化的 join_paths_text 供 CG/SmartFix 双消费。
+
+    Args:
+        selected_schema: SS 产物，List[MSchemaTable]（仅读其表名做路径计算）。
+        database_filter: 限定数据库 db_id，用于定位 schema_graphs/{db}.json 及向量库 where 过滤。
+        vector_store: VectorStoreManager（查桥接表列）；None 时跳过桥接表补全。
+        vectorizer: 向量化器（embed 表名做 query）；None 时跳过桥接表补全。
+        data_dir: data/ 根目录，定位 schema_graphs/。
+
+    Returns:
+        Tuple[List[MSchemaTable], str]:
+            (补全桥接表后的 selected_schema, join_paths_text)。
+            降级情形（database_filter 空 / 表数<2 / 图不存在 / 无边 / 异常）下
+            selected_schema 原样返回、join_paths_text=""。
+    """
+    from src.schema_selection.schema_selector import MSchemaColumn, MSchemaTable
+
+    # 降级：database_filter 为空 → 不计算
+    if not database_filter:
+        return list(selected_schema), ""
+
+    # 收集表名集合（仅 MSchemaTable.name）
+    table_names = [getattr(t, "name", "") for t in selected_schema if getattr(t, "name", "")]
+
+    # 降级：表数 < 2 → 无需 JOIN
+    if len(table_names) < 2:
+        return list(selected_schema), ""
+
+    # 默认 data_dir（与原 _inject_join_paths 硬编码路径一致）
+    if not data_dir:
+        from pathlib import Path
+        data_dir = str(Path(__file__).parent.parent.parent / "data")
+
+    try:
+        from pathlib import Path
+        graph_path = Path(data_dir) / "preprocessed" / "schema_graphs" / f"{database_filter}.json"
+        if not graph_path.exists():
+            logger.debug(f"表关联图不存在: {graph_path}，跳过 JOIN 路径注入")
+            return list(selected_schema), ""
+
+        graph = SchemaGraphBuilder.load(str(graph_path))
+        join_paths_result = extract_join_paths(graph, table_names)
+        edges = join_paths_result.get("edges", [])
+        bridge_tables = join_paths_result.get("bridge_tables", [])
+
+        if not edges:
+            logger.debug("未找到相关 JOIN 路径")
+            return list(selected_schema), ""
+
+        join_paths_text = format_join_paths_for_prompt(join_paths_result)
+
+        # 补充桥接表 M-Schema
+        result_schema = list(selected_schema)
+        if bridge_tables and vector_store is not None and _vectorizer_or_none(vectorizer):
+            existing_names = {getattr(t, "name", "") for t in result_schema}
+            for bt in bridge_tables:
+                if bt in existing_names:
+                    continue
+                mschema_tbl = _build_bridge_mschema_table(
+                    bt, database_filter, vector_store, vectorizer,
+                )
+                if mschema_tbl is not None:
+                    result_schema.append(mschema_tbl)
+                    existing_names.add(bt)
+                    logger.info(f"桥接表补充: {bt}")
+
+        logger.info(f"JOIN 路径注入: {len(edges)} 条关联")
+        return result_schema, join_paths_text
+
+    except Exception as e:
+        logger.warning(f"JOIN 路径注入失败: {e}")
+        return list(selected_schema), ""
+
+
+def _build_bridge_mschema_table(
+    table_name: str,
+    database_filter: str,
+    vector_store,
+    vectorizer,
+) -> Optional["object"]:
+    """
+    从向量库查询桥接表的列，转成 MSchemaTable。
+
+    metadata 字段（data_type/description/sample_values/is_primary_key/references/
+    original_column_name/table_name）与 SS.to_mschema 从 col_item.metadata 取的字段同源同构。
+    """
+    from src.schema_selection.schema_selector import MSchemaColumn, MSchemaTable
+
+    try:
+        where_filter = {
+            "$and": [
+                {"database": database_filter},
+                {"table_name": table_name},
+            ]
+        }
+        embedding_result = vectorizer.embed_texts([table_name], return_dense=True)
+        query_vec = embedding_result.get("dense", [None])[0]
+        if query_vec is None:
+            return None
+
+        results = vector_store.query(
+            query_embedding=query_vec,
+            n_results=50,  # 取足够多确保覆盖该表所有列
+            where_filter=where_filter,
+        )
+
+        columns: List[MSchemaColumn] = []
+        seen_cols: set = set()
+        for r in results:
+            meta = r.get("metadata", {}) or {}
+            col_name = meta.get("original_column_name", meta.get("column_name", ""))
+            t_name = meta.get("table_name", "")
+            if t_name != table_name or not col_name:
+                continue
+            if col_name in seen_cols:
+                continue
+            seen_cols.add(col_name)
+            columns.append(MSchemaColumn(
+                name=col_name,
+                data_type=meta.get("data_type", meta.get("column_type", "TEXT")),
+                description=meta.get("description", ""),
+                sample_values=meta.get("sample_values", []) or [],
+                is_primary_key=meta.get("is_primary_key", False),
+                is_foreign_key=meta.get("is_foreign_key", False),
+                references=meta.get("references", ""),
+            ))
+
+        return MSchemaTable(
+            name=table_name,
+            columns=columns,
+            description="",
+            row_count=0,
+        )
+
+    except Exception as e:
+        logger.warning(f"桥接表 {table_name} 补充失败: {e}")
+        return None

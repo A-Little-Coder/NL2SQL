@@ -696,6 +696,14 @@ final_score = vector_score * 0.2 + normalized_ngram_vote * 0.8
 
 ### 决策 26：表关联图（Schema Relationship Graph）— 预处理阶段构建 + 召回时注入 JOIN 路径
 
+> **实现位置变更（relocate-join-path-injection，2026-07-03）**：JOIN 路径注入已从
+> IR 阶段迁移到 SS→CG 之间新增的 `schema_finalize` 节点。原「IR 召回后注入」语义废弃，
+> 改为基于 SS 收窄后的 `selected_schema` 计算 JOIN 路径（`schema_graph_builder.enrich_schema_with_join_paths`），
+> 桥接表 M-Schema 补全先于 answerability_check，`join_paths_text` 由 CG 生成 Prompt 与
+> SmartFix 修复 Prompt 双消费。IR 的 `_inject_join_paths`/`_add_bridge_tables` 及
+> `RetrievedContext.join_paths`/`join_paths_text` 字段已删除。详见 change
+> `relocate-join-path-injection` 及 `schema-relationship-graph` spec。
+
 **决策**：在预处理阶段为每个数据库构建表关联图（JSON 邻接表），包含显式 FK 和隐式关联（向量相似度匹配 + 值命中率检测 + LLM 辅助）。IR 召回后，根据召回的表集合从图中提取 JOIN 路径和连接键，注入 Prompt。
 
 **问题背景**：IR 召回了多个表的列，但 LLM 不知道表之间如何关联。例如 `satscores.cds = schools.CDSCode` 这个 JOIN 条件，Prompt 里没有体现，LLM 可能生成错误的 JOIN 或直接笛卡尔积。

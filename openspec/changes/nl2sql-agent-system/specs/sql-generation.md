@@ -18,6 +18,14 @@
 给定一个需要多表连接的高级查询
 当 CG 模块选择 few-shot 示例时
 则它应该仅使用训练集中的多表 JOIN 示例
+
+#### Scenario: CG Prompt 注入表关联提示（relocate-join-path-injection）
+给定 schema_finalize 节点产出了非空的 join_paths_text（含选中表间的 JOIN 条件与桥接表）
+当 CG 模块生成 SQL 候选时
+则它应该把 join_paths_text 作为附加上下文注入生成 Prompt
+并且 SmartFix 修复 SQL 时也应通过 schema_text 看到 join_paths_text（双消费）
+并且多表查询时 LLM 应优先按提示的 JOIN 条件连接表
+
 并且它应该基于外键生成正确的 JOIN 条件
 并且它应该在所有候选中保持查询语义
 

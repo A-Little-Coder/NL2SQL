@@ -516,6 +516,75 @@ def make_ss_node(selector) -> Callable[[NL2SQLState], Dict[str, Any]]:
     return node
 
 
+def make_schema_finalize_node(retriever, data_dir: str = None) -> Callable[[NL2SQLState], Dict[str, Any]]:
+    """
+    构造 SchemaFinalize 节点（relocate-join-path-injection）。
+
+    位于 SS 之后、answerability_check/cg 之前。基于收窄后的 selected_schema 计算
+    表间 JOIN 路径，补充桥接表 M-Schema，产出 join_paths_text 写回 state。
+    JOIN 注入职责从 IR 阶段迁移至此（决策 26 实现位置变更）。
+
+    Args:
+        retriever: InformationRetrieval 实例（提供 vector_store / _vectorizer）。
+        data_dir: data/ 根目录，定位 schema_graphs/。None 时函数内取默认路径。
+    """
+
+    def node(state: NL2SQLState) -> Dict[str, Any]:
+        qid = state.get("query_id", "")
+        schema = state.get("selected_schema", [])
+        database_filter = state.get("database_filter")
+
+        join_paths_text = ""
+        finalized_schema = schema
+
+        try:
+            from src.preprocessing.schema_graph_builder import enrich_schema_with_join_paths
+            vector_store = getattr(retriever, "vector_store", None)
+            vectorizer = getattr(retriever, "_vectorizer", None)
+            finalized_schema, join_paths_text = enrich_schema_with_join_paths(
+                selected_schema=schema,
+                database_filter=database_filter,
+                vector_store=vector_store,
+                vectorizer=vectorizer,
+                data_dir=data_dir,
+            )
+        except Exception as e:
+            # 兜底：异常时 schema 原样、join_paths_text 置空，不阻断流水线
+            logger.warning(f"[qid={qid}] [SchemaFinalize] 失败降级: {e}")
+            finalized_schema = schema
+            join_paths_text = ""
+
+        # 统计
+        edge_count = 0
+        bridge_count = 0
+        try:
+            if join_paths_text:
+                edge_count = join_paths_text.count("JOIN")
+            if finalized_schema and schema:
+                bridge_count = len(finalized_schema) - len(schema)
+        except Exception:
+            pass
+        logger.info(
+            f"[qid={qid}] [SchemaFinalize] join_edges={edge_count} bridge_tables={bridge_count} "
+            f"has_text={bool(join_paths_text)}"
+        )
+
+        emit_safe("schema_finalize", {
+            "join_edges": edge_count,
+            "bridge_tables": bridge_count,
+        })
+
+        return {
+            "selected_schema": finalized_schema,
+            "join_paths_text": join_paths_text,
+            "trace_log": state.get("trace_log", []) + ["[SchemaFinalize] done"],
+        }
+
+    return node
+
+    return node
+
+
 def make_answerability_check_node(checker) -> Callable[[NL2SQLState], Dict[str, Any]]:
     """
     构造可回答性检查节点（决策 23）：SS 之后、CG 之前
@@ -568,6 +637,7 @@ def make_cg_node(generator) -> Callable[[NL2SQLState], Dict[str, Any]]:
                                   if get_user_memory_ctx() else {},
             "metric_definitions": state.get("metric_definitions", []),
             "historical_sql_refs": state.get("historical_sql_refs", []),
+            "join_paths_text": state.get("join_paths_text", ""),
         })
         candidates = result.get("sql_candidates", [])
 
@@ -634,6 +704,11 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
                 schema_text = ""
         except Exception:
             schema_text = ""
+
+        # 拼接表关联文本（relocate-join-path-injection）：让 SmartFix 修复 SQL 时也能看到 JOIN 关系
+        join_paths_text = state.get("join_paths_text", "") or ""
+        if schema_text and join_paths_text:
+            schema_text = f"{schema_text}\n\n## 表关联\n{join_paths_text}"
 
         # 决策 51：一次性执行每个候选，不触发 LLM 修复
         executor = fix_loop.executor

@@ -26,6 +26,7 @@ class CGGraphState(TypedDict, total=False):
     query_preferences: Dict[str, str]  # 用户查询偏好（由主图注入）
     metric_definitions: List[Dict[str, Any]]  # 用户指标定义（由主图注入）
     historical_sql_refs: List[Dict[str, Any]]  # 不可复用历史的 query/sql 弱参考
+    join_paths_text: str  # 表关联格式化文本（relocate-join-path-injection，由主图 schema_finalize 注入）
 
 
 def build_cg_graph(generator):
@@ -122,6 +123,14 @@ def build_cg_graph(generator):
                     "以上历史 SQL 仅供写法、指标口径或聚合方式参考。"
                     "必须以当前用户问题和当前 selected schema 为准，"
                     "不得使用当前 schema 中不存在的表或列。"
+                ))
+            # 注入表关联（relocate-join-path-injection）：schema_finalize 产出的 JOIN 路径
+            join_text = state.get("join_paths_text", "") or ""
+            if join_text:
+                base_messages.append(HumanMessage(
+                    "## 表关联\n"
+                    f"{join_text}\n"
+                    "多表查询时，请优先按以上 JOIN 条件连接表（含必要的桥接表）。"
                 ))
             raw = stream_with_sse(generator.llm_client.stream(base_messages, as_json=True, temperature=0.3))
             result = parse_json(raw)
