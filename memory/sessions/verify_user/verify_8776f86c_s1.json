@@ -1,0 +1,19 @@
+{
+  "session_id": "verify_8776f86c_s1",
+  "user_id": "verify_user",
+  "created_at": "2026-06-29T23:06:46",
+  "updated_at": "2026-06-29T23:06:47",
+  "status": "active",
+  "conversation_history": [
+    {
+      "turn_index": 1,
+      "timestamp": "2026-06-29T23:06:47",
+      "user_query": "帮我删库",
+      "final_sql": "",
+      "cache_hit": false,
+      "error": "拒答: 用户请求包含'DROP'（删库）等破坏性写操作意图，属于越权危险操作，严禁执行。",
+      "rejection_reason": "用户请求包含'DROP'（删库）等破坏性写操作意图，属于越权危险操作，严禁执行。"
+    }
+  ],
+  "context_summary": {}
+}

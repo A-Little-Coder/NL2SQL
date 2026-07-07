@@ -213,6 +213,24 @@ class VectorStoreManager:
         except Exception as e:
             logger.error(f"清空集合失败: {e}")
 
+    def delete_collection(self, collection_name: str) -> bool:
+        """
+        删除指定名称的集合（供迁移脚本使用）
+
+        Args:
+            collection_name: 要删除的集合名称
+
+        Returns:
+            bool: 删除成功返回 True
+        """
+        try:
+            self.client.delete_collection(collection_name)
+            logger.info(f"集合 {collection_name} 已删除")
+            return True
+        except Exception as e:
+            logger.error(f"删除集合 {collection_name} 失败: {e}")
+            return False
+
     def get_stats(self) -> Dict[str, Any]:
         """
         获取向量存储的统计信息

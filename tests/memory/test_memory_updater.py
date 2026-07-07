@@ -276,7 +276,7 @@ class TestUpdaterNoLLM:
 class TestSessionRecallWrite:
     """SessionMemory v2 写入策略"""
 
-    def test_success_query_writes_session_recall_memory(self, user_memory, session_memory):
+    def test_success_query_writes_session_recall_memory(self, user_memory, session_memory, tmp_path):
         from src.memory.session_recall import HybridSessionRetriever, JsonConversationStore, SessionRecallConfig
 
         class FakeIndex:
@@ -291,7 +291,7 @@ class TestSessionRecallWrite:
                 return []
 
         index = FakeIndex()
-        store = JsonConversationStore("data/test_session_recall_tmp")
+        store = JsonConversationStore(str(tmp_path / "test_session_recall_tmp"))
         retriever = HybridSessionRetriever(index, store, SessionRecallConfig())
         updater = MemoryUpdater(llm_client=None, session_retriever=retriever)
         session_memory.session_id = "s1"

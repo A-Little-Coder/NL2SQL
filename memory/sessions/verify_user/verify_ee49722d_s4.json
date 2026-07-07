@@ -1,0 +1,28 @@
+{
+  "session_id": "verify_ee49722d_s4",
+  "user_id": "verify_user",
+  "created_at": "2026-07-01T14:17:27",
+  "updated_at": "2026-07-01T14:23:09",
+  "status": "active",
+  "conversation_history": [
+    {
+      "turn_index": 1,
+      "timestamp": "2026-07-01T14:23:09",
+      "user_query": "查询洛杉矶的学校总数，以及这些学校的平均入学人数",
+      "final_sql": "SELECT COUNT(*) AS total_schools FROM schools WHERE County = 'Los Angeles';",
+      "cache_hit": false,
+      "result_meta": {
+        "row_count": 1,
+        "columns": [
+          "total_schools"
+        ]
+      }
+    }
+  ],
+  "context_summary": {
+    "last_topic": "查询洛杉矶的学校总数，以及这些学校的平均",
+    "last_tables": [
+      "schools"
+    ]
+  }
+}

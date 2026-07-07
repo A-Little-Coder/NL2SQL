@@ -290,6 +290,8 @@ def main():
     model_name = os.getenv("QWEN_MODEL", "qwen3.6-plus-2026-04-02")
 
     data_dir = str(Path(__file__).parent.parent / "data")
+    memory_dir = os.getenv("MEMORY_DIR", "memory")
+    memory_dir = str(Path(__file__).parent.parent / memory_dir)
     vectorizer, vector_store = prepare_schema_index(data_dir, bge_model_path)
 
     try:
@@ -322,10 +324,10 @@ def main():
     memory_updater = MemoryUpdater(llm_client=llm_client)
 
     session_manager = SessionManager(
-        base_dir=str(Path(data_dir) / "sessions"),
+        base_dir=str(Path(memory_dir) / "sessions"),
         max_cache_size=20,
     )
-    user_memory = UserMemory(user_id=user_id, base_dir=str(Path(data_dir) / "user_memory"))
+    user_memory = UserMemory(user_id=user_id, base_dir=str(Path(memory_dir) / "user_memory"))
     user_memory.load()
 
     # 6. 选择会话

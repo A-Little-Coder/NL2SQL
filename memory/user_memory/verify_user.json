@@ -1,0 +1,45 @@
+{
+  "user_id": "verify_user",
+  "created_at": "2026-06-29T23:06:46",
+  "updated_at": "2026-07-07T16:48:48",
+  "term_preferences": {},
+  "frequently_used_tables": {
+    "schools": {
+      "query_count": 3,
+      "last_used": "2026-07-01"
+    },
+    "superhero": {
+      "query_count": 1,
+      "last_used": "2026-07-07"
+    }
+  },
+  "metric_definitions": {
+    "洛杉矶学校数量": {
+      "description": "统计邮寄城市为洛杉矶的学校总数",
+      "sql_pattern": "SELECT COUNT(*) FROM schools WHERE MailCity = 'Los Angeles'",
+      "source": "auto_learned",
+      "confidence": 0.5,
+      "times_used": 1,
+      "last_used": "2026-06-29"
+    },
+    "公立学校总数": {
+      "description": "统计所在县或邮寄城市包含“Los Angeles”且类型标识为“Public”的学校总数",
+      "sql_pattern": "SELECT COUNT(*) FROM schools WHERE (County LIKE '%Los Angeles%' OR MailCity LIKE '%Los Angeles%') AND SOCType LIKE '%Public%'",
+      "source": "auto_learned",
+      "confidence": 0.5,
+      "times_used": 1,
+      "last_used": "2026-07-01"
+    },
+    "学校总数": {
+      "description": "统计位于洛杉矶县（Los Angeles）的学校总数量",
+      "sql_pattern": "SELECT COUNT(*) FROM schools WHERE County = 'Los Angeles'",
+      "source": "auto_learned",
+      "confidence": 0.5,
+      "times_used": 1,
+      "last_used": "2026-07-01"
+    }
+  },
+  "query_preferences": {},
+  "domain_context": {},
+  "clarification_history": []
+}

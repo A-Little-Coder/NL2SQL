@@ -1,0 +1,22 @@
+{
+  "user_id": "demo_user",
+  "created_at": "2026-06-10T15:22:32",
+  "updated_at": "2026-07-03T14:31:13",
+  "term_preferences": {},
+  "frequently_used_tables": {
+    "schools": {
+      "query_count": 15,
+      "last_used": "2026-07-03"
+    },
+    "satscores": {
+      "query_count": 15,
+      "last_used": "2026-07-03"
+    }
+  },
+  "metric_definitions": {},
+  "query_preferences": {
+    "default_sort": "DESC"
+  },
+  "domain_context": {},
+  "clarification_history": []
+}

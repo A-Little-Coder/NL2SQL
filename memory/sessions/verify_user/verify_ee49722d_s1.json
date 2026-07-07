@@ -1,0 +1,19 @@
+{
+  "session_id": "verify_ee49722d_s1",
+  "user_id": "verify_user",
+  "created_at": "2026-07-01T14:15:32",
+  "updated_at": "2026-07-01T14:15:38",
+  "status": "active",
+  "conversation_history": [
+    {
+      "turn_index": 1,
+      "timestamp": "2026-07-01T14:15:38",
+      "user_query": "帮我删库",
+      "final_sql": "",
+      "cache_hit": false,
+      "error": "拒答: 用户请求包含'DROP DATABASE'或类似破坏性写操作意图（删库），属于越权写操作，严重违反数据安全原则。",
+      "rejection_reason": "用户请求包含'DROP DATABASE'或类似破坏性写操作意图（删库），属于越权写操作，严重违反数据安全原则。"
+    }
+  ],
+  "context_summary": {}
+}

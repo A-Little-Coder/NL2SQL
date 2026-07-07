@@ -75,6 +75,9 @@ def init_globals(data_dir: Optional[str] = None) -> None:
         # 默认项目根的 data/
         data_dir = str(Path(__file__).parent.parent.parent / "data")
 
+    memory_dir = os.getenv("MEMORY_DIR", "memory")
+    memory_dir = str(Path(__file__).parent.parent.parent / memory_dir)
+
     bge_model_path = os.getenv("BGE_M3_MODEL_PATH", "BAAI/bge-m3")
     model_name = os.getenv("QWEN_MODEL", "qwen3.6-plus")
     pool_max_size = int(os.getenv("DB_POOL_MAX_SIZE", "2"))
@@ -119,11 +122,11 @@ def init_globals(data_dir: Optional[str] = None) -> None:
         require_multi_channel_hit=os.getenv("SESSION_RECALL_REQUIRE_MULTI", "false").lower() == "true",
     )
     session_conversation_store = JsonConversationStore(
-        base_dir=str(Path(data_dir) / "session_memory_v2")
+        base_dir=str(Path(memory_dir) / "session_memory_v2")
     )
     session_query_index = ChromaSessionQueryIndex(
         vectorizer=vectorizer,
-        persist_directory=str(Path(data_dir) / "preprocessed" / "chroma"),
+        persist_directory=str(Path(memory_dir) / "chroma"),
         collection_name=session_recall_config.collection_name,
     )
     session_retriever = HybridSessionRetriever(
@@ -136,7 +139,7 @@ def init_globals(data_dir: Optional[str] = None) -> None:
 
     # 5. 会话管理器（文件存储 + 进程 LRU）
     _session_manager = SessionManager(
-        base_dir=str(Path(data_dir) / "sessions"),
+        base_dir=str(Path(memory_dir) / "sessions"),
         max_cache_size=200,
     )
 
@@ -178,6 +181,7 @@ def init_globals(data_dir: Optional[str] = None) -> None:
         memory_updater=memory_updater,
         session_retriever=session_retriever,
         data_dir=data_dir,
+        memory_dir=memory_dir,
         task_planner=task_planner,
         dialog_manager=dialog_manager,
         checkpointer=checkpointer,
@@ -230,7 +234,7 @@ def get_user_memory(user_id: str) -> UserMemory:
     if _globals is None:
         raise RuntimeError("Globals 未初始化")
 
-    base_dir = str(Path(_globals.data_dir) / "user_memory")
+    base_dir = str(Path(_globals.memory_dir) / "user_memory")
     um = UserMemory(user_id=user_id, base_dir=base_dir)
     um.load()
 

@@ -1,0 +1,22 @@
+{
+  "user_id": "hz",
+  "created_at": "2026-06-08T14:32:04",
+  "updated_at": "2026-06-08T14:36:45",
+  "term_preferences": {},
+  "frequently_used_tables": {
+    "schools": {
+      "query_count": 1,
+      "last_used": "2026-06-08"
+    },
+    "satscores": {
+      "query_count": 1,
+      "last_used": "2026-06-08"
+    }
+  },
+  "metric_definitions": {},
+  "query_preferences": {
+    "default_sort": "DESC"
+  },
+  "domain_context": {},
+  "clarification_history": []
+}

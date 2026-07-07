@@ -1,0 +1,30 @@
+{
+  "user_id": "demo_user",
+  "session_id": "demo_session_005",
+  "created_at": "2026-06-25T10:56:40",
+  "updated_at": "2026-07-03T14:31:13",
+  "turns": [
+    {
+      "conversation_id": "demo_session_005",
+      "turn_id": 2,
+      "user_id": "demo_user",
+      "session_id": "demo_session_005",
+      "db_id": "california_schools",
+      "user_query": "查一下各个学校的各科成绩",
+      "final_sql": "SELECT T1.School, T2.AvgScrMath, T2.AvgScrWrite, T2.AvgScrRead FROM schools AS T1 JOIN satscores AS T2 ON T1.CDSCode = T2.cds ORDER BY T2.AvgScrMath DESC",
+      "success": true,
+      "timestamp": "2026-06-25T10:56:40"
+    },
+    {
+      "conversation_id": "demo_session_005",
+      "turn_id": 7,
+      "user_id": "demo_user",
+      "session_id": "demo_session_005",
+      "db_id": "california_schools",
+      "user_query": "列出每个学校的名称和平均阅读成绩",
+      "final_sql": "SELECT T1.School, AVG(T2.AvgScrRead) AS avg_read_score FROM schools AS T1 JOIN satscores AS T2 ON T1.CDSCode = T2.cds GROUP BY T1.School ORDER BY avg_read_score DESC",
+      "success": true,
+      "timestamp": "2026-07-03T14:31:13"
+    }
+  ]
+}

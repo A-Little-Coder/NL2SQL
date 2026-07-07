@@ -70,6 +70,7 @@ class Globals:
     history_cache: Any
     memory_updater: Any
     data_dir: str  # data/ 根目录，用于定位 db 文件
+    memory_dir: str  # memory/ 根目录，用于定位记忆存储文件
     session_retriever: Any = None
     # 反问机制（决策 9-15）；None 时不启用反问，主图退化为直接 EXECUTE
     task_planner: Any = None

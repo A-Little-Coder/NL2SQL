@@ -1,0 +1,17 @@
+{
+  "session_id": "ga-03c58f36",
+  "user_id": "generalist",
+  "created_at": "2026-06-23T16:22:39",
+  "updated_at": "2026-06-23T16:22:41",
+  "status": "active",
+  "conversation_history": [
+    {
+      "turn_index": 1,
+      "timestamp": "2026-06-23T16:22:41",
+      "user_query": "获取 schools 表中前 5 条记录",
+      "final_sql": "",
+      "cache_hit": false
+    }
+  ],
+  "context_summary": {}
+}

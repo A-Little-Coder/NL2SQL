@@ -1,0 +1,21 @@
+{
+  "session_id": "f355b416-ccf2-41c4-91a4-5b7c9a017719",
+  "user_id": "whz",
+  "created_at": "2026-06-09T12:10:47",
+  "updated_at": "2026-06-09T12:11:55",
+  "status": "active",
+  "conversation_history": [
+    {
+      "turn_index": 1,
+      "timestamp": "2026-06-09T12:11:55",
+      "user_query": "[反问] 您提到的「xxxyyy」我没有找到对应的数据字段，能具体说明一下您指的是什么吗？ → 各科成绩",
+      "clarification_round": {
+        "trigger_type": "A",
+        "question": "您提到的「xxxyyy」我没有找到对应的数据字段，能具体说明一下您指的是什么吗？",
+        "answer": "各科成绩",
+        "status": "answered"
+      }
+    }
+  ],
+  "context_summary": {}
+}

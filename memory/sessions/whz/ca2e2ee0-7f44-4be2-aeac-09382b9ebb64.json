@@ -1,0 +1,25 @@
+{
+  "session_id": "ca2e2ee0-7f44-4be2-aeac-09382b9ebb64",
+  "user_id": "whz",
+  "created_at": "2026-06-06T17:24:26",
+  "updated_at": "2026-06-06T17:53:38",
+  "status": "active",
+  "conversation_history": [
+    {
+      "turn_index": 1,
+      "timestamp": "2026-06-06T17:48:19",
+      "user_query": "最多学生的club有多少学生参加",
+      "final_sql": "",
+      "final_result": null,
+      "cache_hit": false,
+      "rejection_reason": "问题核心实体“club（社团/俱乐部）”在提供的数据库 schema 中完全不存在。现有表仅包含成员(member)、活动(event)、出勤(attendance)、预算(budget)和收入(income)，没有任何表或字段用于标识社团或记录成员与社团的归属关系，因此无法按社团统计学生人数。"
+    }
+  ],
+  "context_summary": {
+    "last_topic": "学生的出勤情况是怎么样的？",
+    "last_tables": [
+      "event",
+      "attendance"
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "session_id": "verify_ee49722d_s2",
+  "user_id": "verify_user",
+  "created_at": "2026-07-01T14:15:40",
+  "updated_at": "2026-07-01T14:17:06",
+  "status": "active",
+  "conversation_history": [
+    {
+      "turn_index": 1,
+      "timestamp": "2026-07-01T14:17:06",
+      "user_query": "查询洛杉矶（Los Angeles）的公立学校总数",
+      "final_sql": "SELECT COUNT(*) AS total_public_schools FROM schools WHERE (County LIKE '%Los Angeles%' OR MailCity LIKE '%Los Angeles%') AND SOCType LIKE '%Public%';",
+      "cache_hit": false,
+      "result_meta": {
+        "row_count": 1,
+        "columns": [
+          "total_public_schools"
+        ]
+      }
+    }
+  ],
+  "context_summary": {
+    "last_topic": "查询洛杉矶（Los Angeles）的公",
+    "last_tables": [
+      "schools"
+    ]
+  }
+}
