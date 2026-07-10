@@ -20,8 +20,8 @@ def patched_app(tmp_path, monkeypatch):
         # 触发 _find_databases：必须有 <db_id>.sqlite 或 *.sqlite
         (sub / f"{db_id}.sqlite").write_bytes(b"")
 
-    # mock globals
-    fake_globals = MagicMock(data_dir=str(data_dir))
+    # mock globals（memory_dir 必须给真实路径，否则 get_user_memory 会用 mock 对象当路径落盘到项目根）
+    fake_globals = MagicMock(data_dir=str(data_dir), memory_dir=str(tmp_path / "memory"))
 
     # mock pool：acquire 返回带 mock connector 的 ctx
     class _MockPool:

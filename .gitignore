@@ -49,6 +49,9 @@ vector_store/
 lsh_index/
 indexes/
 
+# Test artifacts (mock 泄漏到项目根的临时记忆目录，正常不应提交)
+MagicMock/
+
 # Logs
 *.log
 
