@@ -40,6 +40,7 @@ def _make_pool(max_size: int = 2) -> DbContextPool:
         history_cache=MagicMock(),
         memory_updater=MagicMock(),
         data_dir="/fake/data",
+        memory_dir="/fake/memory",
     )
     pool = DbContextPool(max_size=max_size, globals_=g)
     # 替换 _build 为 mock 工厂
@@ -160,3 +161,60 @@ def test_release_unknown_db_id_is_noop():
     """release 未 acquire 过的 db_id 不应抛异常"""
     pool = _make_pool(max_size=2)
     pool.release("never_acquired")  # 不应抛
+
+
+# ── _build 端到端注入（harden-history-cache 回归）──────────────
+
+def test_build_passes_llm_client_to_main_graph(monkeypatch):
+    """回归：_build 必须把 g.llm_client 传给 build_main_graph
+
+    历史 bug：db_pool.py 调 build_main_graph 时漏传 llm_client，导致主图 value_rewrite
+    节点恒走 `if llm_client is None` 降级分支（不 emit 事件、adjusted_cached_sql 直接
+    回落原 cached_sql），值参数改写从未生效。该路径被端到端服务验证发现——单元测试
+    因 _make_pool 把 pool._build 整体替换为 mock 而绕过，形成集成盲区。
+
+    本测试 mock 掉 _build 内所有重组件构造，专测 build_main_graph 的 llm_client 注入。
+    """
+    from src.api import db_pool
+
+    # mock _build 内全部重组件，仅保留对 build_main_graph 调用的观测
+    monkeypatch.setattr(db_pool, "_find_db_path",
+                        lambda data_dir, db_id: f"/fake/{db_id}.sqlite")
+    monkeypatch.setattr(db_pool, "DatabaseConnector", MagicMock())
+    monkeypatch.setattr(db_pool, "_prepare_lsh_indexer", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(db_pool, "InformationRetrieval", MagicMock())
+    monkeypatch.setattr(db_pool, "SchemaSelector", MagicMock())
+    monkeypatch.setattr(db_pool, "SQLExecutor", MagicMock())
+    monkeypatch.setattr(db_pool, "SQLFixLoop", MagicMock())
+    # build_single_query_graph 是 _build 内函数级 import，patch 源模块
+    monkeypatch.setattr("src.graph.single_query_graph.build_single_query_graph",
+                        MagicMock(return_value=MagicMock()))
+
+    captured = {}
+
+    def fake_build_main_graph(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(db_pool, "build_main_graph", fake_build_main_graph)
+
+    g = Globals(
+        bge_vectorizer=None,
+        vector_store=None,
+        llm_client=MagicMock(name="the_llm"),
+        generator=MagicMock(),
+        decider=MagicMock(),
+        answerability_checker=MagicMock(),
+        history_cache=MagicMock(),
+        memory_updater=MagicMock(),
+        data_dir="/fake/data",
+        memory_dir="/fake/memory",
+    )
+    pool = DbContextPool(max_size=2, globals_=g)
+
+    pool._build("california_schools")
+
+    # 核心断言：llm_client 必须被注入主图（value_rewrite 节点依赖它）
+    assert "llm_client" in captured, "build_main_graph 必须收到 llm_client 参数"
+    assert captured["llm_client"] is g.llm_client, \
+        "llm_client 必须是 g.llm_client 同一实例，否则 value_rewrite 节点会降级"

@@ -27,6 +27,12 @@ from typing import Any, Callable, Dict, List
 from langgraph.graph import END, START, StateGraph
 from loguru import logger
 
+# harden-history-cache: interrupt 用于 cache_confirm 节点
+try:
+    from langgraph.types import interrupt
+except ImportError:
+    interrupt = None  # type: ignore
+
 from src.graph.state import NL2SQLState
 from src.clarification.dialog import DialogManager
 
@@ -138,13 +144,15 @@ def make_history_cache_node(history_cache) -> Callable[[NL2SQLState], Dict[str, 
             metric_definitions=metric_definitions,
         )
 
-        historical_sql_refs = [] if result.hit else [ref.to_dict() for ref in recalled_refs]
+        # harden-history-cache：命中时也保留 historical_sql_refs，供否定回退时使用
+        historical_sql_refs = [ref.to_dict() for ref in recalled_refs]
 
         out: Dict[str, Any] = {
             "cache_hit": result.hit,
             "cached_sql": result.cached_sql,
             "cache_source": result.source,
             "cache_confidence": result.confidence,
+            "cached_historical_query": getattr(result, "historical_query", None),
             "historical_sql_refs": historical_sql_refs,
             "trace_log": state.get("trace_log", [])
                          + [f"[HistoryCache] hit={result.hit}, source={result.source}, confidence={result.confidence}, recalled={len(recalled_refs)}"],
@@ -157,6 +165,175 @@ def make_history_cache_node(history_cache) -> Callable[[NL2SQLState], Dict[str, 
             "cached_sql": result.cached_sql,
             "recalled": len(recalled_refs),
             "historical_sql_refs": historical_sql_refs,
+        })
+        return out
+
+    return node
+
+
+def make_value_rewrite_node(llm_client=None) -> Callable[[NL2SQLState], Dict[str, Any]]:
+    """构造 ValueRewrite 节点：比对历史查询与当前查询，改写 cached_sql 中的值参数
+
+    Args:
+        llm_client: LLM 客户端实例（应与 HistoryCache 使用同一个），None 时降级透传
+
+    Returns:
+        节点函数，输出 adjusted_cached_sql 字段
+    """
+    from src.memory.prompts import VALUE_REWRITE_PROMPT
+
+    def node(state: NL2SQLState) -> Dict[str, Any]:
+        qid = state.get("query_id", "")
+        cached_sql = state.get("cached_sql", "")
+        historical_query = state.get("cached_historical_query")
+        user_query = state.get("user_query", "")
+
+        # 降级场景：无 cached_sql、无 historical_query、无 llm_client → 直接透传
+        if not cached_sql:
+            return {
+                "adjusted_cached_sql": None,
+                "trace_log": state.get("trace_log", []) + ["[ValueRewrite] skipped (no cached_sql)"],
+            }
+        if not historical_query:
+            return {
+                "adjusted_cached_sql": cached_sql,
+                "trace_log": state.get("trace_log", []) + ["[ValueRewrite] skipped (no historical_query)"],
+            }
+        if llm_client is None:
+            return {
+                "adjusted_cached_sql": cached_sql,
+                "trace_log": state.get("trace_log", []) + ["[ValueRewrite] skipped (no llm_client)"],
+            }
+
+        adjusted_sql = cached_sql
+        changed = False
+        reason = "未变更"
+
+        try:
+            # 调用 VALUE_REWRITE_PROMPT
+            messages = VALUE_REWRITE_PROMPT.format_messages(
+                historical_query=historical_query,
+                user_query=user_query,
+                cached_sql=cached_sql,
+            )
+            response = llm_client.invoke(messages, as_json=True, thinking=False, run_name="value-rewrite")
+
+            if isinstance(response, dict):
+                adjusted_sql = response.get("adjusted_sql", cached_sql)
+                changed = response.get("changed", False)
+                reason = response.get("reason", "未变更")
+        except Exception as e:
+            # 异常降级：透传原 cached_sql
+            logger.warning(f"[qid={qid}] [ValueRewrite] 异常降级: {e}")
+            adjusted_sql = cached_sql
+            changed = False
+            reason = f"异常降级: {e}"
+
+        out: Dict[str, Any] = {
+            "adjusted_cached_sql": adjusted_sql,
+            "trace_log": state.get("trace_log", [])
+                         + [f"[ValueRewrite] changed={changed}, reason={reason}"],
+        }
+        emit_safe("value_rewrite", {
+            "historical_query": historical_query,
+            "user_query": user_query,
+            "cached_sql": cached_sql,
+            "adjusted_cached_sql": adjusted_sql,
+            "changed": changed,
+            "reason": reason,
+        })
+        return out
+
+    return node
+
+
+def make_cache_confirm_node() -> Callable[[NL2SQLState], Dict[str, Any]]:
+    """构造 CacheConfirm 节点：向用户确认是否复用 cached_sql（或 adjusted_cached_sql）
+
+    测试逃逸：若 state.cache_confirm_approved 已预置（非 None），则跳过 interrupt
+
+    Returns:
+        节点函数，输出 cache_confirm_approved 字段；若用户否定，则同时置 cache_hit=False 并清空 cached_sql
+    """
+
+    def node(state: NL2SQLState) -> Dict[str, Any]:
+        qid = state.get("query_id", "")
+        cached_sql = state.get("cached_sql", "")
+        adjusted_sql = state.get("adjusted_cached_sql")
+        historical_query = state.get("cached_historical_query", "")
+        user_query = state.get("user_query", "")
+
+        # 测试逃逸：已预置 approved 值，直接使用
+        pre_approved = state.get("cache_confirm_approved")
+        if pre_approved is not None:
+            logger.info(f"[qid={qid}] [CacheConfirm] 使用预置 approved={pre_approved}")
+            out: Dict[str, Any] = {
+                "cache_confirm_approved": pre_approved,
+            }
+            if not pre_approved:
+                out["cache_hit"] = False
+                out["cached_sql"] = None
+            return out
+
+        # 构造确认文本：意图为主，SQL 为辅
+        sql_to_show = adjusted_sql if adjusted_sql else cached_sql
+        # SQL 截断：超 5 行或 200 字符
+        if sql_to_show:
+            lines = sql_to_show.splitlines()
+            if len(lines) > 5:
+                sql_to_show = "\n".join(lines[:5]) + "\n... (已截断)"
+            elif len(sql_to_show) > 200:
+                sql_to_show = sql_to_show[:200] + "... (已截断)"
+
+        confirm_question = f"""检测到历史相似查询，是否复用？
+
+历史查询: {historical_query}
+当前查询: {user_query}
+
+复用方式: 意图等价直接复用{f"（已自动改写值参数）" if adjusted_sql else ""}
+
+待执行 SQL:
+{sql_to_show}"""
+
+        # 构造 interrupt payload（兼容 query.py 中的 clarification 事件处理）
+        payload = {
+            "question": confirm_question,
+            "ambiguities": [],
+            "round": 1,
+        }
+
+        # 调用 interrupt
+        if interrupt is None:
+            # 无 interrupt 时降级：自动复用（向后兼容）
+            logger.warning(f"[qid={qid}] [CacheConfirm] interrupt 不可用，自动复用")
+            emit_safe("cache_confirm", {
+                "skipped": True,
+                "reason": "interrupt unavailable",
+                "approved": True,
+            })
+            return {"cache_confirm_approved": True}
+
+        user_choice = interrupt(payload)
+
+        # 解析用户选择
+        approved = str(user_choice).strip() in {"复用", "reuse", "yes", "是", "1", "y", "确认", "Y", "YES"}
+
+        out: Dict[str, Any] = {
+            "cache_confirm_approved": approved,
+        }
+        if approved:
+            out["trace_log"] = state.get("trace_log", []) + ["[CacheConfirm] 用户确认复用"]
+        else:
+            # 用户否定：置 cache_hit=False 并清空 cached_sql，使 single_query_graph 走完整 ir 链路
+            out["cache_hit"] = False
+            out["cached_sql"] = None
+            out["trace_log"] = state.get("trace_log", []) + ["[CacheConfirm] 用户选择重新生成"]
+
+        emit_safe("cache_confirm", {
+            "approved": approved,
+            "user_choice": str(user_choice),
+            "historical_query": historical_query,
+            "user_query": user_query,
         })
         return out
 
@@ -676,11 +853,11 @@ def make_execution_node(fix_loop) -> Callable[[NL2SQLState], Dict[str, Any]]:
 
     def node(state: NL2SQLState) -> Dict[str, Any]:
         qid = state.get("query_id", "")
-        # 如果 history_cache 命中，从 cached_sql 构造候选
+        # 如果 history_cache 命中，从 adjusted_cached_sql（优先）或 cached_sql 构造候选
         if state.get("cache_hit", False):
-            cached_sql = state.get("cached_sql", "")
+            cached_sql = state.get("adjusted_cached_sql") or state.get("cached_sql", "")
             if not cached_sql:
-                return {"error": "cache_hit=True 但 cached_sql 为空"}
+                return {"error": "cache_hit=True 但 cached_sql 与 adjusted_cached_sql 均为空"}
 
             cand = SQLCandidate(
                 id="cache_hit",
@@ -896,11 +1073,12 @@ def build_main_graph(
     orchestrator=None,
     summarizer=None,
     single_query_graph=None,
+    llm_client=None,
 ):
     """
-    构造并编译 NL2SQL 主图（refactor-single-query-graph 后瘦身版）
+    构造并编译 NL2SQL 主图（refactor-single-query-graph 后瘦身版 + harden-history-cache）
 
-    主图只负责「分流 + 记忆」：history_cache → task_planner →
+    主图只负责「分流 + 记忆」：history_cache → (value_rewrite → cache_confirm / task_planner) →
     (run_single_query | run_subqueries | END) → memory_update。
     单查询流水线 ir/ss/cg/execution/decision 已下沉到 single_query_graph。
 
@@ -917,6 +1095,7 @@ def build_main_graph(
         summarizer: ResultSummarizer 实例（决策 15，可选；多结果汇总）
         single_query_graph: 已编译的单查询流水线图（refactor-single-query-graph）。
             None 时内部用 retriever/selector/... 自动编译，向后兼容旧调用方式。
+        llm_client: LLM 客户端实例（供 value_rewrite 使用，应与 HistoryCache 同一个）
 
     Returns:
         CompiledGraph: 已编译主图，可调用 .invoke(initial_state)
@@ -937,6 +1116,10 @@ def build_main_graph(
 
     # 节点：历史命中检测（START 之后）
     graph.add_node("history_cache", _wrap_node("history_cache", make_history_cache_node(history_cache)))
+    # 节点：ValueRewrite（harden-history-cache：值参数改写）
+    graph.add_node("value_rewrite", _wrap_node("value_rewrite", make_value_rewrite_node(llm_client)))
+    # 节点：CacheConfirm（harden-history-cache：用户确认复用）
+    graph.add_node("cache_confirm", _wrap_node("cache_confirm", make_cache_confirm_node()))
     # 节点：TaskPlanner 意图理解（决策 9，IR 之前）
     graph.add_node("task_planner", _wrap_node("task_planner", make_task_planner_node(task_planner, dialog_manager)))
     # 节点：单查询流水线（ir/ss/cg/execution/decision 下沉至此，refactor-single-query-graph）
@@ -952,19 +1135,24 @@ def build_main_graph(
     # 入口 → history_cache
     graph.add_edge(START, "history_cache")
 
-    # HistoryCache 条件分支（refactor-single-query-graph）：
-    #   命中 → run_single_query（跳过 task_planner；cache 短路在子图入口直奔 execution）
+    # HistoryCache 条件分支（harden-history-cache）：
+    #   命中 → value_rewrite → cache_confirm → run_single_query
     #   未命中 → task_planner
     def route_after_cache(state: NL2SQLState) -> str:
         if state.get("cache_hit", False):
-            return "run_single_query"
+            return "value_rewrite"
         return "task_planner"
 
     graph.add_conditional_edges(
         "history_cache",
         route_after_cache,
-        {"task_planner": "task_planner", "run_single_query": "run_single_query"},
+        {"task_planner": "task_planner", "value_rewrite": "value_rewrite"},
     )
+
+    # value_rewrite → cache_confirm
+    graph.add_edge("value_rewrite", "cache_confirm")
+    # cache_confirm → run_single_query
+    graph.add_edge("cache_confirm", "run_single_query")
 
     # TaskPlanner 三选一条件分支（决策 9/14）：
     #   REJECT → END（拒答）

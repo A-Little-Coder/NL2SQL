@@ -21,6 +21,7 @@ class CacheResult:
     cached_sql: Optional[str] = None
     source: Optional[str] = None  # "session_history" | "metric_definition"
     confidence: float = 0.0
+    historical_query: Optional[str] = None  # 命中的历史 query（仅 source=session_history 时有效）
 
 
 # Prompt 已迁移至 src/memory/prompts.py
@@ -91,7 +92,7 @@ class HistoryCache:
             # 历史缓存检测属于"准实时"场景：直接走 invoke 而不是 stream
             # （响应快 + 不需要 SSE 推送 + 不需要思考链：规则明确，输出固定）
             data = self._llm.invoke(messages, as_json=True, thinking=False, run_name="cache-check")
-            result = self._parse_response(data)
+            result = self._parse_response(data, session_history)
         except Exception:
             # LLM 调用失败时安全降级：不走缓存
             return CacheResult(hit=False)
@@ -128,7 +129,7 @@ class HistoryCache:
             lines.append(f"{name}({desc}): {pattern}")
         return "\n".join(lines)
 
-    def _parse_response(self, response) -> CacheResult:
+    def _parse_response(self, response, session_history: List[Dict[str, Any]]) -> CacheResult:
         """解析 LLM 返回的 JSON 结果"""
         try:
             if isinstance(response, str):
@@ -137,11 +138,38 @@ class HistoryCache:
             else:
                 data = response
 
+            hit = data.get("can_reuse", False)
+            source = data.get("source")
+            matched_turn_index = data.get("matched_turn_index")
+
+            # 从 session_history 中回填命中的历史 query
+            # 优先用 matched_turn_index 匹配；不准/缺失时用 cached_sql 精确反查兜底
+            # （LLM 返回的 matched_turn_index 在多候选时不稳定，cached_sql 字符串匹配更可靠）
+            historical_query = None
+            cached_sql = data.get("cached_sql")
+            if hit and source == "session_history":
+                if matched_turn_index is not None:
+                    # 兼容 int/str 类型的 turn_index/turn_id
+                    for turn in session_history:
+                        idx = turn.get("turn_index", turn.get("turn_id"))
+                        if idx is not None and str(idx) == str(matched_turn_index):
+                            historical_query = turn.get("user_query", turn.get("historical_query"))
+                            break
+                if historical_query is None and cached_sql:
+                    # 兜底：按 cached_sql 精确反查（忽略首尾空白与末尾分号差异）
+                    norm = lambda s: str(s).strip().rstrip(";").strip()
+                    for turn in session_history:
+                        turn_sql = turn.get("final_sql", turn.get("historical_sql"))
+                        if turn_sql and norm(turn_sql) == norm(cached_sql):
+                            historical_query = turn.get("user_query", turn.get("historical_query"))
+                            break
+
             return CacheResult(
-                hit=data.get("can_reuse", False),
+                hit=hit,
                 cached_sql=data.get("cached_sql"),
-                source=data.get("source"),
+                source=source,
                 confidence=data.get("confidence", 0.0),
+                historical_query=historical_query,
             )
         except (ValueError, TypeError, KeyError):
             return CacheResult(hit=False)

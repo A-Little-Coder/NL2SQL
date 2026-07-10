@@ -235,16 +235,26 @@ def test_no_database_filter_degrades():
 # ============================================================================
 
 def test_cache_hit_short_circuits_schema_finalize():
-    """cache_hit=True：跳过 ir/ss/schema_finalize，直接 execution。"""
+    """cache_hit=True：跳过 ir/ss/schema_finalize，直接 execution（使用 adjusted_cached_sql 优先）。"""
     from src.graph import create_initial_state
     from src.graph.single_query_graph import build_single_query_graph
 
     retr, sel, gen, fix, dec, _ = _mock_agents_for_join(join_text_expected=False)
+    # 记录实际执行的 SQL
+    executed_sql = []
+    original_execute = fix.executor.execute
+
+    def _record_execute(sql):
+        executed_sql.append(sql)
+        return original_execute(sql)
+    fix.executor.execute = _record_execute
+
     graph = build_single_query_graph(retr, sel, gen, fix, dec)
 
     state = create_initial_state(user_query="缓存命中查询", database_filter="california_schools")
     state["cache_hit"] = True
-    state["cached_sql"] = "SELECT 1"
+    state["cached_sql"] = "SELECT old"
+    state["adjusted_cached_sql"] = "SELECT new"  # harden-history-cache
     result = graph.invoke(state)
 
     # IR 未被调用（build_graph.invoke 没触发）
@@ -253,3 +263,49 @@ def test_cache_hit_short_circuits_schema_finalize():
     assert sel.build_graph.return_value.invoke.call_count == 0
     # join_paths_text 为空（schema_finalize 未执行）
     assert result.get("join_paths_text", "") == ""
+    # 验证执行了 adjusted_cached_sql
+    assert executed_sql == ["SELECT new"]
+
+
+def test_cache_hit_falls_back_to_cached_sql():
+    """cache_hit=True 且 adjusted_cached_sql 为空：回退使用 cached_sql。"""
+    from src.graph import create_initial_state
+    from src.graph.single_query_graph import build_single_query_graph
+
+    retr, sel, gen, fix, dec, _ = _mock_agents_for_join(join_text_expected=False)
+    # 记录实际执行的 SQL
+    executed_sql = []
+    original_execute = fix.executor.execute
+
+    def _record_execute(sql):
+        executed_sql.append(sql)
+        return original_execute(sql)
+    fix.executor.execute = _record_execute
+
+    graph = build_single_query_graph(retr, sel, gen, fix, dec)
+
+    state = create_initial_state(user_query="缓存命中查询", database_filter="california_schools")
+    state["cache_hit"] = True
+    state["cached_sql"] = "SELECT fallback"
+    state["adjusted_cached_sql"] = None
+    result = graph.invoke(state)
+
+    # 验证执行了 cached_sql（回退）
+    assert executed_sql == ["SELECT fallback"]
+
+
+def test_cache_hit_both_sql_empty_returns_error():
+    """cache_hit=True 但 cached_sql 与 adjusted_cached_sql 均为空：execution 返回 error。"""
+    from src.graph import create_initial_state
+    from src.graph.single_query_graph import build_single_query_graph
+
+    retr, sel, gen, fix, dec, _ = _mock_agents_for_join(join_text_expected=False)
+    graph = build_single_query_graph(retr, sel, gen, fix, dec)
+
+    state = create_initial_state(user_query="缓存命中查询", database_filter="california_schools")
+    state["cache_hit"] = True
+    state["cached_sql"] = ""
+    state["adjusted_cached_sql"] = None
+    result = graph.invoke(state)
+
+    assert "cache_hit" in (result.get("error") or "")

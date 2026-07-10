@@ -142,12 +142,42 @@ class TestSingleQueryGraph(unittest.TestCase):
         out = graph.invoke({"user_query": "查苹果", "cache_hit": True, "cached_sql": "SELECT 42"})
         self.assertEqual(out.get("final_sql"), "SELECT 1")  # decision mock 仍返回 SELECT 1
 
+    def test_cache_hit_uses_adjusted_cached_sql(self):
+        """cache 命中且有 adjusted_cached_sql → execution 优先使用 adjusted_cached_sql（harden-history-cache）"""
+        comps = _make_components()
+        # 覆盖 execution 的 fix_loop.executor.execute 来记录实际执行的 SQL
+        retriever, selector, generator, fix_loop, decider, answerability = comps
+        executed_sql = []
+        original_execute = fix_loop.executor.execute
+
+        def _record_execute(sql):
+            executed_sql.append(sql)
+            return original_execute(sql)
+        fix_loop.executor.execute = MagicMock(side_effect=_record_execute)
+
+        graph = _build_graph(comps)
+        out = graph.invoke({
+            "user_query": "查苹果",
+            "cache_hit": True,
+            "cached_sql": "SELECT old",
+            "adjusted_cached_sql": "SELECT new"
+        })
+        # 验证 execution 执行了 adjusted_cached_sql
+        self.assertEqual(len(executed_sql), 1)
+        self.assertEqual(executed_sql[0], "SELECT new")
+        self.assertEqual(out.get("final_sql"), "SELECT 1")
+
     def test_cache_hit_empty_sql(self):
-        """cache 命中但 cached_sql 空 → execution 写 error，无候选 → decision 失败"""
+        """cache 命中但 cached_sql 与 adjusted_cached_sql 均为空 → execution 写 error（harden-history-cache）"""
         comps = _make_components()
         graph = _build_graph(comps)
-        out = graph.invoke({"user_query": "查苹果", "cache_hit": True, "cached_sql": ""})
-        # execution 节点 cache_hit 分支：cached_sql 空 → return error，无候选
+        out = graph.invoke({
+            "user_query": "查苹果",
+            "cache_hit": True,
+            "cached_sql": "",
+            "adjusted_cached_sql": None
+        })
+        # execution 节点 cache_hit 分支：SQL 均为空 → return error
         self.assertIn("cache_hit", out.get("error", "") or "")
         self.assertFalse(out.get("final_sql"))
 

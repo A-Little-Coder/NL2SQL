@@ -71,6 +71,7 @@ class TestCacheHitSessionHistory:
             "source": "session_history",
             "cached_sql": "SELECT SUM(amount) FROM sales WHERE product='Apple'",
             "confidence": 0.95,
+            "matched_turn_index": 1,
             "reason": "查询与历史轮次 1 完全相同",
         })
         cache = HistoryCache(mock, min_confidence=0.8)
@@ -85,6 +86,92 @@ class TestCacheHitSessionHistory:
         assert result.source == "session_history"
         assert result.cached_sql is not None
         assert result.confidence >= 0.8
+        assert result.historical_query == "查询苹果的销售额"
+
+    def test_hit_with_historical_query_backfill(self):
+        """命中时应从 session_history 回填 historical_query"""
+        mock = MockLLMClient({
+            "can_reuse": True,
+            "source": "session_history",
+            "cached_sql": "SELECT SUM(amount) FROM sales WHERE product='Apple'",
+            "confidence": 0.95,
+            "matched_turn_index": 2,
+            "reason": "查询与历史轮次 2 等价",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="查一下苹果的销售额",
+            session_history=[
+                {"turn_index": 1, "user_query": "查询三星的销售额", "final_sql": "SELECT SUM(amount) FROM sales WHERE product='Samsung'"},
+                {"turn_index": 2, "user_query": "查询苹果的销售额", "final_sql": "SELECT SUM(amount) FROM sales WHERE product='Apple'"},
+            ],
+            metric_definitions=[],
+        )
+        assert result.hit is True
+        assert result.historical_query == "查询苹果的销售额"
+
+    def test_hit_with_turn_id_instead_of_turn_index(self):
+        """兼容 turn_id 字段名"""
+        mock = MockLLMClient({
+            "can_reuse": True,
+            "source": "session_history",
+            "cached_sql": "SELECT 1",
+            "confidence": 0.9,
+            "matched_turn_index": "abc123",
+            "reason": "命中",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="测试",
+            session_history=[
+                {"turn_id": "abc123", "user_query": "历史查询", "final_sql": "SELECT 1"},
+            ],
+            metric_definitions=[],
+        )
+        assert result.historical_query == "历史查询"
+
+    def test_matched_turn_index_not_found_falls_back_to_sql(self):
+        """matched_turn_index 不准时，用 cached_sql 反查兜底回填 historical_query"""
+        mock = MockLLMClient({
+            "can_reuse": True,
+            "source": "session_history",
+            "cached_sql": "SELECT 1",
+            "confidence": 0.9,
+            "matched_turn_index": 999,  # 故意给不存在的索引，触发 cached_sql 兜底
+            "reason": "命中",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="测试",
+            session_history=[
+                {"turn_index": 1, "user_query": "历史查询", "final_sql": "SELECT 1"},
+            ],
+            metric_definitions=[],
+        )
+        assert result.hit is True
+        # matched_turn_index=999 找不到，但 cached_sql 与 turn.final_sql 匹配 -> 兜底回填
+        assert result.historical_query == "历史查询"
+
+    def test_matched_turn_index_and_sql_both_not_found(self):
+        """matched_turn_index 不准且 cached_sql 也反查不到时，historical_query 为 None"""
+        mock = MockLLMClient({
+            "can_reuse": True,
+            "source": "session_history",
+            "cached_sql": "SELECT 999",  # 与任何历史 final_sql 都不匹配
+            "confidence": 0.9,
+            "matched_turn_index": 999,
+            "reason": "命中",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="测试",
+            session_history=[
+                {"turn_index": 1, "user_query": "历史查询", "final_sql": "SELECT 1"},
+            ],
+            metric_definitions=[],
+        )
+        assert result.hit is True
+        assert result.historical_query is None
 
 
 # ── Test: 命中 metric_definition ──────────────────────────────
@@ -99,6 +186,7 @@ class TestCacheHitMetric:
             "source": "metric_definition",
             "cached_sql": "SELECT SUM(amount) FROM sales",
             "confidence": 0.9,
+            "matched_turn_index": None,
             "reason": "当前查询匹配已知指标定义「销售额」",
         })
         cache = HistoryCache(mock, min_confidence=0.8)
@@ -110,6 +198,27 @@ class TestCacheHitMetric:
         assert result.hit is True
         assert result.source == "metric_definition"
         assert result.confidence >= 0.8
+
+    def test_metric_definition_hit_has_no_historical_query(self, metric_definitions):
+        """metric_definition 命中时 historical_query 应为 None"""
+        mock = MockLLMClient({
+            "can_reuse": True,
+            "source": "metric_definition",
+            "cached_sql": "SELECT SUM(amount) FROM sales",
+            "confidence": 0.9,
+            "matched_turn_index": None,
+            "reason": "匹配指标",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="查一下总销售额",
+            session_history=[
+                {"turn_index": 1, "user_query": "历史查询", "final_sql": "SELECT 1"},
+            ],
+            metric_definitions=metric_definitions,
+        )
+        assert result.hit is True
+        assert result.historical_query is None
 
 
 # ── Test: 未命中 ──────────────────────────────────────────────
@@ -135,6 +244,7 @@ class TestCacheMiss:
             "source": None,
             "cached_sql": None,
             "confidence": 0.0,
+            "matched_turn_index": None,
             "reason": "当前查询与历史不匹配",
         })
         cache = HistoryCache(mock, min_confidence=0.8)
@@ -144,6 +254,7 @@ class TestCacheMiss:
             metric_definitions=[],
         )
         assert result.hit is False
+        assert result.historical_query is None
 
 
 # ── Test: 低置信度过滤 ────────────────────────────────────────
@@ -158,12 +269,31 @@ class TestLowConfidence:
             "source": "session_history",
             "cached_sql": "SELECT ...",
             "confidence": 0.7,
+            "matched_turn_index": 1,
             "reason": "有点相似但不确定",
         })
         cache = HistoryCache(mock, min_confidence=0.8)
         result = cache.check(
             user_query="查询苹果的销售额",
             session_history=[{"turn_index": 1, "user_query": "查询苹果的销售额", "final_sql": "SELECT ..."}],
+            metric_definitions=[],
+        )
+        assert result.hit is False
+
+    def test_empty_cached_sql(self):
+        """can_reuse=True 但 cached_sql 为空时应返回未命中"""
+        mock = MockLLMClient({
+            "can_reuse": True,
+            "source": "session_history",
+            "cached_sql": None,
+            "confidence": 0.9,
+            "matched_turn_index": 1,
+            "reason": "有命中但无 SQL",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="测试查询",
+            session_history=[{"turn_index": 1, "user_query": "测试查询", "final_sql": ""}],
             metric_definitions=[],
         )
         assert result.hit is False
@@ -186,24 +316,103 @@ class TestLowConfidence:
         assert result.hit is False
 
 
-# ── Test: 时间相关 follow-up ─────────────────────────────────
+# ── Test: 值参数变化 follow-up ─────────────────────────────────
 
-class TestTimeRelatedFollowUp:
-    """时间相关的 follow-up 不复用"""
+class TestValueParameterRelatedFollowUp:
+    """值参数变化的 follow-up 仍可复用（交由 value_rewrite 改写）"""
 
-    def test_llm_rejects_time_change(self):
-        """时间变化的 follow-up 应返回未命中"""
+    def test_llm_allows_time_change_reuse(self):
+        """时间变化的 follow-up 应返回命中，historical_query 回填"""
         mock = MockLLMClient({
-            "can_reuse": False,
-            "source": None,
-            "cached_sql": None,
-            "confidence": 0.0,
-            "reason": "涉及时间范围变化",
+            "can_reuse": True,
+            "source": "session_history",
+            "cached_sql": "SELECT SUM(amount) FROM sales WHERE year=2025",
+            "confidence": 0.9,
+            "matched_turn_index": 1,
+            "reason": "意图等价，值参数差异交由值改写阶段处理",
         })
         cache = HistoryCache(mock, min_confidence=0.8)
         result = cache.check(
             user_query="那去年的呢",
-            session_history=[{"turn_index": 1, "user_query": "查询今年的销售额", "final_sql": "SELECT ..."}],
+            session_history=[{"turn_index": 1, "user_query": "查询今年的销售额", "final_sql": "SELECT SUM(amount) FROM sales WHERE year=2025"}],
+            metric_definitions=[],
+        )
+        assert result.hit is True
+        assert result.historical_query == "查询今年的销售额"
+        assert result.cached_sql is not None
+
+    def test_llm_allows_region_change_reuse(self):
+        """地区变化的 follow-up 应返回命中，historical_query 回填"""
+        mock = MockLLMClient({
+            "can_reuse": True,
+            "source": "session_history",
+            "cached_sql": "SELECT SUM(amount) FROM sales WHERE region='华北'",
+            "confidence": 0.9,
+            "matched_turn_index": 1,
+            "reason": "意图等价，值参数差异交由值改写阶段处理",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="那华北区的呢",
+            session_history=[{"turn_index": 1, "user_query": "查询华东区的销售额", "final_sql": "SELECT SUM(amount) FROM sales WHERE region='华东'"}],
+            metric_definitions=[],
+        )
+        assert result.hit is True
+        assert result.historical_query == "查询华东区的销售额"
+        assert result.cached_sql is not None
+
+    def test_llm_allows_limit_change_reuse(self):
+        """LIMIT 值变化的 follow-up 应返回命中，historical_query 回填"""
+        mock = MockLLMClient({
+            "can_reuse": True,
+            "source": "session_history",
+            "cached_sql": "SELECT product FROM sales ORDER BY amount DESC LIMIT 20",
+            "confidence": 0.9,
+            "matched_turn_index": 1,
+            "reason": "意图等价，值参数差异交由值改写阶段处理",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="那前20名呢",
+            session_history=[{"turn_index": 1, "user_query": "查询销售额前10名的产品", "final_sql": "SELECT product FROM sales ORDER BY amount DESC LIMIT 10"}],
+            metric_definitions=[],
+        )
+        assert result.hit is True
+        assert result.historical_query == "查询销售额前10名的产品"
+        assert result.cached_sql is not None
+
+    def test_llm_disallows_structure_change(self):
+        """结构变化（增删 WHERE 谓词）不应命中"""
+        mock = MockLLMClient({
+            "can_reuse": False,
+            "source": None,
+            "cached_sql": None,
+            "confidence": 0.5,
+            "matched_turn_index": None,
+            "reason": "结构变化，增删了 WHERE 谓词，不应复用",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="查询华东区今年的销售额",
+            session_history=[{"turn_index": 1, "user_query": "查询今年的销售额", "final_sql": "SELECT SUM(amount) FROM sales WHERE year=2025"}],
+            metric_definitions=[],
+        )
+        assert result.hit is False
+
+    def test_llm_disallows_intent_change(self):
+        """意图变化（销售额→利润）不应命中"""
+        mock = MockLLMClient({
+            "can_reuse": False,
+            "source": None,
+            "cached_sql": None,
+            "confidence": 0.3,
+            "matched_turn_index": None,
+            "reason": "意图变化，指标不同，不应复用",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="查询利润",
+            session_history=[{"turn_index": 1, "user_query": "查询销售额", "final_sql": "SELECT SUM(amount) FROM sales"}],
             metric_definitions=[],
         )
         assert result.hit is False
@@ -257,6 +466,7 @@ class TestCacheResultData:
         assert r.cached_sql is None
         assert r.source is None
         assert r.confidence == 0.0
+        assert r.historical_query is None
 
     def test_custom_values(self):
         """自定义值应正确设置"""
@@ -265,11 +475,25 @@ class TestCacheResultData:
             cached_sql="SELECT 1",
             source="session_history",
             confidence=0.95,
+            historical_query="历史查询",
         )
         assert r.hit is True
         assert r.cached_sql == "SELECT 1"
         assert r.source == "session_history"
         assert r.confidence == 0.95
+        assert r.historical_query == "历史查询"
+
+    def test_miss_has_no_historical_query(self):
+        """未命中时 historical_query 保持 None"""
+        r = CacheResult(
+            hit=False,
+            cached_sql=None,
+            source=None,
+            confidence=0.0,
+            historical_query=None,
+        )
+        assert r.hit is False
+        assert r.historical_query is None
 
 
 # ── Test: Prompt 构建 ─────────────────────────────────────────

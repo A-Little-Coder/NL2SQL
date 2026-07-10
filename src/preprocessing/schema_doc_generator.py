@@ -14,11 +14,10 @@ class SchemaColumnDocGenerator:
     """
     Schema 列文档生成器
 
-    按决策19顺序：
-        {table_name} {original_column_name} {column_name} {data_type}
-        {column_description} {value_description} {data_format} {column_name}
+    格式: {table_name} | {original_column_name} | {desc}
+    desc 优先级: column_description → value_description → column_name → original_column_name
 
-    （末尾重复 column_name 一次做 boost）
+    （无末尾 boost）
     """
 
     def __init__(self):

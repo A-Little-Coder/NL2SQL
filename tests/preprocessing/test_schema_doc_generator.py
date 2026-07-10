@@ -25,8 +25,8 @@ class TestSchemaColumnDocGenerator:
         )
         assert "users" in doc
         assert "id" in doc
-        assert "用户ID" in doc
-        assert doc.count("用户ID") == 2  # 末尾 boost
+        assert "用户id" in doc
+        assert doc == "users | id | 用户id"
 
     def test_format_column_document_with_description(self):
         """带描述的文档"""
@@ -37,18 +37,18 @@ class TestSchemaColumnDocGenerator:
             data_type="DECIMAL",
             column_description="订单总金额，包含运费",
         )
-        assert "订单总额" in doc
+        assert doc == "orders | total_amt | 订单总金额，包含运费"
         assert "订单总金额，包含运费" in doc
 
-    def test_format_column_document_boost(self):
-        """验证末尾 boost"""
+    def test_format_column_document_no_boost(self):
+        """验证无末尾 boost，格式为 {table} | {original} | {desc}"""
         doc = SchemaColumnDocGenerator.format_column_document(
             table_name="t",
             original_column_name="x",
             column_name="销量",
         )
-        # 结构：t x 销量 销量
-        assert doc.startswith("t x 销量")
+        # 结构：t | x | 销量（无 boost）
+        assert doc == "t | x | 销量"
         assert doc.endswith("销量")
 
     def test_build_column_metadata_basic(self):

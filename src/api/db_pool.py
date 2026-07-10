@@ -259,6 +259,7 @@ class DbContextPool:
             orchestrator=orchestrator,
             summarizer=g.summarizer,
             single_query_graph=single_query_graph,
+            llm_client=g.llm_client,
         )
 
         return DbContext(

@@ -41,12 +41,22 @@ class TestShouldWriteSessionTurn(unittest.TestCase):
         self.assertFalse(_should_write_session_turn(accumulated))
 
     def test_smartfix_failed_not_written(self):
-        """SmartFix 全失败（有候选 SQL 但 fix_failed、final_sql 空）不入会话"""
+        """SmartFix 全失败（有候选 SQL 且 fix_failed=True、final_sql 非空）不入会话"""
         accumulated = {
-            "final_sql": "",
+            "final_sql": "SELECT * FROM non_existent_table",
             "fix_failed": True,
             "decision_path": "E",
-            "last_error": "SmartFix 3 轮失败",
+            "last_error": "SmartFix 3 轮失败: 表不存在",
+        }
+        self.assertFalse(_should_write_session_turn(accumulated))
+
+    def test_fixfailed_nonempty_sql_not_written(self):
+        """SmartFix 失败但 final_sql 非空（盲区覆盖）不入会话"""
+        accumulated = {
+            "final_sql": "SELECT invalid_column FROM schools",
+            "fix_failed": True,
+            "decision_path": "E",
+            "last_error": "SmartFix 失败: 列不存在",
         }
         self.assertFalse(_should_write_session_turn(accumulated))
 

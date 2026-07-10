@@ -71,6 +71,11 @@ class NL2SQLState(TypedDict, total=False):
         metric_definitions: 用户记忆中的指标定义（由 API 层注入）
         historical_sql_refs: HistoryCache 不复用时保留的历史 query/sql 弱参考
 
+        # ===== 缓存复用增强（harden-history-cache）=====
+        cached_historical_query: 命中的历史 query（供 value_rewrite 使用）
+        adjusted_cached_sql: 经值参数改写后的 cached_sql
+        cache_confirm_approved: 用户是否确认复用（True=复用，False=重新生成）
+
         # ===== 内部注入（API 层注入，graph 节点内部使用）=====
         _user_memory: Any  # UserMemory 实例
         _session_memory: Any  # SessionMemory 实例
@@ -142,6 +147,11 @@ class NL2SQLState(TypedDict, total=False):
     metric_definitions: List[Dict[str, Any]]
     historical_sql_refs: List[Dict[str, Any]]  # 不可复用历史的 query/sql 弱参考
 
+    # ===== 缓存复用增强（harden-history-cache）=====
+    cached_historical_query: Optional[str]  # 命中的历史 query（供 value_rewrite 使用）
+    adjusted_cached_sql: Optional[str]  # 经值参数改写后的 cached_sql
+    cache_confirm_approved: Optional[bool]  # 用户是否确认复用（True=复用，False=重新生成）
+
     # ===== 内部注入 =====
     _user_memory: Any
     _session_memory: Any
@@ -212,6 +222,9 @@ def create_initial_state(
         cache_confidence=0.0,
         metric_definitions=[],
         historical_sql_refs=[],
+        cached_historical_query=None,
+        adjusted_cached_sql=None,
+        cache_confirm_approved=None,
         _user_memory=None,
         _session_memory=None,
         error=None,

@@ -75,7 +75,11 @@ def build_single_query_graph(
 
     # ---- 入口：history_cache 命中短路（跳过 ir/ss/cg 直奔 execution）----
     def route_start(state: NL2SQLState) -> str:
-        return "execution" if state.get("cache_hit", False) else "ir"
+        if state.get("cache_hit", False):
+            # 若 cache_hit=True 但 SQL 均为空，不应该走到这里（应该在主图或 execution 处理）
+            # 这里仍路由到 execution，由 execution 节点返回 error
+            return "execution"
+        return "ir"
 
     graph.add_conditional_edges(START, route_start, {"ir": "ir", "execution": "execution"})
 

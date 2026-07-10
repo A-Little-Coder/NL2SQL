@@ -42,9 +42,9 @@ from src.graph.state import create_initial_state
 def _should_write_session_turn(accumulated: Dict[str, Any]) -> bool:
     """判断本次请求是否应写入会话历史（fix-keyword-history-pollution）
 
-    仅当非反问挂起且产出了最终 SQL 时才写会话。拒答 / fail-fast 早退 /
-    SmartFix 失败等无 final_sql 的轮次不入会话，避免无结果历史污染后续
-    follow-up 的关键词提取与理解。
+    仅当非反问挂起且产出了最终 SQL 且非 SmartFix 失败时才写会话。
+    拒答 / fail-fast 早退 / SmartFix 失败（即使有 final_sql）的轮次
+    不入会话，避免无结果历史污染后续 follow-up 的关键词提取与理解。
 
     Args:
         accumulated: graph.stream 累积的最终 state 片段
@@ -54,7 +54,7 @@ def _should_write_session_turn(accumulated: Dict[str, Any]) -> bool:
     """
     if accumulated.get("__interrupted__"):
         return False
-    return bool(accumulated.get("final_sql"))
+    return bool(accumulated.get("final_sql")) and not accumulated.get("fix_failed")
 
 router = APIRouter()
 
