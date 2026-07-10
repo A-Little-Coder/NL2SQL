@@ -39,8 +39,8 @@ conda-env.yaml
 # Data files
 /data/
 
-# User memory files (persisted between sessions)
-data/user_memory/*.json
+# Memory runtime data (chroma 向量库 / 用户记忆 / 会话存储，运行时生成，自动重建)
+/memory/
 
 # Vector store
 vector_store/
