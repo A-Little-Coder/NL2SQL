@@ -64,3 +64,11 @@ Thumbs.db
 
 # Claude Code (not needed in version control)
 .claude/
+
+# Frontend (NL2SQL/frontend/)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Playwright MCP 测试产物（Playwright 验证时自动生成）
+.playwright-mcp/

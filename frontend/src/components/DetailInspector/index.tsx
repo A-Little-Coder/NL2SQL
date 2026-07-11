@@ -1,0 +1,634 @@
+/**
+ * 节点详情检查器（任务 9.1-9.3 + 10.1-10.2，决策 D5）
+ *
+ * 职责：
+ * - 从 store.turns 取"当前 turn"（最后一个 turn，最近活跃），turns 为空显示空态
+ * - 确定显示哪个节点详情（D5）：
+ *   · turn.selectedNode === null  -> 自动跟随最新节点（timeline 最后一个节点的 type）
+ *   · turn.selectedNode !== null  -> 锁定显示该 type 的节点详情
+ * - 顶部显示当前 turn 的 userQuery、status 标签、selectedNode 状态
+ * - 按节点类型渲染详情（9.2），从 turn.details 取数据（字段名严格按 store/types.ts）
+ * - 思考链区域（10.1）：turn.thinking 按节点展示，每节点一个 Collapse 面板，
+ *   内容累积思考文本，展开时打字机式自动滚动到底部；
+ *   整体思考链区域用外层 Collapse 默认折叠
+ * - 10.2：turn.thinking 为空对象时完全不渲染思考链区域（非思考模型降级）
+ *
+ * store 依赖：turns（取当前 turn，selectedNode 判定自动跟随/锁定）
+ */
+import { useEffect, useRef } from 'react';
+import {
+  Alert,
+  Card,
+  Collapse,
+  Descriptions,
+  Empty,
+  Tag,
+  Typography,
+} from 'antd';
+import type { CollapseProps } from 'antd';
+import {
+  CheckCircleOutlined,
+  CloseCircleOutlined,
+  LockOutlined,
+  ThunderboltOutlined,
+} from '@ant-design/icons';
+import { useChatStore } from '@/store/useChatStore';
+import type {
+  ExecutionResult,
+  TimelineNodeType,
+  Turn,
+} from '@/store/types';
+
+const { Text, Paragraph, Title } = Typography;
+
+// ---------------------------------------------------------------------------
+// 节点类型 -> 中文标签映射（与时间轴展示保持一致）
+// ---------------------------------------------------------------------------
+const NODE_LABEL: Record<TimelineNodeType, string> = {
+  cache: '历史缓存',
+  ir: '信息检索',
+  answerability: '可回答性检查',
+  cg: '候选生成',
+  execution: 'SQL 执行',
+  decision: '最终决策',
+  clarify: '反问',
+  result: '最终结果',
+  error: '错误/拒答',
+};
+
+// Turn 状态 -> Tag 颜色与文案
+const STATUS_TAG: Record<
+  Turn['status'],
+  { color: string; text: string }
+> = {
+  streaming: { color: 'processing', text: '推理中' },
+  done: { color: 'success', text: '已完成' },
+  error: { color: 'error', text: '错误' },
+  awaiting_clarification: { color: 'warning', text: '等待反问回答' },
+};
+
+// ---------------------------------------------------------------------------
+// 工具函数
+// ---------------------------------------------------------------------------
+
+/** 数值格式化为两位置信度（null/undefined 显示 '-'） */
+function fmtConf(c: number | null | undefined): string {
+  if (c == null || Number.isNaN(c)) return '-';
+  return typeof c === 'number' ? c.toFixed(2) : String(c);
+}
+
+// ---------------------------------------------------------------------------
+// 思考链面板（10.1）：展开时打字机式自动滚动到底部
+// ---------------------------------------------------------------------------
+function ThinkingPanel({ text }: { text: string }) {
+  const ref = useRef<HTMLPreElement>(null);
+
+  // 内容变化时滚动到底部（打字机式累积，保持末尾可见）
+  useEffect(() => {
+    const el = ref.current;
+    if (el) {
+ el.scrollTop = el.scrollHeight; }
+  }, [text]);
+
+  return (
+    <pre
+      ref={ref}
+      style={{
+        margin: 0,
+        padding: '8px 12px',
+        maxHeight: 320,
+        overflow: 'auto',
+        background: '#fafafa',
+        border: '1px solid #f0f0f0',
+        borderRadius: 4,
+        fontSize: 12.5,
+        lineHeight: 1.6,
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word',
+        fontFamily:
+          'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+      }}
+    >
+      {text || '（暂无思考内容）'}
+    </pre>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 按节点类型渲染详情（9.2）
+// ---------------------------------------------------------------------------
+
+/** cache 节点：显示 hit/source/confidence/cachedSql */
+function CacheDetail({ turn }: { turn: Turn }) {
+  const c = turn.details.cache;
+  if (!c) return <NoDetail />;
+  return (
+    <Descriptions column={1} size="small" bordered>
+      <Descriptions.Item label="是否命中">
+        {c.hit ? (
+          <Tag icon={<CheckCircleOutlined />} color="success">
+            命中
+          </Tag>
+        ) : (
+          <Tag icon={<CloseCircleOutlined />} color="default">
+            未命中
+          </Tag>
+        )}
+      </Descriptions.Item>
+      <Descriptions.Item label="来源">{c.source || '-'}</Descriptions.Item>
+      <Descriptions.Item label="置信度">{fmtConf(c.confidence)}</Descriptions.Item>
+      <Descriptions.Item label="缓存 SQL">
+        {c.cachedSql ? (
+          <Paragraph code copyable style={{ margin: 0, whiteSpace: 'pre-wrap' }}>
+            {c.cachedSql}
+          </Paragraph>
+        ) : (
+          <Text type="secondary">无</Text>
+        )}
+      </Descriptions.Item>
+    </Descriptions>
+  );
+}
+
+/** ir 节点：关键词组 keywords + schema 召回 schemaRecall */
+function IrDetail({ turn }: { turn: Turn }) {
+  const keywords = turn.details.keywords;
+  const schemaRecall = turn.details.schemaRecall;
+  const hasKeywords = keywords && keywords.length > 0;
+  const hasSchema = schemaRecall && schemaRecall.length > 0;
+
+  if (!hasKeywords && !hasSchema) return <NoDetail />;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {hasKeywords && (
+        <Card size="small" title="关键词提取" styles={{ body: { padding: 8 } }}>
+          {keywords!.map((kw, i) => (
+            <div key={i} style={{ marginBottom: 6 }}>
+              <Text strong>{kw.name}</Text>
+              {kw.expansions && kw.expansions.length > 0 && (
+                <div style={{ marginLeft: 8, marginTop: 2 }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    扩展：
+                  </Text>{' '}
+                  {kw.expansions.map((ex, j) => (
+                    <Tag key={j} style={{ marginBottom: 2 }}>
+                      {ex}
+                    </Tag>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </Card>
+      )}
+      {hasSchema && (
+        <Card size="small" title="Schema 召回" styles={{ body: { padding: 8 } }}>
+          {schemaRecall!.map((g, i) => (
+            <div key={i} style={{ marginBottom: 6 }}>
+              <Text strong>{g.name}</Text>
+              {g.top_columns && g.top_columns.length > 0 && (
+                <div style={{ marginLeft: 8, marginTop: 2 }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    列：
+                  </Text>{' '}
+                  {g.top_columns.map((col, j) => (
+                    <Tag key={j} color="blue" style={{ marginBottom: 2 }}>
+                      {col}
+                    </Tag>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/** answerability 节点 */
+function AnswerabilityDetail({ turn }: { turn: Turn }) {
+  const a = turn.details.answerability;
+  if (!a) return <NoDetail />;
+  return (
+    <Descriptions column={1} size="small" bordered>
+      <Descriptions.Item label="是否可回答">
+        {a.answerable ? (
+          <Tag icon={<CheckCircleOutlined />} color="success">
+            可回答
+          </Tag>
+        ) : (
+          <Tag icon={<CloseCircleOutlined />} color="error">
+            不可回答
+          </Tag>
+        )}
+      </Descriptions.Item>
+      <Descriptions.Item label="置信度">{fmtConf(a.confidence)}</Descriptions.Item>
+      <Descriptions.Item label="理由">
+        <Paragraph style={{ margin: 0 }}>{a.reason || '-'}</Paragraph>
+      </Descriptions.Item>
+    </Descriptions>
+  );
+}
+
+/** cg 节点：候选 SQL 列表全文 */
+function CgDetail({ turn }: { turn: Turn }) {
+  const candidates = turn.details.candidates;
+  if (!candidates || candidates.length === 0) return <NoDetail />;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {candidates.map((cand) => (
+        <Card
+          key={cand.id}
+          size="small"
+          title={<Text code>{cand.id}</Text>}
+          styles={{ body: { padding: 8 } }}
+        >
+          <Paragraph
+            code
+            copyable
+            style={{
+              margin: 0,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              fontSize: 12.5,
+            }}
+          >
+            {cand.sql}
+          </Paragraph>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+/** execution 节点：逐候选显示 success/rows/error */
+function ExecutionDetail({ turn }: { turn: Turn }) {
+  const exec = turn.details.exec;
+  if (!exec || Object.keys(exec).length === 0) return <NoDetail />;
+
+  const entries = Object.entries(exec) as [string, ExecutionResult][];
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {entries.map(([id, r]) => (
+        <Card
+          key={id}
+          size="small"
+          title={
+            <span>
+              <Text code>{r.candidateId ?? id}</Text>
+              {r.success ? (
+                <Tag
+                  icon={<CheckCircleOutlined />}
+                  color="success"
+                  style={{ marginLeft: 8 }}
+                >
+                  成功
+                </Tag>
+              ) : (
+                <Tag
+                  icon={<CloseCircleOutlined />}
+                  color="error"
+                  style={{ marginLeft: 8 }}
+                >
+                  失败
+                </Tag>
+              )}
+            </span>
+          }
+          styles={{ body: { padding: 8 } }}
+        >
+          <Descriptions column={1} size="small">
+            <Descriptions.Item label="行数">
+              {r.rows != null ? r.rows : '-'}
+            </Descriptions.Item>
+            {r.error && (
+              <Descriptions.Item label="错误">
+                <Text type="danger" style={{ fontSize: 12.5 }}>
+                  {r.error}
+                </Text>
+              </Descriptions.Item>
+            )}
+          </Descriptions>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+/** decision 节点：selectedId/selectedSql/decisionPath/fixFailed/reason/multiIntent */
+function DecisionDetail({ turn }: { turn: Turn }) {
+  const d = turn.details.decision;
+  if (!d) return <NoDetail />;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <Descriptions column={1} size="small" bordered>
+        {d.multiIntent != null && (
+          <Descriptions.Item label="多意图">
+            {d.multiIntent ? (
+              <Tag color="purple">多意图聚合</Tag>
+            ) : (
+              <Tag>单意图</Tag>
+            )}
+          </Descriptions.Item>
+        )}
+        {d.subqueryCount != null && (
+          <Descriptions.Item label="子查询数">{d.subqueryCount}</Descriptions.Item>
+        )}
+        {d.successCount != null && (
+          <Descriptions.Item label="成功数">{d.successCount}</Descriptions.Item>
+        )}
+        {d.selectedId != null && (
+          <Descriptions.Item label="选中候选">
+            <Text code>{d.selectedId || '-'}</Text>
+          </Descriptions.Item>
+        )}
+        {d.fixFailed != null && (
+          <Descriptions.Item label="修复失败">
+            {d.fixFailed ? (
+              <Tag color="error">是</Tag>
+            ) : (
+              <Tag color="default">否</Tag>
+            )}
+          </Descriptions.Item>
+        )}
+        {d.decisionPath && (
+          <Descriptions.Item label="决策路径">
+            <Text>{d.decisionPath}</Text>
+          </Descriptions.Item>
+        )}
+        {d.reason && (
+          <Descriptions.Item label="理由">
+            <Paragraph style={{ margin: 0 }}>{d.reason}</Paragraph>
+          </Descriptions.Item>
+        )}
+      </Descriptions>
+      {d.selectedSql && (
+        <Card size="small" title="选中 SQL" styles={{ body: { padding: 8 } }}>
+          <Paragraph
+            code
+            copyable
+            style={{
+              margin: 0,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              fontSize: 12.5,
+            }}
+          >
+            {d.selectedSql}
+          </Paragraph>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/** clarify 节点：turn.clarification（question/ambiguities/round） */
+function ClarifyDetail({ turn }: { turn: Turn }) {
+  const c = turn.clarification;
+  if (!c) return <NoDetail />;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <Descriptions column={1} size="small" bordered>
+        <Descriptions.Item label="反问轮次">第 {c.round} 轮</Descriptions.Item>
+        <Descriptions.Item label="问题">
+          <Paragraph style={{ margin: 0 }}>{c.question}</Paragraph>
+        </Descriptions.Item>
+      </Descriptions>
+      {c.ambiguities && c.ambiguities.length > 0 && (
+        <Card size="small" title="歧义点" styles={{ body: { padding: 8 } }}>
+          {c.ambiguities.map((a, i) => (
+            <Tag key={i} color="orange" style={{ marginBottom: 4 }}>
+              {a}
+            </Tag>
+          ))}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/** result 节点：turn.result.sql + 行数 */
+function ResultDetail({ turn }: { turn: Turn }) {
+  const r = turn.result;
+  if (!r) return <NoDetail />;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <Descriptions column={1} size="small" bordered>
+        <Descriptions.Item label="结果行数">{r.rows.length}</Descriptions.Item>
+      </Descriptions>
+      <Card size="small" title="最终 SQL" styles={{ body: { padding: 8 } }}>
+        <Paragraph
+          code
+          copyable
+          style={{
+            margin: 0,
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+            fontSize: 12.5,
+          }}
+        >
+          {r.sql}
+        </Paragraph>
+      </Card>
+    </div>
+  );
+}
+
+/** error 节点：turn.error（rejection 时标注"拒答"） */
+function ErrorDetail({ turn }: { turn: Turn }) {
+  if (!turn.error) return <NoDetail />;
+  return (
+    <Alert
+      type={turn.rejection ? 'warning' : 'error'}
+      showIcon
+      message={turn.rejection ? '拒答' : '错误'}
+      description={turn.error}
+    />
+  );
+}
+
+/** 该节点 type 在 timeline 中但 details 无数据 */
+function NoDetail() {
+  return (
+    <Empty
+      image={Empty.PRESENTED_IMAGE_SIMPLE}
+      description="该节点暂无结构化详情"
+      style={{ margin: '12px 0' }}
+    />
+  );
+}
+
+/** 按节点类型分发渲染 */
+function renderDetail(turn: Turn, type: TimelineNodeType) {
+  switch (type) {
+    case 'cache':
+      return <CacheDetail turn={turn} />;
+    case 'ir':
+      return <IrDetail turn={turn} />;
+    case 'answerability':
+      return <AnswerabilityDetail turn={turn} />;
+    case 'cg':
+      return <CgDetail turn={turn} />;
+    case 'execution':
+      return <ExecutionDetail turn={turn} />;
+    case 'decision':
+      return <DecisionDetail turn={turn} />;
+    case 'clarify':
+      return <ClarifyDetail turn={turn} />;
+    case 'result':
+      return <ResultDetail turn={turn} />;
+    case 'error':
+      return <ErrorDetail turn={turn} />;
+    default:
+      return <NoDetail />;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 主组件
+// ---------------------------------------------------------------------------
+export default function DetailInspector() {
+  // 取最后一个 turn 作为"当前 turn"（最近活跃）
+  const turns = useChatStore((s) => s.turns);
+  const currentTurn: Turn | undefined =
+    turns.length > 0 ? turns[turns.length - 1] : undefined;
+
+  // ---- 空态：无 turn ----
+  if (!currentTurn) {
+    return (
+      <div style={{ padding: 16, height: '100%' }}>
+        <Card size="small" style={{ marginBottom: 12 }}>
+          <Title level={5} style={{ margin: 0 }}>
+            节点详情检查器
+          </Title>
+        </Card>
+        <Empty description="暂无活跃轮次" style={{ marginTop: 48 }} />
+      </div>
+    );
+  }
+
+  const turn = currentTurn;
+
+  // ---- D5：确定显示哪个节点 ----
+  // selectedNode === null -> 自动跟随最新节点（timeline 最后一个节点的 type）
+  // selectedNode !== null -> 锁定显示该 type 的节点详情
+  const isAuto = turn.selectedNode === null;
+  let displayType: TimelineNodeType | null = null;
+
+  if (!isAuto) {
+    // 锁定模式：显示 selectedNode
+    displayType = turn.selectedNode;
+  } else if (turn.timeline.length > 0) {
+    // 自动跟随：取 timeline 最后一个节点的 type
+    displayType = turn.timeline[turn.timeline.length - 1].type;
+  }
+
+  // ---- 思考链（10.1 / 10.2）----
+  // 10.2：turn.thinking 为空对象时完全不渲染思考链区域
+  const thinkingEntries = Object.entries(turn.thinking);
+  const hasThinking = thinkingEntries.length > 0;
+
+  // 思考链内层面板
+  const thinkingPanels: CollapseProps['items'] = thinkingEntries.map(
+    ([node, text]) => ({
+      key: node,
+      label: (
+        <span>
+          <Text strong>{node}</Text>
+          <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>
+            {text.length} 字
+          </Text>
+        </span>
+      ),
+      children: <ThinkingPanel text={text} />,
+    }),
+  );
+
+  // ---- status 标签 ----
+  const statusTag = STATUS_TAG[turn.status];
+
+  return (
+    <div style={{ padding: 12, height: '100%', overflow: 'auto' }}>
+      {/* 顶部：标题 + 当前 turn 信息 */}
+      <Card size="small" style={{ marginBottom: 12 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 8,
+            }}
+          >
+            <Title level={5} style={{ margin: 0 }}>
+              节点详情检查器
+            </Title>
+            <Tag color={statusTag.color}>{statusTag.text}</Tag>
+          </div>
+          <div>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              用户问题
+            </Text>
+            <Paragraph
+              style={{ margin: '4px 0 0 0', fontWeight: 500 }}
+              ellipsis={{ rows: 3, tooltip: turn.userQuery }}
+            >
+              {turn.userQuery || '（空）'}
+            </Paragraph>
+          </div>
+          <div>
+            {isAuto ? (
+              <Tag icon={<ThunderboltOutlined />} color="blue">
+                自动跟随
+              </Tag>
+            ) : (
+              <Tag icon={<LockOutlined />} color="gold">
+                已锁定：{turn.selectedNode ? NODE_LABEL[turn.selectedNode] : '-'}
+              </Tag>
+            )}
+          </div>
+        </div>
+      </Card>
+
+      {/* 节点详情区（9.2）*/}
+      <Card
+        size="small"
+        title={
+          displayType ? (
+            <span>
+              节点详情 ·{' '}
+              <Text strong>{NODE_LABEL[displayType]}</Text>
+            </span>
+          ) : (
+            <span>节点详情</span>
+          )
+        }
+        style={{ marginBottom: 12 }}
+      >
+        {displayType ? (
+          renderDetail(turn, displayType)
+        ) : (
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description="暂无节点，等待推理开始…"
+            style={{ margin: '12px 0' }}
+          />
+        )}
+      </Card>
+
+      {/* 思考链区域（10.1 / 10.2）*/}
+      {hasThinking && (
+        <Card size="small" title="qwen3 思考链" style={{ marginBottom: 12 }}>
+          <Collapse
+            size="small"
+            items={thinkingPanels}
+            // 默认折叠：不设置 defaultActiveKey
+          />
+        </Card>
+      )}
+    </div>
+  );
+}
