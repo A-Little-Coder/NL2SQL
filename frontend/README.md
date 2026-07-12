@@ -8,6 +8,7 @@
 - **TypeScript**：与后端 Pydantic schema 对齐，`src/api/types.ts` 作单一契约源
 - **Ant Design 5**：中文 locale 内置，`Table`/`Layout`/`Timeline` 等组件开箱即用
 - **Zustand**：轻量状态管理，适合高频流式更新
+- **react-resizable-panels**：三栏可拖拽布局（宽度调整 + 折叠 + localStorage 持久化）
 - **Vitest**：单元测试（SSE 解析器、reducer、resume 合并、检查器选中态）
 
 ## 目录结构（决策 D9）
@@ -93,6 +94,8 @@ npm run test:watch    # watch 模式
 - `tests/reducer.test.ts`：reduceSseEvent 各事件类型 -> Turn 状态（cache 短路、clarification、rejection、done 收尾）
 - `tests/resume.test.ts`：初始流 + resume 流合并到同一 turnId，server query_id 变化不影响 turnId
 - `tests/inspector.test.ts`：检查器选中态（自动跟随 / 点击 pin / 新查询重置）
+- `tests/ir_ss_detail.test.tsx`：IrDetail 按关键词组聚合渲染（phrase/同义词/字段/值）、SsDetail（join_edges/bridge_tables）
+- `tests/AppLayout.test.tsx`：CollapsedBar 折叠展开条交互
 
 ## 构建
 
@@ -103,7 +106,8 @@ npm run preview   # 本地预览生产构建
 
 ## 关键设计
 
-- **极透明三栏布局**：会话侧栏 ｜ 对话 + Agent 时间轴 + 结果 ｜ 节点详情检查器
+- **极透明三栏布局**：会话侧栏 ｜ 对话 + Agent 时间轴 + 结果 ｜ 节点详情检查器；左右栏宽度可拖拽调整、窄于阈值折叠为展开条（react-resizable-panels，宽度持久化到 localStorage）
+- **IR 详情按关键词组聚合**：每组展示 phrase / 同义词 / 召回字段（带 score）/ 召回值（带 score，后端 source_phrase 归属，前端零猜测）；SS 阶段独立时间轴节点（schema_finalize 更新 JOIN 边/桥接表）
 - **SSE 流式渲染**：fetch + ReadableStream 自写解析器（决策 D2），逐事件点亮时间轴
 - **反问 resume 续流**：客户端 turnId 作主键（决策 D4），resume 流并入同一 Turn
 - **检查器自动跟随 + 点击 pin**（决策 D5）：默认跟随最新节点，点击锁定

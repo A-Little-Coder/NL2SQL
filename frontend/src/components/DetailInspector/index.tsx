@@ -47,6 +47,7 @@ const { Text, Paragraph, Title } = Typography;
 const NODE_LABEL: Record<TimelineNodeType, string> = {
   cache: '历史缓存',
   ir: '信息检索',
+  ss: 'Schema 选择',
   answerability: '可回答性检查',
   cg: '候选生成',
   execution: 'SQL 执行',
@@ -150,60 +151,93 @@ function CacheDetail({ turn }: { turn: Turn }) {
   );
 }
 
-/** ir 节点：关键词组 keywords + schema 召回 schemaRecall */
+/** ir 节点：按关键词组聚合展示关键词提取 + 字段召回 + 值召回（D5） */
 function IrDetail({ turn }: { turn: Turn }) {
-  const keywords = turn.details.keywords;
-  const schemaRecall = turn.details.schemaRecall;
-  const hasKeywords = keywords && keywords.length > 0;
-  const hasSchema = schemaRecall && schemaRecall.length > 0;
+  const keywordGroups = turn.details.ir?.keywordGroups;
+  if (!keywordGroups || keywordGroups.length === 0) return <NoDetail />;
 
-  if (!hasKeywords && !hasSchema) return <NoDetail />;
+  const panels = keywordGroups.map((g, i) => ({
+    key: String(i),
+    label: (
+      <span>
+        <Text strong>{g.phrase}</Text>
+        <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>
+          {g.terms.length} 同义词 · {g.columns.length} 字段 · {g.values.length} 值
+        </Text>
+      </span>
+    ),
+    children: (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {g.terms.length > 0 && (
+          <div>
+            <Text type="secondary" style={{ fontSize: 12 }}>同义词：</Text>{' '}
+            {g.terms.map((t, j) => (
+              <Tag key={j} style={{ marginBottom: 2 }}>{t}</Tag>
+            ))}
+          </div>
+        )}
+        <div>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            召回字段 ({g.columns.length})：
+          </Text>
+          {g.columns.length > 0 ? (
+            <div style={{ marginTop: 2 }}>
+              {g.columns.map((c, j) => (
+                <Tag key={j} color="blue" style={{ marginBottom: 2 }}>
+                  {c.table}.{c.column}
+                  <Text type="secondary" style={{ fontSize: 11, marginLeft: 4 }}>
+                    {fmtConf(c.score)}
+                  </Text>
+                </Tag>
+              ))}
+            </div>
+          ) : (
+            <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>无召回</Text>
+          )}
+        </div>
+        <div>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            召回值 ({g.values.length})：
+          </Text>
+          {g.values.length > 0 ? (
+            <div style={{ marginTop: 2 }}>
+              {g.values.map((v, j) => (
+                <Tag key={j} color="purple" style={{ marginBottom: 2 }}>
+                  {v.value}
+                  <Text type="secondary" style={{ fontSize: 11, marginLeft: 4 }}>
+                    {v.table}.{v.column} · {fmtConf(v.score)}
+                  </Text>
+                </Tag>
+              ))}
+            </div>
+          ) : (
+            <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>无召回</Text>
+          )}
+        </div>
+      </div>
+    ),
+  }));
 
+  return <Collapse size="small" defaultActiveKey={['0']} items={panels} />;
+}
+
+/** ss 节点：Schema 选择 + JOIN 路径注入详情（D4） */
+function SsDetail({ turn }: { turn: Turn }) {
+  const sf = turn.details.schemaFinalize;
+  if (!sf) {
+    return (
+      <Empty
+        image={Empty.PRESENTED_IMAGE_SIMPLE}
+        description="SS 阶段进行中或无 JOIN 路径数据"
+        style={{ margin: '12px 0' }}
+      />
+    );
+  }
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {hasKeywords && (
-        <Card size="small" title="关键词提取" styles={{ body: { padding: 8 } }}>
-          {keywords!.map((kw, i) => (
-            <div key={i} style={{ marginBottom: 6 }}>
-              <Text strong>{kw.name}</Text>
-              {kw.expansions && kw.expansions.length > 0 && (
-                <div style={{ marginLeft: 8, marginTop: 2 }}>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    扩展：
-                  </Text>{' '}
-                  {kw.expansions.map((ex, j) => (
-                    <Tag key={j} style={{ marginBottom: 2 }}>
-                      {ex}
-                    </Tag>
-                  ))}
-                </div>
-              )}
-            </div>
-          ))}
-        </Card>
-      )}
-      {hasSchema && (
-        <Card size="small" title="Schema 召回" styles={{ body: { padding: 8 } }}>
-          {schemaRecall!.map((g, i) => (
-            <div key={i} style={{ marginBottom: 6 }}>
-              <Text strong>{g.name}</Text>
-              {g.top_columns && g.top_columns.length > 0 && (
-                <div style={{ marginLeft: 8, marginTop: 2 }}>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    列：
-                  </Text>{' '}
-                  {g.top_columns.map((col, j) => (
-                    <Tag key={j} color="blue" style={{ marginBottom: 2 }}>
-                      {col}
-                    </Tag>
-                  ))}
-                </div>
-              )}
-            </div>
-          ))}
-        </Card>
-      )}
-    </div>
+    <Descriptions column={1} size="small" bordered>
+      <Descriptions.Item label="JOIN 边数">{sf.joinEdges}</Descriptions.Item>
+      <Descriptions.Item label="桥接表数">{sf.bridgeTables}</Descriptions.Item>
+    </Descriptions>
   );
 }
 
@@ -468,6 +502,8 @@ function renderDetail(turn: Turn, type: TimelineNodeType) {
       return <CacheDetail turn={turn} />;
     case 'ir':
       return <IrDetail turn={turn} />;
+    case 'ss':
+      return <SsDetail turn={turn} />;
     case 'answerability':
       return <AnswerabilityDetail turn={turn} />;
     case 'cg':

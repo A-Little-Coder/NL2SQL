@@ -1,0 +1,20 @@
+/* 三栏可拖拽分隔条（D6）：竖向窄条，hover/拖拽时高亮 */
+.resize-handle {
+  width: 4px;
+  background: transparent;
+  cursor: col-resize;
+  transition: background 0.2s;
+  flex-shrink: 0;
+  position: relative;
+}
+.resize-handle:hover,
+.resize-handle[data-resize-handle-active] {
+  background: #1677ff;
+}
+
+/* 边栏内容容器：固定最小宽度，窄时不压扁，溢出滚动 */
+.sider-inner {
+  height: 100%;
+  overflow: auto;
+  min-width: 240px;
+}

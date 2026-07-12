@@ -16,6 +16,7 @@ import { Timeline } from 'antd';
 import {
   DatabaseOutlined,
   SearchOutlined,
+  PartitionOutlined,
   QuestionCircleOutlined,
   CodeOutlined,
   PlayCircleOutlined,
@@ -34,6 +35,7 @@ import { useChatStore } from '@/store/useChatStore';
 const NODE_LABEL: Record<TimelineNodeType, string> = {
   cache: '缓存检测',
   ir: '信息检索',
+  ss: 'Schema 选择',
   answerability: '可回答性',
   cg: 'SQL 生成',
   execution: '执行',
@@ -47,6 +49,7 @@ const NODE_LABEL: Record<TimelineNodeType, string> = {
 const NODE_ICON: Record<TimelineNodeType, ReactNode> = {
   cache: <DatabaseOutlined />,
   ir: <SearchOutlined />,
+  ss: <PartitionOutlined />,
   answerability: <QuestionCircleOutlined />,
   cg: <CodeOutlined />,
   execution: <PlayCircleOutlined />,

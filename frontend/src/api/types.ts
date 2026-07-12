@@ -193,12 +193,27 @@ export interface KeywordsEvent {
   };
 }
 
-/** schema_recall：IR schema 召回 */
+/** schema_recall：IR schema 召回（D3：按关键词组聚合，含字段与值召回） */
 export interface SchemaRecallEvent {
   type: 'schema_recall';
   data: {
     query_id: string;
-    groups: { name: string; top_columns: string[] }[];
+    keyword_groups: {
+      phrase: string;
+      terms: string[];
+      columns: { table: string; column: string; score: number }[];
+      values: { value: string; table: string; column: string; score: number }[];
+    }[];
+  };
+}
+
+/** schema_finalize：SS 后 JOIN 路径注入完成（D4：更新 SS 时间轴节点） */
+export interface SchemaFinalizeEvent {
+  type: 'schema_finalize';
+  data: {
+    query_id?: string;
+    join_edges: number;
+    bridge_tables: number;
   };
 }
 
@@ -305,6 +320,7 @@ export type SseEvent =
   | LlmThinkingEvent
   | KeywordsEvent
   | SchemaRecallEvent
+  | SchemaFinalizeEvent
   | AnswerabilityEvent
   | SqlCandidatesEvent
   | ExecutionEvent

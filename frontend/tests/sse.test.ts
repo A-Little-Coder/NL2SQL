@@ -16,8 +16,9 @@ describe('SSE 解析器 parseSseChunk', () => {
     );
     expect(events).toHaveLength(1);
     expect(events[0].type).toBe('stage');
-    expect(events[0].data.node).toBe('ir');
-    expect(events[0].data.query_id).toBe('q1');
+    const stageEvt = events[0] as Extract<SseEvent, { type: 'stage' }>;
+    expect(stageEvt.data.node).toBe('ir');
+    expect(stageEvt.data.query_id).toBe('q1');
   });
 
   test(': heartbeat 注释行不产生事件', () => {
@@ -46,7 +47,8 @@ describe('SSE 解析器 parseSseChunk', () => {
     );
     expect(events).toHaveLength(1);
     expect(events[0].type).toBe('done');
-    expect(events[0].data.awaiting_clarification).toBe(true);
+    const doneEvt = events[0] as Extract<SseEvent, { type: 'done' }>;
+    expect(doneEvt.data.awaiting_clarification).toBe(true);
   });
 
   test('非 JSON payload 不崩、不产事件', () => {

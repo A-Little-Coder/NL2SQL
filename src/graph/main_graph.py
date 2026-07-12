@@ -64,6 +64,28 @@ except Exception:  # pragma: no cover - 无 API 模块时（如离线脚本）
 # 节点装饰器：统一注入 SSE 事件（stage started/done + current_node ContextVar）
 # ---------------------------------------------------------------------------
 
+def _is_graph_interrupt(e: BaseException) -> bool:
+    """判断异常是否为 langgraph 的 GraphInterrupt（interrupt() 的正常控制流信号）。
+
+    GraphInterrupt 是节点调用 interrupt() 反问时抛出的控制流异常，**非错误**。
+    `_wrap_node` 据此放行 re-raise、不 emit error 事件，修复反问场景双发
+    error+clarification 的问题（见 change enhance-ir-display-and-layout D1）。
+
+    兼容不同 langgraph 版本：GraphInterrupt 在新版位于 langgraph.errors，
+    旧版可能位于 langgraph.types；最终回退到类名匹配。
+    """
+    for mod_name, attr in (("langgraph.errors", "GraphInterrupt"),
+                           ("langgraph.types", "GraphInterrupt")):
+        try:
+            mod = __import__(mod_name, fromlist=[attr])
+            cls = getattr(mod, attr, None)
+            if cls is not None and isinstance(e, cls):
+                return True
+        except ImportError:
+            continue
+    return type(e).__name__ == "GraphInterrupt"
+
+
 def _wrap_node(node_name: str, fn: Callable[[NL2SQLState], Dict[str, Any]]):
     """给节点函数包一层：进入时发 stage started，退出时发 stage done
 
@@ -94,6 +116,10 @@ def _wrap_node(node_name: str, fn: Callable[[NL2SQLState], Dict[str, Any]]):
             logger.info(f"[qid={qid}] [stage] node={node_name} status=done{extra}")
             return result
         except Exception as e:
+            # GraphInterrupt 是 interrupt() 的正常控制流信号（反问挂起），非错误：
+            # 放行 re-raise，不 emit error，避免反问场景双发 error+clarification
+            if _is_graph_interrupt(e):
+                raise
             logger.exception(f"[qid={qid}] [stage] node={node_name} error={e!r}")
             emit_safe("error", {"node": node_name, "error": str(e)})
             raise
@@ -535,21 +561,68 @@ def _serialize_keywords(keywords) -> list:
 
 
 def _summarize_schema(ctx) -> dict:
-    """从 retrieved_context 中提取召回的列摘要（用于 SSE 事件）"""
-    summary = {"groups": []}
+    """从 RetrievedContext 提取按关键词组聚合的召回摘要（用于 schema_recall SSE 事件）
+
+    D3（change enhance-ir-display-and-layout）：基于真实字段 keyword_groups /
+    keyword_columns_map / columns / values 聚合，输出 keyword_groups 数组，
+    每组含 phrase / terms / 召回字段(含 score) / 召回值(含 score，按 source_phrase 归属)。
+    """
     if ctx is None:
-        return summary
+        return {"keyword_groups": []}
     try:
-        groups = getattr(ctx, "schema_results", None) or {}
-        for group_name, cols in groups.items():
-            top = [
-                getattr(c, "column_name", str(c))
-                for c in (cols or [])[:10]
-            ]
-            summary["groups"].append({"name": group_name, "top_columns": top})
+        # 构建 column_key -> RetrievedItem 详情索引（取 score）
+        col_detail = {}
+        for c in (getattr(ctx, "columns", None) or []):
+            tbl = getattr(c, "table_name", "") or ""
+            name = getattr(c, "name", "") or ""
+            if tbl and name:
+                col_detail[f"{tbl}.{name}"] = c
+
+        kw_map = getattr(ctx, "keyword_columns_map", None) or {}
+        keyword_groups = []
+        for g in (getattr(ctx, "keyword_groups", None) or []):
+            phrase = getattr(g, "phrase", "") or ""
+            terms = list(getattr(g, "terms", None) or [])
+            # 召回字段：keyword_columns_map[phrase] 交集 col_detail 取 score
+            col_keys = kw_map.get(phrase, [])
+            columns = []
+            for k in col_keys:
+                c = col_detail.get(k)
+                if c is None:
+                    # col_detail 未命中（可能 enhance 后补充的列），退化为按 key 拆分
+                    parts = k.split(".", 1)
+                    columns.append({
+                        "table": parts[0] if len(parts) > 1 else "",
+                        "column": parts[1] if len(parts) > 1 else parts[0],
+                        "score": 0.0,
+                    })
+                else:
+                    columns.append({
+                        "table": getattr(c, "table_name", "") or "",
+                        "column": getattr(c, "name", "") or "",
+                        "score": float(getattr(c, "score", 0.0) or 0.0),
+                    })
+            # 召回值：按 metadata.source_phrase == phrase 过滤归属
+            values = []
+            for v in (getattr(ctx, "values", None) or []):
+                vmeta = getattr(v, "metadata", None) or {}
+                if vmeta.get("source_phrase", "") == phrase:
+                    values.append({
+                        "value": getattr(v, "name", "") or "",
+                        "table": getattr(v, "table_name", "") or "",
+                        "column": vmeta.get("column_name", "") or "",
+                        "score": float(getattr(v, "score", 0.0) or 0.0),
+                    })
+            keyword_groups.append({
+                "phrase": phrase,
+                "terms": terms,
+                "columns": columns,
+                "values": values,
+            })
+        return {"keyword_groups": keyword_groups}
     except Exception:
-        pass
-    return summary
+        logger.exception("[_summarize_schema] 聚合失败，返回空 keyword_groups")
+        return {"keyword_groups": []}
 
 
 def make_task_planner_node(task_planner, dialog_manager=None) -> Callable[[NL2SQLState], Dict[str, Any]]:

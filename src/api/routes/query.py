@@ -105,7 +105,7 @@ async def query_endpoint(
         cache_check     历史命中检测      {hit, source, confidence, cached_sql}
         llm_thinking    qwen3 思考链片段  {node, text}
         keywords        IR 关键词提取    {groups}
-        schema_recall   IR schema 召回   {groups}
+        schema_recall   IR schema 召回   {keyword_groups: [{phrase, terms, columns:[{table,column,score}], values:[{value,table,column,score}]}]}
         answerability   可回答性检查      {answerable, confidence, reason}
         sql_candidates  CG 候选 SQL     {candidates}
         execution       SQL 执行结果     {candidate_id, success, rows, error}

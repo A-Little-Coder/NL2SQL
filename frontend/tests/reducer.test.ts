@@ -46,13 +46,56 @@ describe('reduceSseEvent', () => {
     expect(t.timeline.find((n) => n.type === 'cache')).toBeFalsy();
   });
 
-  test('keywords + schema_recall -> ir 节点 done + details 填充', () => {
+  test('keywords + schema_recall -> ir 节点 done + ir.keywordGroups 填充', () => {
     let t = createTurn('t1', 'q');
     t = reduceSseEvent(t, ev({ type: 'keywords', data: { query_id: 'q1', groups: [{ name: 'k', expansions: ['e'] }] } }));
-    t = reduceSseEvent(t, ev({ type: 'schema_recall', data: { query_id: 'q1', groups: [{ name: 'g', top_columns: ['c'] }] } }));
-    expect(t.details.keywords?.length).toBe(1);
-    expect(t.details.schemaRecall?.[0].top_columns).toEqual(['c']);
+    // keywords 事件先填 phrase/terms（columns/values 空）
+    expect(t.details.ir?.keywordGroups.length).toBe(1);
+    expect(t.details.ir?.keywordGroups[0].phrase).toBe('k');
+    expect(t.details.ir?.keywordGroups[0].terms).toEqual(['e']);
+    expect(t.details.ir?.keywordGroups[0].columns).toEqual([]);
+    t = reduceSseEvent(t, ev({
+      type: 'schema_recall',
+      data: {
+        query_id: 'q1',
+        keyword_groups: [{
+          phrase: 'g',
+          terms: ['g'],
+          columns: [{ table: 't', column: 'c', score: 0.9 }],
+          values: [{ value: 'v', table: 't', column: 'c', score: 0.8 }],
+        }],
+      },
+    }));
+    // schema_recall 覆盖为完整结构
+    expect(t.details.ir?.keywordGroups[0].columns.length).toBe(1);
+    expect(t.details.ir?.keywordGroups[0].values.length).toBe(1);
     expect(t.timeline.find((n) => n.type === 'ir')?.status).toBe('done');
+  });
+
+  test('ss stage -> ss 时间轴节点', () => {
+    let t = createTurn('t1', 'q');
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'ss', status: 'started' } }));
+    expect(t.timeline.find((n) => n.type === 'ss')?.status).toBe('active');
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'ss', status: 'done' } }));
+    expect(t.timeline.find((n) => n.type === 'ss')?.status).toBe('done');
+  });
+
+  test('schema_finalize stage 节点名映射到 ss', () => {
+    let t = createTurn('t1', 'q');
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'schema_finalize', status: 'started' } }));
+    expect(t.timeline.find((n) => n.type === 'ss')).toBeTruthy();
+  });
+
+  test('schema_finalize 事件填充 details.schemaFinalize + 更新 ss 摘要', () => {
+    let t = createTurn('t1', 'q');
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'ss', status: 'done' } }));
+    t = reduceSseEvent(t, ev({ type: 'schema_finalize', data: { join_edges: 2, bridge_tables: 1 } }));
+    expect(t.details.schemaFinalize?.joinEdges).toBe(2);
+    expect(t.details.schemaFinalize?.bridgeTables).toBe(1);
+    const ssNode = t.timeline.find((n) => n.type === 'ss');
+    expect(ssNode?.status).toBe('done');
+    expect(ssNode?.summary).toContain('JOIN 边 2');
+    expect(ssNode?.summary).toContain('桥接表 1');
   });
 
   test('answerability 不可回答时摘要含原因', () => {

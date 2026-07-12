@@ -11,7 +11,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from loguru import logger
 
 
@@ -272,17 +272,22 @@ class InformationRetrieval:
         return keywords
 
     def retrieve_values(self, keywords: List[str], top_k: int = 5,
-                      value_semantic_threshold: float = 0.6) -> List[RetrievedItem]:
-        """
-        LSH 粗召回 + 语义精排两阶段值检索
+                      value_semantic_threshold: float = 0.6,
+                      term_phrase_map: Optional[Dict[str, str]] = None) -> List[RetrievedItem]:
+        """LSH 粗召回 + 语义精排两阶段值检索
 
         Args:
-            keywords: 需要检索的关键词列表
+            keywords: 需要检索的关键词列表（扁平化的全部 term）
             top_k: 每个关键词 LSH 粗召回前 k 个结果
             value_semantic_threshold: 语义精排的余弦相似度阈值（默认 0.6）
+            term_phrase_map: term -> phrase 映射（D2，change enhance-ir-display-and-layout），
+                用于在每个召回值的 metadata 标注 source_phrase/source_term，使值召回结果
+                具备关键词组归属。None 时 source 置空（向后兼容）。
 
         Returns:
-            List[RetrievedItem]: 检索到的值列表，带有 lsh_jaccard_score 和 semantic_score
+            List[RetrievedItem]: 检索到的值列表，metadata 带 lsh_jaccard_score、
+            semantic_score、source_phrase、source_term。同一 value 被多 term 命中时
+            归属到 LSH jaccard_score 最高的 term 所在 phrase。
         """
         if not self.lsh_indexer:
             logger.warning("LSH 索引器未设置，跳过值检索")
@@ -294,15 +299,21 @@ class InformationRetrieval:
             if self._vectorizer.model is not None:
                 has_semantic = True
 
-        all_items: List[RetrievedItem] = []
-        seen = set()
+        def _resolve_source(term: str) -> tuple:
+            """据 term 解析 (source_phrase, source_term)"""
+            if term_phrase_map is None:
+                return ("", term)
+            return (term_phrase_map.get(term, ""), term)
 
+        # ---- 阶段1：LSH 粗召回 + 按 value_key 去重保留最高 lsh_score 的命中 ----
+        # value_key -> {keyword, value, table_name, col_name, lsh_score}
+        best_hits: Dict[str, Dict[str, Any]] = {}
         for keyword in keywords:
             try:
                 if not hasattr(self.lsh_indexer, '_loaded_lsh') or self.lsh_indexer._loaded_lsh is None:
                     continue
 
-                # 阶段1：LSH 粗召回
+                # LSH 粗召回
                 results = self.lsh_indexer.query(
                     self.lsh_indexer._loaded_lsh,
                     self.lsh_indexer._loaded_minhashes,
@@ -310,16 +321,10 @@ class InformationRetrieval:
                     top_k=top_k,
                 )
 
-                candidates_to_rerank = []
-
                 for table_name, columns in results.items():
                     for col_name, values in columns.items():
                         for val in values:
                             key = f"{table_name}.{col_name}.{val}"
-                            if key in seen:
-                                continue
-                            seen.add(key)
-
                             # LSH 相似度分数
                             val_mh = LSHIndexer.create_minhash(val)
                             kw_mh = LSHIndexer.create_minhash(keyword)
@@ -328,89 +333,90 @@ class InformationRetrieval:
                             if lsh_score < self.lsh_threshold:
                                 continue
 
-                            if has_semantic:
-                                candidates_to_rerank.append({
+                            # 同一 value 被多 term 命中：保留 lsh_score 最高的（D2 归属依据）
+                            if key not in best_hits or lsh_score > best_hits[key]["lsh_score"]:
+                                best_hits[key] = {
                                     "keyword": keyword,
                                     "value": val,
                                     "table_name": table_name,
                                     "col_name": col_name,
                                     "lsh_score": lsh_score,
-                                })
-                            else:
-                                # 降级：只看 LSH
-                                all_items.append(RetrievedItem(
-                                    item_type="value",
-                                    name=val,
-                                    table_name=table_name,
-                                    score=lsh_score,
-                                    metadata={
-                                        "column_name": col_name,
-                                        "lsh_jaccard_score": lsh_score,
-                                        "semantic_score": None,
-                                    },
-                                ))
-
-                # 阶段2：语义精排（如果有向量器）
-                if has_semantic and candidates_to_rerank:
-                    # 准备需要 embed 的文本：[(keyword + " " + value), ...]
-                    texts_to_embed = []
-                    for cand in candidates_to_rerank:
-                        text = f"{cand['keyword']} {cand['value']}"
-                        texts_to_embed.append(text)
-
-                    # 批量 embed
-                    embeddings = self._vectorizer.embed_texts(texts_to_embed, return_dense=True)
-                    dense_vectors = embeddings.get("dense", [])
-
-                    # 每个 candidate 单独比较（keyword 和 value 分别 embed 后算余弦相似度）
-                    # 注：为了简单，我们把 keyword 和 value 单独 embed 后计算
-                    # 优化：先单独 embed 所有 keyword 和 value
-                    kw_list = [c["keyword"] for c in candidates_to_rerank]
-                    val_list = [c["value"] for c in candidates_to_rerank]
-
-                    kw_embedding_result = self._vectorizer.embed_texts(kw_list, return_dense=True)
-                    val_embedding_result = self._vectorizer.embed_texts(val_list, return_dense=True)
-                    kw_vectors = kw_embedding_result.get("dense", [])
-                    val_vectors = val_embedding_result.get("dense", [])
-
-                    for i, cand in enumerate(candidates_to_rerank):
-                        if i >= len(kw_vectors) or i >= len(val_vectors):
-                            continue
-
-                        # 余弦相似度计算
-                        kw_vec = kw_vectors[i]
-                        val_vec = val_vectors[i]
-                        dot = sum(a * b for a, b in zip(kw_vec, val_vec))
-                        norm_kw = (sum(a * a for a in kw_vec)) ** 0.5
-                        norm_val = (sum(a * a for a in val_vec)) ** 0.5
-                        if norm_kw == 0 or norm_val == 0:
-                            semantic_score = 0.0
-                        else:
-                            semantic_score = dot / (norm_kw * norm_val)
-
-                        if semantic_score < value_semantic_threshold:
-                            continue
-
-                        # 最终 score 可以加权或直接取 semantic
-                        final_score = semantic_score
-
-                        all_items.append(RetrievedItem(
-                            item_type="value",
-                            name=cand["value"],
-                            table_name=cand["table_name"],
-                            score=final_score,
-                            metadata={
-                                "column_name": cand["col_name"],
-                                "lsh_jaccard_score": cand["lsh_score"],
-                                "semantic_score": semantic_score,
-                            },
-                        ))
+                                }
 
             except Exception as e:
                 logger.warning(f"值检索关键词 '{keyword}' 失败: {e}")
                 import traceback
                 logger.debug(traceback.format_exc())
                 continue
+
+        if not best_hits:
+            logger.info("值检索: LSH 无命中结果")
+            return []
+
+        all_items: List[RetrievedItem] = []
+
+        # ---- 阶段2：语义精排（有向量器）或降级（只 LSH）----
+        if has_semantic:
+            candidates = list(best_hits.values())
+            kw_list = [c["keyword"] for c in candidates]
+            val_list = [c["value"] for c in candidates]
+
+            # keyword 与 value 分别 embed 后算余弦相似度
+            kw_embedding_result = self._vectorizer.embed_texts(kw_list, return_dense=True)
+            val_embedding_result = self._vectorizer.embed_texts(val_list, return_dense=True)
+            kw_vectors = kw_embedding_result.get("dense", [])
+            val_vectors = val_embedding_result.get("dense", [])
+
+            for i, cand in enumerate(candidates):
+                if i >= len(kw_vectors) or i >= len(val_vectors):
+                    continue
+
+                # 余弦相似度计算
+                kw_vec = kw_vectors[i]
+                val_vec = val_vectors[i]
+                dot = sum(a * b for a, b in zip(kw_vec, val_vec))
+                norm_kw = (sum(a * a for a in kw_vec)) ** 0.5
+                norm_val = (sum(a * a for a in val_vec)) ** 0.5
+                if norm_kw == 0 or norm_val == 0:
+                    semantic_score = 0.0
+                else:
+                    semantic_score = dot / (norm_kw * norm_val)
+
+                if semantic_score < value_semantic_threshold:
+                    continue
+
+                # 最终 score 直接取 semantic
+                source_phrase, source_term = _resolve_source(cand["keyword"])
+                all_items.append(RetrievedItem(
+                    item_type="value",
+                    name=cand["value"],
+                    table_name=cand["table_name"],
+                    score=semantic_score,
+                    metadata={
+                        "column_name": cand["col_name"],
+                        "lsh_jaccard_score": cand["lsh_score"],
+                        "semantic_score": semantic_score,
+                        "source_phrase": source_phrase,
+                        "source_term": source_term,
+                    },
+                ))
+        else:
+            # 降级：只看 LSH
+            for cand in best_hits.values():
+                source_phrase, source_term = _resolve_source(cand["keyword"])
+                all_items.append(RetrievedItem(
+                    item_type="value",
+                    name=cand["value"],
+                    table_name=cand["table_name"],
+                    score=cand["lsh_score"],
+                    metadata={
+                        "column_name": cand["col_name"],
+                        "lsh_jaccard_score": cand["lsh_score"],
+                        "semantic_score": None,
+                        "source_phrase": source_phrase,
+                        "source_term": source_term,
+                    },
+                ))
 
         # 按最终 score 排序
         all_items.sort(key=lambda x: x.score, reverse=True)
@@ -567,14 +573,18 @@ class InformationRetrieval:
 
         # 1. 关键词提取（返回分组）
         keyword_groups = self.extract_keywords(query)
-        # 扁平化关键词列表（兼容旧接口）
+        # 扁平化关键词列表（兼容旧接口）+ 构建 term->phrase 映射（D2：值检索组归属）
         all_keywords = []
+        term_phrase_map: Dict[str, str] = {}
         for g in keyword_groups:
             all_keywords.extend(g.terms)
+            for t in (g.terms or []):
+                # 归属到首次出现的组（setdefault），供 retrieve_values 标注 source_phrase
+                term_phrase_map.setdefault(t, g.phrase)
         logger.info(f"提取关键词: {[(g.phrase, g.terms) for g in keyword_groups]}")
 
-        # 2. LSH 值检索（用扁平化关键词）
-        value_items = self.retrieve_values(all_keywords)
+        # 2. LSH 值检索（用扁平化关键词 + term->phrase 映射标注组归属）
+        value_items = self.retrieve_values(all_keywords, term_phrase_map=term_phrase_map)
 
         # 3. 语义 schema 检索（按分组独立召回）
         group_schema_results = self.retrieve_schema(keyword_groups, database_filter)

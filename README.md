@@ -83,6 +83,26 @@ python run_api.py
 
 服务默认在 `http://localhost:8000` 启动，Swagger 文档位于 `http://localhost:8000/docs`。
 
+### 启动前端（问数界面）
+
+前台工程位于 `frontend/`（React + Vite + TypeScript + Ant Design），消费后端 REST + SSE 接口，把 Agent 推理流实时渲染成"玻璃箱数据分析师"体验（三栏可拖拽布局 + SSE 时间轴 + 反问 resume + IR/SS 透明展示）。
+
+```bash
+cd frontend
+npm install --registry https://registry.npmmirror.com   # 首次需安装依赖
+npm run dev
+```
+
+前端 dev server 默认在 `http://localhost:5173`（如被占用自动顺延到 5174/5175），Vite 自动 proxy `/api/v1` -> `http://localhost:8000`，无需处理跨域。浏览器访问 `http://localhost:5173` 即可。
+
+### 一体化启动顺序
+
+1. 先启动后端：`python run_api.py`（等"Application startup complete"）
+2. 再启动前端：`cd frontend && npm run dev`
+3. 浏览器打开前端地址，顶部确认 DB 已选中（如 `california_schools`），底部输入问题即可
+
+> 前端首次访问冷库时，后端懒加载约 5-10 秒，界面会提示"首次加载该数据库"。
+
 ---
 
 ## 架构总览

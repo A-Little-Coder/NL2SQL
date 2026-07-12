@@ -24,6 +24,7 @@ export type NodeStatus = 'pending' | 'active' | 'done' | 'error';
 export type TimelineNodeType =
   | 'cache'
   | 'ir'
+  | 'ss'
   | 'answerability'
   | 'cg'
   | 'execution'
@@ -55,6 +56,14 @@ export interface ExecutionResult {
   error: string | null;
 }
 
+/** IR 关键词组召回详情（D3/D5：按组聚合的字段与值召回） */
+export interface KeywordGroupDetail {
+  phrase: string;
+  terms: string[];
+  columns: { table: string; column: string; score: number }[];
+  values: { value: string; table: string; column: string; score: number }[];
+}
+
 /** Turn 详情：按节点类型存结构化产物（供检查器渲染） */
 export interface TurnDetails {
   cache?: {
@@ -63,8 +72,8 @@ export interface TurnDetails {
     confidence: number;
     cachedSql: string | null;
   };
-  keywords?: { name: string; expansions?: string[] }[];
-  schemaRecall?: { name: string; top_columns: string[] }[];
+  ir?: { keywordGroups: KeywordGroupDetail[] };
+  schemaFinalize?: { joinEdges: number; bridgeTables: number };
   answerability?: {
     answerable: boolean;
     confidence: number | null;

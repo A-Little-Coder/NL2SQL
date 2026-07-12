@@ -63,6 +63,9 @@ function mapStageNode(node: string): TimelineNodeType | null {
   if (n === 'ir' || n.includes('retrieval') || n.includes('preprocess') || n.includes('task_plan')) {
     return 'ir';
   }
+  if (n === 'ss' || n.includes('schema_select') || n === 'schema_finalize' || n.includes('schema_final')) {
+    return 'ss';
+  }
   if (n === 'cg' || n.includes('generation') || n.includes('generate')) {
     return 'cg';
   }
@@ -150,22 +153,55 @@ export function reduceSseEvent(turn: Turn, event: SseEvent): Turn {
     }
 
     case 'keywords': {
-      details = { ...details, keywords: event.data.groups };
+      const groups = event.data.groups;
+      details = {
+        ...details,
+        ir: {
+          keywordGroups: groups.map((g) => ({
+            phrase: g.name,
+            terms: g.expansions ?? [],
+            columns: [],
+            values: [],
+          })),
+        },
+      };
       timeline = upsert(timeline, 'ir', {
         status: 'done',
-        summary: `关键词 ${event.data.groups.length} 组`,
+        summary: `关键词 ${groups.length} 组`,
       });
       break;
     }
 
     case 'schema_recall': {
-      details = { ...details, schemaRecall: event.data.groups };
+      const kwGroups = event.data.keyword_groups;
+      details = { ...details, ir: { keywordGroups: kwGroups } };
       const prev = timeline.find((n) => n.type === 'ir');
+      const colTotal = kwGroups.reduce((s, g) => s + g.columns.length, 0);
+      const valTotal = kwGroups.reduce((s, g) => s + g.values.length, 0);
       timeline = upsert(timeline, 'ir', {
         status: 'done',
         summary: prev?.summary
-          ? `${prev.summary} · 召回 ${event.data.groups.length} 组`
-          : `召回 ${event.data.groups.length} 组 schema`,
+          ? `${prev.summary} · 召回 ${kwGroups.length} 组（${colTotal} 字段/${valTotal} 值）`
+          : `召回 ${kwGroups.length} 组（${colTotal} 字段/${valTotal} 值）`,
+      });
+      break;
+    }
+
+    case 'schema_finalize': {
+      const d = event.data;
+      details = {
+        ...details,
+        schemaFinalize: {
+          joinEdges: d.join_edges,
+          bridgeTables: d.bridge_tables,
+        },
+      };
+      const prevSs = timeline.find((n) => n.type === 'ss');
+      timeline = upsert(timeline, 'ss', {
+        status: 'done',
+        summary: prevSs?.summary
+          ? `${prevSs.summary} · JOIN 边 ${d.join_edges} · 桥接表 ${d.bridge_tables}`
+          : `JOIN 边 ${d.join_edges} · 桥接表 ${d.bridge_tables}`,
       });
       break;
     }
