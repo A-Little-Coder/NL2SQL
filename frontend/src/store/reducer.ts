@@ -43,7 +43,11 @@ function upsert(
   type: TimelineNodeType,
   patch: Partial<TimelineNode>,
 ): TimelineNode[] {
-  const idx = timeline.findIndex((n) => n.type === type);
+  // 有 id 按 id 匹配（多轮节点 rewrite_detect/rewrite），无 id 按 type 匹配（单次节点）
+  const id = patch.id;
+  const idx = id !== undefined
+    ? timeline.findIndex((n) => n.id === id)
+    : timeline.findIndex((n) => n.type === type);
   if (idx === -1) {
     return [...timeline, { type, status: 'done', summary: '', ...patch }];
   }
@@ -60,6 +64,9 @@ function upsert(
  */
 function mapStageNode(node: string): TimelineNodeType | null {
   const n = (node || '').toLowerCase();
+  if (n === 'pre_reject') {
+    return 'pre_reject';
+  }
   if (n === 'ir' || n.includes('retrieval') || n.includes('preprocess') || n.includes('task_plan')) {
     return 'ir';
   }
@@ -99,9 +106,26 @@ export function reduceSseEvent(turn: Turn, event: SseEvent): Turn {
 
   switch (event.type) {
     case 'stage': {
-      const tlType = mapStageNode(event.data.node);
-      if (tlType) {
-        const status = event.data.status === 'started' ? 'active' : 'done';
+      const d = event.data;
+      const tlType = mapStageNode(d.node);
+      if (tlType === 'pre_reject') {
+        // 前置拒答节点：通过->"通过"，拒答->"拒答: 原因"（置 error 态，不落通用 error 节点）
+        const isReject = !!d.rejection_reason;
+        const status = isReject ? 'error' : (d.status === 'started' ? 'active' : 'done');
+        timeline = upsert(timeline, 'pre_reject', {
+          status,
+          summary: isReject ? `拒答: ${d.rejection_reason}` : (d.status === 'done' ? '通过' : ''),
+        });
+        if (isReject) {
+          next.rejection = true;
+          next.error = d.rejection_reason;
+          next.status = 'error';
+          details = { ...details, preReject: { passed: false, reason: d.rejection_reason, category: d.category } };
+        } else if (d.status === 'done') {
+          details = { ...details, preReject: { passed: true, category: d.category } };
+        }
+      } else if (tlType) {
+        const status = d.status === 'started' ? 'active' : 'done';
         const existing = timeline.find((n) => n.type === tlType);
         if (existing) {
           timeline = upsert(timeline, tlType, { status });
@@ -109,18 +133,66 @@ export function reduceSseEvent(turn: Turn, event: SseEvent): Turn {
           timeline = [...timeline, { type: tlType, status, summary: '' }];
         }
       }
-      // stage done 携带 rejection_reason / error（节点内拒答/失败）
-      if (event.data.rejection_reason) {
+      // 非 pre_reject 节点的 stage done 拒答/失败（pre_reject / schema_empty 已自行处理）
+      if (d.rejection_reason && tlType !== 'pre_reject') {
+        const hasSchemaEmptyError = timeline.some(
+          (n) => n.type === 'schema_empty' && n.status === 'error',
+        );
         next.rejection = true;
-        next.error = event.data.rejection_reason;
-        timeline = upsert(timeline, 'error', {
-          status: 'done',
-          summary: `拒答: ${event.data.rejection_reason}`,
-        });
+        next.error = d.rejection_reason;
+        if (!hasSchemaEmptyError) {
+          timeline = upsert(timeline, 'error', {
+            status: 'done',
+            summary: `拒答: ${d.rejection_reason}`,
+          });
+        }
         next.status = 'error';
-      } else if (event.data.error) {
-        next.error = event.data.error;
+      } else if (d.error) {
+        next.error = d.error;
       }
+      break;
+    }
+
+    case 'rewrite_detect': {
+      // 改写问题检测（每轮独立节点，id=detect_r{round}）
+      const d = event.data;
+      const id = `detect_r${d.round}`;
+      const summary = d.has_issues
+        ? `检测到 ${d.issue_types.join('·') || '问题'}`
+        : '无问题';
+      timeline = upsert(timeline, 'rewrite_detect', { id, status: 'done', summary });
+      const rounds = [...(details.rewriteDetect?.rounds ?? [])];
+      const entry = {
+        round: d.round,
+        hasIssues: d.has_issues,
+        issueDetail: d.issue_detail,
+        issueTypes: [...d.issue_types],
+      };
+      const ridx = rounds.findIndex((r) => r.round === d.round);
+      if (ridx >= 0) rounds[ridx] = entry; else rounds.push(entry);
+      details = { ...details, rewriteDetect: { rounds } };
+      break;
+    }
+
+    case 'rewrite': {
+      // 改写执行（每轮独立节点，id=rewrite_r{round}）
+      const d = event.data;
+      const id = `rewrite_r${d.rewrite_round}`;
+      timeline = upsert(timeline, 'rewrite', {
+        id,
+        status: 'done',
+        summary: `改写第 ${d.rewrite_round} 轮`,
+      });
+      const rounds = [...(details.rewrite?.rounds ?? [])];
+      const entry = {
+        round: d.rewrite_round,
+        originalQuery: d.original_query,
+        rewrittenQuery: d.rewritten_query,
+        reason: d.rewrite_reason,
+      };
+      const ridx = rounds.findIndex((r) => r.round === d.rewrite_round);
+      if (ridx >= 0) rounds[ridx] = entry; else rounds.push(entry);
+      details = { ...details, rewrite: { rounds } };
       break;
     }
 
@@ -154,6 +226,46 @@ export function reduceSseEvent(turn: Turn, event: SseEvent): Turn {
           summary: `${label} · conf=${fmtConf(d.confidence)}`,
         });
       }
+      break;
+    }
+
+    case 'value_rewrite': {
+      // 值参数改写（cache 命中后比对历史查询改写值参数）
+      const d = event.data;
+      details = {
+        ...details,
+        valueRewrite: {
+          historicalQuery: d.historical_query,
+          userQuery: d.user_query,
+          cachedSql: d.cached_sql,
+          adjustedCachedSql: d.adjusted_cached_sql,
+          changed: d.changed,
+          reason: d.reason,
+        },
+      };
+      timeline = upsert(timeline, 'value_rewrite', {
+        status: 'done',
+        summary: d.changed ? '✓' : '未变更',
+      });
+      break;
+    }
+
+    case 'cache_confirm': {
+      // 复用确认（用户对 cache 反问的回答结果）
+      const d = event.data;
+      details = {
+        ...details,
+        cacheConfirm: {
+          approved: d.approved,
+          userChoice: d.user_choice,
+          historicalQuery: d.historical_query,
+          userQuery: d.user_query,
+        },
+      };
+      timeline = upsert(timeline, 'cache_confirm', {
+        status: 'done',
+        summary: d.approved ? '✓' : '✗',
+      });
       break;
     }
 
@@ -215,6 +327,20 @@ export function reduceSseEvent(turn: Turn, event: SseEvent): Turn {
           ? `${prevSs.summary} · JOIN 边 ${d.join_edges} · 桥接表 ${d.bridge_tables}`
           : `JOIN 边 ${d.join_edges} · 桥接表 ${d.bridge_tables}`,
       });
+      break;
+    }
+
+    case 'schema_empty': {
+      // SS 未选出任何表时显式拒答（D10）：独立 error 节点，不再静默中断
+      const d = event.data;
+      details = { ...details, schemaEmpty: { reason: d.reason } };
+      timeline = upsert(timeline, 'schema_empty', {
+        status: 'error',
+        summary: '未匹配相关表',
+      });
+      next.rejection = true;
+      next.error = d.reason;
+      next.status = 'error';
       break;
     }
 
@@ -324,10 +450,19 @@ export function reduceSseEvent(turn: Turn, event: SseEvent): Turn {
       next.error = d.error;
       if (d.rejection) next.rejection = true;
       next.status = 'error';
-      timeline = upsert(timeline, 'error', {
-        status: 'done',
-        summary: d.rejection ? `拒答: ${d.error}` : `错误: ${d.error}`,
-      });
+      // 前置拒答 / schema 空拒答已由对应节点独占呈现，不再重复 upsert 通用 error 节点
+      const hasPreRejectError = timeline.some(
+        (n) => n.type === 'pre_reject' && n.status === 'error',
+      );
+      const hasSchemaEmptyError = timeline.some(
+        (n) => n.type === 'schema_empty' && n.status === 'error',
+      );
+      if (!hasPreRejectError && !hasSchemaEmptyError) {
+        timeline = upsert(timeline, 'error', {
+          status: 'done',
+          summary: d.rejection ? `拒答: ${d.error}` : `错误: ${d.error}`,
+        });
+      }
       break;
     }
 

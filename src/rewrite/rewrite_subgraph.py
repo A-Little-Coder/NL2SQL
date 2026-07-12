@@ -79,8 +79,16 @@ def make_detect_issues_node(llm_client: Any) -> Callable:
         user_query = state.get("user_query", "")
         history_lines = _format_history_lines(state.get("conversation_history", []))
 
+        detect_round = state.get("rewrite_round", 0) + 1
+
         if not llm_client:
-            # 无 LLM 时视为无问题
+            # 无 LLM 时视为无问题（仍 emit 事件，保证时间轴节点存在）
+            emit_safe("rewrite_detect", {
+                "round": detect_round,
+                "has_issues": False,
+                "issue_detail": "",
+                "issue_types": [],
+            })
             return {"has_issues": False, "issue_detail": "", "issue_types": []}
 
         try:
@@ -94,13 +102,27 @@ def make_detect_issues_node(llm_client: Any) -> Callable:
             )
             result = parse_json(raw)
             has_issues = bool(result.get("has_issues", False))
+            issue_detail = str(result.get("issue_detail", ""))
+            issue_types = list(result.get("issue_types", []))
+            emit_safe("rewrite_detect", {
+                "round": detect_round,
+                "has_issues": has_issues,
+                "issue_detail": issue_detail,
+                "issue_types": issue_types,
+            })
             return {
                 "has_issues": has_issues,
-                "issue_detail": str(result.get("issue_detail", "")),
-                "issue_types": list(result.get("issue_types", [])),
+                "issue_detail": issue_detail,
+                "issue_types": issue_types,
             }
         except Exception as e:
             logger.error(f"DetectIssues LLM 调用失败，降级为无问题: {e}")
+            emit_safe("rewrite_detect", {
+                "round": detect_round,
+                "has_issues": False,
+                "issue_detail": "",
+                "issue_types": [],
+            })
             return {"has_issues": False, "issue_detail": "", "issue_types": []}
 
     return node
@@ -124,7 +146,7 @@ def make_rewrite_execute_node(llm_client: Any) -> Callable:
 
         if not llm_client:
             # 无 LLM 时透传原 query
-            return {"rewritten_query": user_query, "rewrite_reason": "LLM 不可用，透传"}
+            return {"user_query": user_query, "rewritten_query": user_query, "rewrite_reason": "LLM 不可用，透传"}
 
         try:
             messages = REWRITE_EXECUTE_PROMPT.format_messages(
@@ -144,6 +166,7 @@ def make_rewrite_execute_node(llm_client: Any) -> Callable:
 
             # Emit rewrite SSE 事件
             emit_safe("rewrite", {
+                "original_query": user_query,
                 "rewritten_query": rewritten_query,
                 "rewrite_reason": rewrite_reason,
                 "rewrite_round": current_round,
@@ -151,13 +174,14 @@ def make_rewrite_execute_node(llm_client: Any) -> Callable:
 
             logger.info(f"Rewrite: round={current_round}, reason={rewrite_reason[:80]}")
             return {
+                "user_query": rewritten_query,
                 "rewritten_query": rewritten_query,
                 "rewrite_reason": rewrite_reason,
                 "rewrite_round": current_round,
             }
         except Exception as e:
             logger.error(f"RewriteExecute LLM 调用失败，降级透传: {e}")
-            return {"rewritten_query": user_query, "rewrite_reason": "LLM 异常，透传"}
+            return {"user_query": user_query, "rewritten_query": user_query, "rewrite_reason": "LLM 异常，透传"}
 
     return node
 

@@ -246,4 +246,157 @@ describe('reduceSseEvent', () => {
     expect(t.turnId).toBe('t1');
     expect(t.queryId).toBe('server-qid');
   });
+
+  // ===== 改写/拒答展示（rewrite-refusal-frontend-display）=====
+
+  test('rewrite_detect 事件 -> 检测节点 + details.rewriteDetect', () => {
+    let t = createTurn('t1', '那去年的呢');
+    t = reduceSseEvent(
+      t,
+      ev({ type: 'rewrite_detect', data: { query_id: 'q1', round: 1, has_issues: true, issue_detail: '指代缺失', issue_types: ['指代缺失'] } }),
+    );
+    const node = t.timeline.find((n) => n.type === 'rewrite_detect');
+    expect(node).toBeTruthy();
+    expect(node?.id).toBe('detect_r1');
+    expect(node?.summary).toContain('指代缺失');
+    expect(t.details.rewriteDetect?.rounds.length).toBe(1);
+    expect(t.details.rewriteDetect?.rounds[0].hasIssues).toBe(true);
+  });
+
+  test('rewrite 事件多轮 -> 多个独立 rewrite 节点（id 递增）+ rounds 数组', () => {
+    let t = createTurn('t1', 'q');
+    t = reduceSseEvent(
+      t,
+      ev({ type: 'rewrite', data: { query_id: 'q1', original_query: '那去年的呢', rewritten_query: '查苹果去年的销售额', rewrite_reason: '补全指代', rewrite_round: 1 } }),
+    );
+    t = reduceSseEvent(
+      t,
+      ev({ type: 'rewrite', data: { query_id: 'q1', original_query: '查苹果去年的销售额', rewritten_query: '查苹果公司2025年的销售额', rewrite_reason: '消歧', rewrite_round: 2 } }),
+    );
+    const rewriteNodes = t.timeline.filter((n) => n.type === 'rewrite');
+    expect(rewriteNodes.length).toBe(2);
+    expect(rewriteNodes[0].id).toBe('rewrite_r1');
+    expect(rewriteNodes[1].id).toBe('rewrite_r2');
+    expect(t.details.rewrite?.rounds.length).toBe(2);
+    expect(t.details.rewrite?.rounds[1].rewrittenQuery).toBe('查苹果公司2025年的销售额');
+  });
+
+  test('value_rewrite 事件 -> 值改写节点 + details.valueRewrite', () => {
+    let t = createTurn('t1', 'q');
+    t = reduceSseEvent(
+      t,
+      ev({
+        type: 'value_rewrite',
+        data: {
+          query_id: 'q1',
+          historical_query: '查苹果销售额',
+          user_query: '查华为销售额',
+          cached_sql: "SELECT * FROM sales WHERE brand='苹果'",
+          adjusted_cached_sql: "SELECT * FROM sales WHERE brand='华为'",
+          changed: true,
+          reason: 'brand 值参数变更',
+        },
+      }),
+    );
+    const node = t.timeline.find((n) => n.type === 'value_rewrite');
+    expect(node).toBeTruthy();
+    expect(node?.summary).toBe('✓');
+    expect(t.details.valueRewrite?.changed).toBe(true);
+    expect(t.details.valueRewrite?.adjustedCachedSql).toContain('华为');
+  });
+
+  test('cache_confirm 事件 -> 确认节点 + details.cacheConfirm', () => {
+    let t = createTurn('t1', 'q');
+    t = reduceSseEvent(
+      t,
+      ev({ type: 'cache_confirm', data: { query_id: 'q1', approved: true, user_choice: '复用', historical_query: 'h', user_query: 'q' } }),
+    );
+    const node = t.timeline.find((n) => n.type === 'cache_confirm');
+    expect(node?.summary).toBe('✓');
+    expect(t.details.cacheConfirm?.approved).toBe(true);
+  });
+
+  test('stage(pre_reject, done, rejection_reason) -> pre_reject error 节点，不生成通用 error', () => {
+    let t = createTurn('t1', '删除数据');
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'pre_reject', status: 'started' } }));
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'pre_reject', status: 'done', rejection_reason: '本服务仅支持查询' } }));
+    // 模拟 query.py 图结束后发的 error 事件（rejection=true）
+    t = reduceSseEvent(t, ev({ type: 'error', data: { query_id: 'q1', error: '本服务仅支持查询', rejection: true } }));
+    const preReject = t.timeline.find((n) => n.type === 'pre_reject');
+    expect(preReject?.status).toBe('error');
+    expect(preReject?.summary).toContain('拒答');
+    // 不应出现通用 error 节点
+    expect(t.timeline.find((n) => n.type === 'error')).toBeFalsy();
+    expect(t.rejection).toBe(true);
+    expect(t.details.preReject?.passed).toBe(false);
+  });
+
+  test('stage(pre_reject, done) 无 rejection_reason -> pre_reject done 节点 summary="通过"', () => {
+    let t = createTurn('t1', '查苹果销售额');
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'pre_reject', status: 'started' } }));
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'pre_reject', status: 'done' } }));
+    const preReject = t.timeline.find((n) => n.type === 'pre_reject');
+    expect(preReject?.status).toBe('done');
+    expect(preReject?.summary).toBe('通过');
+    expect(t.details.preReject?.passed).toBe(true);
+  });
+
+  test('单次节点（ir/cg）upsert 在 id 改造后仍按 type 合并，无回归', () => {
+    let t = createTurn('t1', 'q');
+    // ir 节点：stage + keywords + schema_recall 三次事件应合并到同一 ir 节点
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'ir', status: 'started' } }));
+    t = reduceSseEvent(t, ev({ type: 'keywords', data: { query_id: 'q1', groups: [{ name: 'k', expansions: ['e'] }] } }));
+    t = reduceSseEvent(t, ev({ type: 'schema_recall', data: { query_id: 'q1', keyword_groups: [{ phrase: 'g', terms: ['g'], columns: [], values: [] }] } }));
+    expect(t.timeline.filter((n) => n.type === 'ir').length).toBe(1);
+    // cg 节点
+    t = reduceSseEvent(t, ev({ type: 'sql_candidates', data: { query_id: 'q1', candidates: [{ id: 'c1', sql: 'SELECT 1' }] } }));
+    expect(t.timeline.filter((n) => n.type === 'cg').length).toBe(1);
+  });
+
+  test('schema_empty 事件 -> schema_empty error 节点 + details.schemaEmpty + 拒答', () => {
+    let t = createTurn('t1', 'q');
+    t = reduceSseEvent(t, ev({ type: 'schema_empty', data: { query_id: 'q1', reason: '未在数据库中找到与查询相关的表或字段' } }));
+    const node = t.timeline.find((n) => n.type === 'schema_empty');
+    expect(node).toBeDefined();
+    expect(node?.status).toBe('error');
+    expect(t.details.schemaEmpty?.reason).toContain('找到');
+    expect(t.rejection).toBe(true);
+    expect(t.status).toBe('error');
+  });
+
+  test('stage(pre_reject, done, category=write_op, rejection_reason) -> pre_reject error + category 写入', () => {
+    let t = createTurn('t1', '删除数据');
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'pre_reject', status: 'started' } }));
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'pre_reject', status: 'done', rejection_reason: '本服务仅支持查询', category: 'write_op' } }));
+    expect(t.details.preReject?.category).toBe('write_op');
+    expect(t.details.preReject?.passed).toBe(false);
+    const node = t.timeline.find((n) => n.type === 'pre_reject');
+    expect(node?.status).toBe('error');
+    // 不生成通用 error 节点
+    expect(t.timeline.some((n) => n.type === 'error')).toBe(false);
+  });
+
+  test('stage(pre_reject, done, category=normal) -> pre_reject done + category=normal', () => {
+    let t = createTurn('t1', '查询');
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'pre_reject', status: 'done', category: 'normal' } }));
+    expect(t.details.preReject?.category).toBe('normal');
+    expect(t.details.preReject?.passed).toBe(true);
+  });
+
+  test('schema_empty 后 stage(schema_finalize, done, rejection_reason) 不重复 upsert 通用 error', () => {
+    let t = createTurn('t1', 'q');
+    t = reduceSseEvent(t, ev({ type: 'schema_empty', data: { query_id: 'q1', reason: '未找到相关表' } }));
+    t = reduceSseEvent(t, ev({ type: 'stage', data: { query_id: 'q1', node: 'schema_finalize', status: 'done', rejection_reason: '未找到相关表' } }));
+    // 已有 schema_empty error 节点，不再生成通用 error 节点
+    expect(t.timeline.some((n) => n.type === 'error')).toBe(false);
+    expect(t.timeline.some((n) => n.type === 'schema_empty' && n.status === 'error')).toBe(true);
+  });
+
+  test('schema_empty 后 error(rejection) 事件不重复 upsert 通用 error', () => {
+    let t = createTurn('t1', 'q');
+    t = reduceSseEvent(t, ev({ type: 'schema_empty', data: { query_id: 'q1', reason: '未找到相关表' } }));
+    t = reduceSseEvent(t, ev({ type: 'error', data: { query_id: 'q1', error: '未找到相关表', rejection: true } }));
+    expect(t.timeline.some((n) => n.type === 'error')).toBe(false);
+    expect(t.timeline.some((n) => n.type === 'schema_empty' && n.status === 'error')).toBe(true);
+  });
 });

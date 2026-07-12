@@ -153,8 +153,65 @@ export interface StageEvent {
     error?: string;
     /** done 时若拒答携带 */
     rejection_reason?: string;
+    /** pre_reject done 时携带 LLM 判定类别（write_op/dangerous_info/normal） */
+    category?: string;
     /** run_subqueries 节点携带子查询列表 */
     subqueries?: string[];
+  };
+}
+
+/** rewrite_detect：改写问题检测（detect_issues 子节点，每轮一次） */
+export interface RewriteDetectEvent {
+  type: 'rewrite_detect';
+  data: {
+    query_id: string;
+    /** 第几次检测（= rewrite_round + 1） */
+    round: number;
+    has_issues: boolean;
+    issue_detail: string;
+    issue_types: string[];
+  };
+}
+
+/** rewrite：改写执行（rewrite_execute 子节点，每轮一次） */
+export interface RewriteEvent {
+  type: 'rewrite';
+  data: {
+    query_id: string;
+    /** 改写前的 query（当前轮输入） */
+    original_query: string;
+    /** 改写后的完整 query */
+    rewritten_query: string;
+    /** 改写原因说明 */
+    rewrite_reason: string;
+    /** 第几次改写 */
+    rewrite_round: number;
+  };
+}
+
+/** value_rewrite：值参数改写（cache 命中后比对历史查询改写值） */
+export interface ValueRewriteEvent {
+  type: 'value_rewrite';
+  data: {
+    query_id: string;
+    historical_query: string;
+    user_query: string;
+    cached_sql: string;
+    adjusted_cached_sql: string;
+    changed: boolean;
+    reason: string;
+  };
+}
+
+/** cache_confirm：用户确认是否复用 cached_sql（interrupt 恢复后） */
+export interface CacheConfirmEvent {
+  type: 'cache_confirm';
+  data: {
+    query_id: string;
+    approved: boolean;
+    user_choice: string;
+    historical_query: string;
+    user_query: string;
   };
 }
 
@@ -218,6 +275,15 @@ export interface SchemaFinalizeEvent {
     query_id?: string;
     join_edges: number;
     bridge_tables: number;
+  };
+}
+
+/** schema_empty：SS 未选出任何表时显式拒答（D10） */
+export interface SchemaEmptyEvent {
+  type: 'schema_empty';
+  data: {
+    query_id?: string;
+    reason: string;
   };
 }
 
@@ -320,11 +386,16 @@ export interface DoneEvent {
 /** 全部 SSE 事件联合类型 */
 export type SseEvent =
   | StageEvent
+  | RewriteDetectEvent
+  | RewriteEvent
+  | ValueRewriteEvent
+  | CacheConfirmEvent
   | CacheCheckEvent
   | LlmThinkingEvent
   | KeywordsEvent
   | SchemaRecallEvent
   | SchemaFinalizeEvent
+  | SchemaEmptyEvent
   | AnswerabilityEvent
   | SqlCandidatesEvent
   | ExecutionEvent

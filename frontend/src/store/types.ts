@@ -11,20 +11,33 @@ export type NodeStatus = 'pending' | 'active' | 'done' | 'error';
 
 /**
  * 时间轴节点类型（对应推理阶段）。
- * - cache        历史缓存命中
- * - ir           信息检索（关键词 + schema 召回）
+ * - pre_reject    前置拒答检测（写操作/空查询）
+ * - rewrite_detect 改写问题检测（每轮独立节点，id=detect_r{round}）
+ * - rewrite       改写执行（每轮独立节点，id=rewrite_r{round}）
+ * - cache         历史缓存命中
+ * - value_rewrite 值参数改写
+ * - cache_confirm 复用确认
+ * - ir            信息检索（关键词 + schema 召回）
+ * - ss            Schema 选择
+ * - schema_empty  SS 未选出表时显式拒答
  * - answerability 可回答性检查
- * - cg           SQL 候选生成
- * - execution    SQL 执行
- * - decision     最终决策
- * - clarify      反问
- * - result       最终结果
- * - error        拒答/错误
+ * - cg            SQL 候选生成
+ * - execution     SQL 执行
+ * - decision      最终决策
+ * - clarify       反问
+ * - result        最终结果
+ * - error         拒答/错误
  */
 export type TimelineNodeType =
+  | 'pre_reject'
+  | 'rewrite_detect'
+  | 'rewrite'
   | 'cache'
+  | 'value_rewrite'
+  | 'cache_confirm'
   | 'ir'
   | 'ss'
+  | 'schema_empty'
   | 'answerability'
   | 'cg'
   | 'execution'
@@ -36,6 +49,8 @@ export type TimelineNodeType =
 /** 时间轴节点（常驻时间轴的一行） */
 export interface TimelineNode {
   type: TimelineNodeType;
+  /** 多轮节点（rewrite_detect/rewrite）用 id 区分轮次，单次节点无 id */
+  id?: string;
   status: NodeStatus;
   /** 一行摘要（命中/关键词/候选数/可回答性/决策） */
   summary: string;
@@ -66,6 +81,28 @@ export interface KeywordGroupDetail {
 
 /** Turn 详情：按节点类型存结构化产物（供检查器渲染） */
 export interface TurnDetails {
+  preReject?: {
+    passed: boolean;
+    reason?: string;
+    /** LLM 判定类别（write_op/dangerous_info/normal） */
+    category?: string;
+  };
+  rewriteDetect?: {
+    rounds: Array<{
+      round: number;
+      hasIssues: boolean;
+      issueDetail: string;
+      issueTypes: string[];
+    }>;
+  };
+  rewrite?: {
+    rounds: Array<{
+      round: number;
+      originalQuery: string;
+      rewrittenQuery: string;
+      reason: string;
+    }>;
+  };
   cache?: {
     hit: boolean;
     source: string;
@@ -74,8 +111,23 @@ export interface TurnDetails {
     matchedMetricName?: string | null;
     historicalQuery?: string | null;
   };
+  valueRewrite?: {
+    historicalQuery: string;
+    userQuery: string;
+    cachedSql: string;
+    adjustedCachedSql: string;
+    changed: boolean;
+    reason: string;
+  };
+  cacheConfirm?: {
+    approved: boolean;
+    userChoice: string;
+    historicalQuery: string;
+    userQuery: string;
+  };
   ir?: { keywordGroups: KeywordGroupDetail[] };
   schemaFinalize?: { joinEdges: number; bridgeTables: number };
+  schemaEmpty?: { reason: string };
   answerability?: {
     answerable: boolean;
     confidence: number | null;

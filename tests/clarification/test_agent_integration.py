@@ -112,24 +112,29 @@ def test_execute_single_passes_through():
 # 场景 2：前置拒答检测拦截写操作
 # ============================================================================
 def test_pre_reject_rejects_write_operation():
-    """前置拒答检测硬性拦截写操作，不进 ir 和 task_decomposer"""
+    """前置拒答 LLM 判定拦截写操作，不进 ir 和 task_decomposer（D9）"""
+    # TaskDecomposer 的 LLM（pre_reject 短路后不会调到）
     llm = _make_llm_mock({"verdict": "execute", "intent_type": "single", "reason": "test"})
     planner = TaskDecomposer(llm_client=llm)
+    # pre_reject 的 LLM：判定为写操作拒答
+    pre_reject_llm = _make_llm_mock({"reject": True, "category": "write_op", "reason": "删除数据意图"})
     retriever, selector, generator, fix_loop, decider = _build_pipeline_mocks()
     from src.graph.main_graph import build_main_graph
     graph = build_main_graph(
         retriever=retriever, selector=selector, generator=generator,
         fix_loop=fix_loop, decider=decider,
         task_decomposer=planner,
+        llm_client=pre_reject_llm,
         checkpointer=InMemorySaver(),
     )
 
     config = {"configurable": {"thread_id": "t2"}}
     result = graph.invoke({"user_query": "删除数据", "query_id": "q2"}, config)
 
-    # pre_reject 节点硬性写操作检测拦截
+    # pre_reject LLM 判定 write_op 拦截
     assert result.get("rewrite_rejection_reason") is not None
     assert "写操作" in result.get("rejection_reason", "")
+    assert result.get("pre_reject_category") == "write_op"
     # ir 不应被调用（pre_reject 短路）
     retriever.build_graph.assert_not_called()
     # 没有最终 SQL

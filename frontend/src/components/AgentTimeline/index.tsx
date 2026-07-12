@@ -26,6 +26,12 @@ import {
   CloseCircleOutlined,
   LoadingOutlined,
   ClockCircleOutlined,
+  SafetyOutlined,
+  AuditOutlined,
+  EditOutlined,
+  ToolOutlined,
+  SolutionOutlined,
+  WarningOutlined,
 } from '@ant-design/icons';
 import type { ReactNode } from 'react';
 import type { Turn, TimelineNode, TimelineNodeType, NodeStatus } from '@/store/types';
@@ -33,9 +39,15 @@ import { useChatStore } from '@/store/useChatStore';
 
 /** 节点类型 -> 中文标签 */
 const NODE_LABEL: Record<TimelineNodeType, string> = {
+  pre_reject: '前置检查',
+  rewrite_detect: '改写检测',
+  rewrite: '改写',
   cache: '缓存检测',
+  value_rewrite: '值改写',
+  cache_confirm: '确认复用',
   ir: '信息检索',
   ss: 'Schema 选择',
+  schema_empty: '未匹配表',
   answerability: '可回答性',
   cg: 'SQL 生成',
   execution: '执行',
@@ -47,9 +59,15 @@ const NODE_LABEL: Record<TimelineNodeType, string> = {
 
 /** 节点类型 -> 图标 */
 const NODE_ICON: Record<TimelineNodeType, ReactNode> = {
+  pre_reject: <SafetyOutlined />,
+  rewrite_detect: <AuditOutlined />,
+  rewrite: <EditOutlined />,
   cache: <DatabaseOutlined />,
+  value_rewrite: <ToolOutlined />,
+  cache_confirm: <SolutionOutlined />,
   ir: <SearchOutlined />,
   ss: <PartitionOutlined />,
+  schema_empty: <WarningOutlined />,
   answerability: <QuestionCircleOutlined />,
   cg: <CodeOutlined />,
   execution: <PlayCircleOutlined />,
@@ -92,10 +110,21 @@ export default function AgentTimeline({ turn }: { turn: Turn }) {
   const selectedNode = turn.selectedNode;
   const cacheHit = turn.details.cache?.hit === true;
 
-  // 缓存命中短路（8.3）：仅渲染 cache 节点，跳过 ir/ss/cg/execution
+  // 缓存命中短路（8.3）：保留前置检查/改写/值改写/确认等辅助节点 + cache + result + error，
+  // 跳过 ir/ss/answerability/cg/execution/decision（cache 命中时这些被短路）
   let nodes = turn.timeline;
   if (cacheHit) {
-    nodes = turn.timeline.filter((n) => n.type === 'cache' || n.type === 'result' || n.type === 'error');
+    nodes = turn.timeline.filter(
+      (n) =>
+        n.type === 'pre_reject' ||
+        n.type === 'rewrite_detect' ||
+        n.type === 'rewrite' ||
+        n.type === 'cache' ||
+        n.type === 'value_rewrite' ||
+        n.type === 'cache_confirm' ||
+        n.type === 'result' ||
+        n.type === 'error',
+    );
     // 若 reducer 还没追加 result/error，至少保留 cache 节点
     if (nodes.length === 0) {
       nodes = turn.timeline.filter((n) => n.type === 'cache');
@@ -127,7 +156,7 @@ export default function AgentTimeline({ turn }: { turn: Turn }) {
     const color = statusColor(node.status);
     const label = NODE_LABEL[node.type];
     return {
-      key: node.type,
+      key: node.id ?? node.type,
       color,
       dot: nodeDot(node),
       children: (

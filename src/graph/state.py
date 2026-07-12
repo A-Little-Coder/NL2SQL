@@ -99,6 +99,7 @@ class NL2SQLState(TypedDict, total=False):
     rewrite_round: int             # 改写轮次（0=未改写，1=第一次改写，2=第二次改写）
     rewrite_reason: str            # 改写说明
     rewrite_rejection_reason: Optional[str]  # 前置拒答检测拒答原因
+    pre_reject_category: Optional[str]      # 前置拒答 LLM 判定类别（write_op/dangerous_info/normal）
     clarify_context: Optional[str]   # 用户补充信息（反问回答，Rewrite 子图用）
 
     # ===== IR =====
@@ -202,6 +203,7 @@ def create_initial_state(
         rewrite_round=0,
         rewrite_reason="",
         rewrite_rejection_reason=None,
+        pre_reject_category=None,
         clarify_context=None,
         keywords=[],
         retrieved_context=None,

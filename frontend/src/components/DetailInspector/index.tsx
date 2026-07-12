@@ -31,6 +31,7 @@ import {
   CloseCircleOutlined,
   LockOutlined,
   ThunderboltOutlined,
+  WarningOutlined,
 } from '@ant-design/icons';
 import { useChatStore } from '@/store/useChatStore';
 import type {
@@ -45,9 +46,15 @@ const { Text, Paragraph, Title } = Typography;
 // 节点类型 -> 中文标签映射（与时间轴展示保持一致）
 // ---------------------------------------------------------------------------
 const NODE_LABEL: Record<TimelineNodeType, string> = {
+  pre_reject: '前置检查',
+  rewrite_detect: '改写检测',
+  rewrite: '改写执行',
   cache: '历史缓存',
+  value_rewrite: '值改写',
+  cache_confirm: '确认复用',
   ir: '信息检索',
   ss: 'Schema 选择',
+  schema_empty: '未匹配表',
   answerability: '可回答性检查',
   cg: '候选生成',
   execution: 'SQL 执行',
@@ -495,15 +502,186 @@ function NoDetail() {
   );
 }
 
+/** 前置拒答 LLM 判定类别 -> 中文标签 */
+const PRE_REJECT_CATEGORY_LABEL: Record<string, string> = {
+  write_op: '写操作',
+  dangerous_info: '危险信息',
+  normal: '通过',
+};
+
+/** 前置拒答节点：通过/拒答原因 + LLM 判定类别（D9） */
+function PreRejectDetail({ turn }: { turn: Turn }) {
+  const p = turn.details.preReject;
+  if (!p) return <NoDetail />;
+  const categoryLabel = p.category ? (PRE_REJECT_CATEGORY_LABEL[p.category] ?? p.category) : null;
+  return (
+    <Descriptions column={1} size="small" bordered>
+      <Descriptions.Item label="检测结果">
+        {p.passed ? (
+          <Tag icon={<CheckCircleOutlined />} color="success">通过</Tag>
+        ) : (
+          <Tag icon={<CloseCircleOutlined />} color="error">拒答</Tag>
+        )}
+      </Descriptions.Item>
+      {categoryLabel && (
+        <Descriptions.Item label="判定类别">
+          <Tag color={p.category === 'dangerous_info' ? 'error' : (p.category === 'write_op' ? 'warning' : 'success')}>
+            {categoryLabel}
+          </Tag>
+        </Descriptions.Item>
+      )}
+      {!p.passed && p.reason && (
+        <Descriptions.Item label="拒答原因">{p.reason}</Descriptions.Item>
+      )}
+    </Descriptions>
+  );
+}
+
+/** schema 空拒答节点：未选出表时显式拒答（D10） */
+function SchemaEmptyDetail({ turn }: { turn: Turn }) {
+  const s = turn.details.schemaEmpty;
+  if (!s) return <NoDetail />;
+  return (
+    <Descriptions column={1} size="small" bordered>
+      <Descriptions.Item label="检测结果">
+        <Tag icon={<WarningOutlined />} color="error">未匹配表</Tag>
+      </Descriptions.Item>
+      <Descriptions.Item label="拒答原因">{s.reason}</Descriptions.Item>
+    </Descriptions>
+  );
+}
+
+/** 改写检测节点：按轮次展示检测到的问题 */
+function RewriteDetectDetail({ turn }: { turn: Turn }) {
+  const rounds = turn.details.rewriteDetect?.rounds;
+  if (!rounds || rounds.length === 0) return <NoDetail />;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {rounds.map((r) => (
+        <Card key={r.round} size="small" title={`第 ${r.round} 轮检测`}>
+          <Descriptions column={1} size="small">
+            <Descriptions.Item label="结果">
+              {r.hasIssues ? (
+                <Tag color="warning">发现问题</Tag>
+              ) : (
+                <Tag icon={<CheckCircleOutlined />} color="success">无问题</Tag>
+              )}
+            </Descriptions.Item>
+            {r.hasIssues && (
+              <>
+                {r.issueTypes.length > 0 && (
+                  <Descriptions.Item label="问题类型">
+                    {r.issueTypes.map((t, i) => (
+                      <Tag key={i} color="orange">{t}</Tag>
+                    ))}
+                  </Descriptions.Item>
+                )}
+                {r.issueDetail && (
+                  <Descriptions.Item label="详情">{r.issueDetail}</Descriptions.Item>
+                )}
+              </>
+            )}
+          </Descriptions>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+/** 改写执行节点：按轮次展示原句->改写后/原因 */
+function RewriteDetail({ turn }: { turn: Turn }) {
+  const rounds = turn.details.rewrite?.rounds;
+  if (!rounds || rounds.length === 0) return <NoDetail />;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {rounds.map((r) => (
+        <Card key={r.round} size="small" title={`第 ${r.round} 轮改写`}>
+          <Descriptions column={1} size="small">
+            <Descriptions.Item label="原句">
+              <Paragraph style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{r.originalQuery}</Paragraph>
+            </Descriptions.Item>
+            <Descriptions.Item label="改写后">
+              <Paragraph code copyable style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{r.rewrittenQuery}</Paragraph>
+            </Descriptions.Item>
+            {r.reason && (
+              <Descriptions.Item label="原因">{r.reason}</Descriptions.Item>
+            )}
+          </Descriptions>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+/** 值参数改写节点：历史查询/原缓存SQL->改写后SQL */
+function ValueRewriteDetail({ turn }: { turn: Turn }) {
+  const v = turn.details.valueRewrite;
+  if (!v) return <NoDetail />;
+  return (
+    <Descriptions column={1} size="small" bordered>
+      <Descriptions.Item label="是否改写">
+        {v.changed ? (
+          <Tag color="processing">已改写值参数</Tag>
+        ) : (
+          <Tag color="default">未变更</Tag>
+        )}
+      </Descriptions.Item>
+      <Descriptions.Item label="历史查询">{v.historicalQuery || '-'}</Descriptions.Item>
+      <Descriptions.Item label="当前查询">{v.userQuery || '-'}</Descriptions.Item>
+      <Descriptions.Item label="原缓存 SQL">
+        <Paragraph code copyable style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{v.cachedSql}</Paragraph>
+      </Descriptions.Item>
+      <Descriptions.Item label="改写后 SQL">
+        <Paragraph code copyable style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{v.adjustedCachedSql}</Paragraph>
+      </Descriptions.Item>
+      {v.reason && (
+        <Descriptions.Item label="原因">{v.reason}</Descriptions.Item>
+      )}
+    </Descriptions>
+  );
+}
+
+/** 复用确认节点：用户确认结果 */
+function CacheConfirmDetail({ turn }: { turn: Turn }) {
+  const c = turn.details.cacheConfirm;
+  if (!c) return <NoDetail />;
+  return (
+    <Descriptions column={1} size="small" bordered>
+      <Descriptions.Item label="用户选择">
+        {c.approved ? (
+          <Tag icon={<CheckCircleOutlined />} color="success">确认复用</Tag>
+        ) : (
+          <Tag icon={<CloseCircleOutlined />} color="warning">重新生成</Tag>
+        )}
+      </Descriptions.Item>
+      <Descriptions.Item label="回答内容">{c.userChoice || '-'}</Descriptions.Item>
+      <Descriptions.Item label="历史查询">{c.historicalQuery || '-'}</Descriptions.Item>
+      <Descriptions.Item label="当前查询">{c.userQuery || '-'}</Descriptions.Item>
+    </Descriptions>
+  );
+}
+
 /** 按节点类型分发渲染 */
 function renderDetail(turn: Turn, type: TimelineNodeType) {
   switch (type) {
+    case 'pre_reject':
+      return <PreRejectDetail turn={turn} />;
+    case 'rewrite_detect':
+      return <RewriteDetectDetail turn={turn} />;
+    case 'rewrite':
+      return <RewriteDetail turn={turn} />;
     case 'cache':
       return <CacheDetail turn={turn} />;
+    case 'value_rewrite':
+      return <ValueRewriteDetail turn={turn} />;
+    case 'cache_confirm':
+      return <CacheConfirmDetail turn={turn} />;
     case 'ir':
       return <IrDetail turn={turn} />;
     case 'ss':
       return <SsDetail turn={turn} />;
+    case 'schema_empty':
+      return <SchemaEmptyDetail turn={turn} />;
     case 'answerability':
       return <AnswerabilityDetail turn={turn} />;
     case 'cg':

@@ -107,6 +107,9 @@ def _wrap_node(node_name: str, fn: Callable[[NL2SQLState], Dict[str, Any]]):
             for key in ("error", "rejection_reason"):
                 if key in result and result[key]:
                     done_payload[key] = result[key]
+            # 透传 pre_reject LLM 判定类别（D9）
+            if result.get("pre_reject_category"):
+                done_payload["category"] = result["pre_reject_category"]
             emit_safe("stage", done_payload)
             extra = ""
             if "error" in done_payload:
@@ -719,6 +722,17 @@ def make_schema_finalize_node(retriever, data_dir: str = None) -> Callable[[NL2S
         schema = state.get("selected_schema", [])
         database_filter = state.get("database_filter")
 
+        # 空表显式拒答（D10）：SS 未选出任何表时设 rejection_reason + emit schema_empty，不再静默 END
+        if not schema:
+            reason = "未在数据库中找到与查询相关的表或字段，请尝试换一种表述或确认数据范围"
+            emit_safe("schema_empty", {"reason": reason})
+            return {
+                "rejection_reason": reason,
+                "selected_schema": [],
+                "join_paths_text": "",
+                "trace_log": state.get("trace_log", []) + ["[SchemaFinalize] 空表拒答"],
+            }
+
         join_paths_text = ""
         finalized_schema = schema
 
@@ -1122,9 +1136,9 @@ def build_main_graph(
 
     graph = StateGraph(NL2SQLState)
 
-    # 节点：前置拒答检测（pre_reject：START 之后第一个节点，硬性检测，不调 LLM）
+    # 节点：前置拒答检测（pre_reject：START 之后第一个节点，空查询规则快路径 + LLM 语义判定，D9）
     from src.rewrite.pre_reject import make_pre_reject_node
-    graph.add_node("pre_reject", _wrap_node("pre_reject", make_pre_reject_node()))
+    graph.add_node("pre_reject", _wrap_node("pre_reject", make_pre_reject_node(llm_client=llm_client)))
     # 节点：Rewrite 子图（rewrite-before-cache v2：指代消解 + 改写 + 反问澄清）
     from src.rewrite.rewrite_subgraph import make_rewrite_node
     graph.add_node("rewrite", _wrap_node("rewrite", make_rewrite_node(llm_client=llm_client)))
