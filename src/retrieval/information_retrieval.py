@@ -135,7 +135,6 @@ class RetrievedContext:
 # Prompts 已迁移至 src/retrieval/prompts.py
 from src.retrieval.prompts import (
     KEYWORD_EXTRACTION_PROMPT,
-    KEYWORD_EXTRACTION_WITH_HISTORY_PROMPT,
 )
 from utils.llm_client import parse_json, stream_with_sse
 
@@ -168,16 +167,12 @@ class InformationRetrieval:
         self.lsh_threshold = lsh_threshold
         self.vector_top_k = vector_top_k
 
-    def extract_keywords(self, query: str, conversation_history: List[Dict[str, Any]] = None) -> List[KeywordGroup]:
+    def extract_keywords(self, query: str) -> List[KeywordGroup]:
         """
         从自然语言查询中提取关键词（含同义词扩写，按原生关键词分组）
 
-        支持 follow-up 查询：如果提供了会话历史，会在 prompt 中注入上一轮查询
-        辅助 LLM 理解"那去年的呢"类省略句。
-
         Args:
-            query: 用户查询
-            conversation_history: 可选，当前会话的历史轮次列表
+            query: 用户查询（已由 Rewrite 模块改写为完整语义）
 
         Returns:
             List[KeywordGroup]: 关键词分组列表，每组含 phrase 和 terms
@@ -188,26 +183,7 @@ class InformationRetrieval:
             return [KeywordGroup(phrase=kw, terms=[kw.lower()]) for kw in simple_kws]
 
         try:
-            # 注入会话历史（辅助 follow-up 理解）
-            has_history = bool(conversation_history)
-            history_lines_text = ""
-            if has_history:
-                history_lines = []
-                for turn in conversation_history[-3:]:  # 最多最近 3 轮
-                    q = turn.get("user_query", "")
-                    if q:
-                        history_lines.append(f"  - \"{q}\"")
-                history_lines_text = "\n".join(history_lines) if history_lines else ""
-                if not history_lines_text:
-                    has_history = False  # 没有有效历史
-
-            if has_history:
-                messages = KEYWORD_EXTRACTION_WITH_HISTORY_PROMPT.format_messages(
-                    query=query,
-                    history_lines=history_lines_text,
-                )
-            else:
-                messages = KEYWORD_EXTRACTION_PROMPT.format_messages(query=query)
+            messages = KEYWORD_EXTRACTION_PROMPT.format_messages(query=query)
 
             raw = stream_with_sse(self.llm_client.stream(messages, as_json=True, temperature=0.0, thinking=False, run_name="ir-keywords"))
             result = parse_json(raw)

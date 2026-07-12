@@ -70,6 +70,7 @@ class SessionMemory:
         "cache_hit",
         "cache_source",
         "rejection_reason",
+        "rewrite_rejection_reason",  # Rewrite 改写拒答原因
         "error",
         "result_meta",          # 仅元信息（行数、列名），不含真实数据
         "clarification_round",  # Phase 2 反问轮次

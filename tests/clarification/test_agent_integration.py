@@ -1,10 +1,10 @@
 # ============================================================================
-# TaskPlanner 主图集成测试（决策 9-13）
+# TaskDecomposer 主图集成测试（v2 精简版）
 # ============================================================================
 # 验证：
-#   - EXECUTE 单意图：task_planner 放行 → ir → ... → END
-#   - REJECT：task_planner 拒答 → 直接 END（不进 ir）
-#   - CLARIFY interrupt/resume：首次挂起 → resume 带回答 → 重新裁决 → 执行
+#   - EXECUTE 单意图：task_decomposer 放行 → ir → ... → END
+#   - 前置拒答检测：pre_reject 拦截写操作 → END
+#   - 多意图：task_decomposer multi → run_subqueries → aggregate_results
 #   - checkpointer + thread_id 状态共享
 #
 # 运行: pytest tests/clarification/test_agent_integration.py -v
@@ -22,8 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from src.clarification.task_planner import TaskPlanner
-from src.clarification.dialog import DialogManager
+from src.clarification.task_decomposer import TaskDecomposer
 
 
 def _make_llm_mock(json_dict: dict):
@@ -79,13 +78,13 @@ def _build_pipeline_mocks():
     return retriever, selector, generator, fix_loop, decider
 
 
-def _build_graph(task_planner, dialog_manager, with_checkpointer=True):
+def _build_graph(task_decomposer, with_checkpointer=True):
     from src.graph.main_graph import build_main_graph
     retriever, selector, generator, fix_loop, decider = _build_pipeline_mocks()
     return build_main_graph(
         retriever=retriever, selector=selector, generator=generator,
         fix_loop=fix_loop, decider=decider,
-        task_planner=task_planner, dialog_manager=dialog_manager,
+        task_decomposer=task_decomposer,
         checkpointer=InMemorySaver() if with_checkpointer else None,
     )
 
@@ -96,8 +95,8 @@ def _build_graph(task_planner, dialog_manager, with_checkpointer=True):
 def test_execute_single_passes_through():
     llm = _make_llm_mock({"verdict": "execute", "intent_type": "single",
                           "subqueries": ["查苹果销售额"], "reason": "清晰"})
-    planner = TaskPlanner(llm_client=llm)
-    graph = _build_graph(planner, dialog_manager=None)
+    planner = TaskDecomposer(llm_client=llm)
+    graph = _build_graph(planner)
 
     config = {"configurable": {"thread_id": "t1"}}
     initial = {"user_query": "查苹果销售额", "query_id": "q1"}
@@ -107,126 +106,41 @@ def test_execute_single_passes_through():
     assert result["subqueries"] == ["查苹果销售额"]
     # 走完整链路到 decision
     assert result.get("final_sql") == "SELECT * FROM t"
-    # ir 被调用（说明 task_planner 放行进了 ir）
-    assert graph  # placeholder
 
 
 # ============================================================================
-# 场景 2：REJECT 直接 END（不进 ir）
+# 场景 2：前置拒答检测拦截写操作
 # ============================================================================
-def test_reject_short_circuits_before_ir():
-    llm = _make_llm_mock({"verdict": "reject", "reject_reason": "越权写操作", "reason": "delete"})
-    planner = TaskPlanner(llm_client=llm)
+def test_pre_reject_rejects_write_operation():
+    """前置拒答检测硬性拦截写操作，不进 ir 和 task_decomposer"""
+    llm = _make_llm_mock({"verdict": "execute", "intent_type": "single", "reason": "test"})
+    planner = TaskDecomposer(llm_client=llm)
     retriever, selector, generator, fix_loop, decider = _build_pipeline_mocks()
     from src.graph.main_graph import build_main_graph
     graph = build_main_graph(
         retriever=retriever, selector=selector, generator=generator,
         fix_loop=fix_loop, decider=decider,
-        task_planner=planner, dialog_manager=None,
+        task_decomposer=planner,
         checkpointer=InMemorySaver(),
     )
 
     config = {"configurable": {"thread_id": "t2"}}
     result = graph.invoke({"user_query": "删除数据", "query_id": "q2"}, config)
 
-    assert result["plan_result"]["verdict"] == "reject"
-    assert "写操作" in result["rejection_reason"]
-    # ir 不应被调用（REJECT 短路）
+    # pre_reject 节点硬性写操作检测拦截
+    assert result.get("rewrite_rejection_reason") is not None
+    assert "写操作" in result.get("rejection_reason", "")
+    # ir 不应被调用（pre_reject 短路）
     retriever.build_graph.assert_not_called()
     # 没有最终 SQL
     assert result.get("final_sql", "") == ""
 
 
 # ============================================================================
-# 场景 3：CLARIFY interrupt/resume 完整闭环
+# 场景 3：task_decomposer=None 向后兼容
 # ============================================================================
-def test_clarify_interrupt_then_resume():
-    """首次 CLARIFY 挂起 → resume 带回答 → 重新裁决 EXECUTE → 执行
-
-    LangGraph interrupt 语义：resume 时节点从头重跑。
-    所以 plan 的调用顺序：
-      1. 首次执行 plan(clarified=None) → clarify → ask() interrupt 挂起
-      2. resume 重跑 plan(clarified=None) → clarify → ask() 返回"公司" → round=1
-      3. while 内重新 plan(clarified="公司") → execute → 放行
-    故 side_effect 需 3 个响应：[clarify, clarify, execute]
-    """
-    llm = MagicMock()
-    clarify_resp = [(json.dumps({"verdict": "clarify",
-                                 "clarify_question": "苹果指公司还是水果？",
-                                 "ambiguities": [{"entity": "苹果", "candidates": ["公司", "水果"]}],
-                                 "reason": "多义"}, ensure_ascii=False), None)]
-    execute_resp = [(json.dumps({"verdict": "execute", "intent_type": "single",
-                                 "subqueries": ["查 Apple 公司销售额"], "reason": "已澄清"}, ensure_ascii=False), None)]
-    # 首次 plan(clarify) → resume 重跑 plan(clarify) → while 内重新 plan(execute)
-    llm.stream.side_effect = [clarify_resp, clarify_resp, execute_resp]
-
-    planner = TaskPlanner(llm_client=llm)
-    dialog_manager = DialogManager(max_rounds=5)
-    graph = _build_graph(planner, dialog_manager)
-
-    config = {"configurable": {"thread_id": "t3"}}
-
-    # 首次执行：应挂起在 task_planner 的 interrupt
-    chunks = list(graph.stream({"user_query": "查苹果的销售额", "query_id": "q3"}, config, stream_mode="updates"))
-    interrupted = any("__interrupt__" in c for c in chunks)
-    assert interrupted, "首次执行应在 CLARIFY 处挂起"
-
-    # 确认挂起状态
-    snap = graph.get_state(config)
-    assert snap.next  # 非空 = 暂停中
-
-    # resume：用户回答"公司"
-    list(graph.stream(Command(resume="公司"), config, stream_mode="updates"))
-    # resume 后应继续走完整链路到 END
-    snap2 = graph.get_state(config)
-    assert not snap2.next  # 空 = 跑完了
-
-    final = snap2.values
-    assert final["plan_result"]["verdict"] == "execute"
-    assert final["subqueries"] == ["查 Apple 公司销售额"]
-    assert final.get("final_sql") == "SELECT * FROM t"
-    # clarify_round 应为 1（一轮反问）
-    assert final["clarify_round"] == 1
-
-
-# ============================================================================
-# 场景 4：CLARIFY 用户拒答 → 降级执行
-# ============================================================================
-def test_clarify_user_declines_degrades_to_execute():
-    """CLARIFY 挂起 → resume 用户拒答 → 降级执行
-
-    plan 调用顺序：首次 plan(clarify) 挂起 → resume 重跑 plan(clarify) → ask() 返回 DECLINED → 降级
-    side_effect 需 2 个 clarify 响应。
-    """
-    llm = MagicMock()
-    clarify_resp = [(json.dumps({"verdict": "clarify",
-                                 "clarify_question": "苹果指什么？", "reason": "多义"}, ensure_ascii=False), None)]
-    llm.stream.side_effect = [clarify_resp, clarify_resp]
-
-    planner = TaskPlanner(llm_client=llm)
-    dialog_manager = DialogManager(max_rounds=5)
-    graph = _build_graph(planner, dialog_manager)
-
-    config = {"configurable": {"thread_id": "t4"}}
-    # 首次挂起
-    list(graph.stream({"user_query": "查苹果的销售额", "query_id": "q4"}, config, stream_mode="updates"))
-    assert graph.get_state(config).next  # 暂停中
-
-    # resume：用户拒答"不知道"
-    list(graph.stream(Command(resume="不知道"), config, stream_mode="updates"))
-    final = graph.get_state(config).values
-    assert not graph.get_state(config).next  # 跑完
-    # 降级执行（用原始 query）
-    assert final["plan_result"]["verdict"] == "execute"
-    assert final["plan_result"].get("degraded") is True
-    assert final["subqueries"] == ["查苹果的销售额"]
-
-
-# ============================================================================
-# 场景 5：task_planner=None 向后兼容（直接 EXECUTE 单意图）
-# ============================================================================
-def test_no_task_planner_backward_compatible():
-    graph = _build_graph(task_planner=None, dialog_manager=None)
+def test_no_task_decomposer_backward_compatible():
+    graph = _build_graph(task_decomposer=None)
     config = {"configurable": {"thread_id": "t5"}}
     result = graph.invoke({"user_query": "查苹果销售额", "query_id": "q5"}, config)
     assert result["subqueries"] == ["查苹果销售额"]
@@ -234,30 +148,10 @@ def test_no_task_planner_backward_compatible():
 
 
 # ============================================================================
-# 场景 6：写操作硬检测 REJECT（不调 LLM）
-# ============================================================================
-def test_write_operation_rejected_no_llm():
-    llm = _make_llm_mock({"verdict": "execute", "subqueries": ["x"]})
-    planner = TaskPlanner(llm_client=llm)
-    retriever, selector, generator, fix_loop, decider = _build_pipeline_mocks()
-    from src.graph.main_graph import build_main_graph
-    graph = build_main_graph(
-        retriever=retriever, selector=selector, generator=generator,
-        fix_loop=fix_loop, decider=decider,
-        task_planner=planner, dialog_manager=None, checkpointer=InMemorySaver(),
-    )
-    config = {"configurable": {"thread_id": "t6"}}
-    result = graph.invoke({"user_query": "delete from users", "query_id": "q6"}, config)
-    assert result["plan_result"]["verdict"] == "reject"
-    llm.stream.assert_not_called()
-    retriever.build_graph.assert_not_called()
-
-
-# ============================================================================
-# 场景 7：多意图 → run_subqueries → aggregate_results 完整路径（决策 14/15）
+# 场景 4：多意图 → run_subqueries → aggregate_results 完整路径
 # ============================================================================
 def test_multi_intent_runs_orchestrator():
-    """task_planner multi → run_subqueries（orchestrator 串行）→ aggregate_results → memory_update"""
+    """task_decomposer multi → run_subqueries（orchestrator 串行）→ aggregate_results → memory_update"""
     from src.clarification.subquery_orchestrator import SubqueryOrchestrator
     from src.graph.main_graph import build_main_graph
     from src.graph.single_query_graph import build_single_query_graph
@@ -266,7 +160,7 @@ def test_multi_intent_runs_orchestrator():
         "verdict": "execute", "intent_type": "multi",
         "subqueries": ["查苹果销售额", "查苹果利润"], "reason": "两个独立意图",
     })
-    planner = TaskPlanner(llm_client=llm)
+    planner = TaskDecomposer(llm_client=llm)
 
     retriever, selector, generator, fix_loop, decider = _build_pipeline_mocks()
     sqg = build_single_query_graph(
@@ -277,8 +171,8 @@ def test_multi_intent_runs_orchestrator():
     graph = build_main_graph(
         retriever=retriever, selector=selector, generator=generator,
         fix_loop=fix_loop, decider=decider,
-        task_planner=planner, dialog_manager=None,
-        orchestrator=orch, summarizer=None,  # summarizer=None → 降级拼接
+        task_decomposer=planner,
+        orchestrator=orch, summarizer=None,
         checkpointer=None, single_query_graph=sqg,
     )
     config = {"configurable": {"thread_id": "t7"}}
@@ -304,7 +198,7 @@ def test_single_intent_does_not_trigger_orchestrator():
 
     llm = _make_llm_mock({"verdict": "execute", "intent_type": "single",
                           "subqueries": ["查苹果销售额"], "reason": "清晰"})
-    planner = TaskPlanner(llm_client=llm)
+    planner = TaskDecomposer(llm_client=llm)
     retriever, selector, generator, fix_loop, decider = _build_pipeline_mocks()
     sqg = build_single_query_graph(
         retriever=retriever, selector=selector, generator=generator,
@@ -314,7 +208,7 @@ def test_single_intent_does_not_trigger_orchestrator():
     graph = build_main_graph(
         retriever=retriever, selector=selector, generator=generator,
         fix_loop=fix_loop, decider=decider,
-        task_planner=planner, dialog_manager=None,
+        task_decomposer=planner,
         orchestrator=orch, summarizer=None, checkpointer=None,
         single_query_graph=sqg,
     )
@@ -327,25 +221,18 @@ def test_single_intent_does_not_trigger_orchestrator():
     assert result.get("subquery_results", []) == []
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
 # ============================================================================
-# 场景 9：UserMemory/SessionMemory 实例通过 ContextVar 注入，checkpointer 不报序列化错
+# 场景 5：UserMemory/SessionMemory 通过 ContextVar 注入，checkpointer 不报序列化错
 # ============================================================================
 def test_user_memory_via_contextvar_with_checkpointer():
-    """回归：真实 bug 场景——UserMemory/SessionMemory 是 Python 对象，
-    若放进 state 会被 checkpointer 序列化报 'not msgpack serializable'。
-    改用 ContextVar 注入后，checkpointer 不应报错，且节点能取到实例。"""
+    """回归：UserMemory/SessionMemory 是 Python 对象，checkpointer 不报错"""
     from src.api.streaming import current_user_memory, current_session_memory
 
     llm = _make_llm_mock({"verdict": "execute", "intent_type": "single",
                           "subqueries": ["查苹果销售额"], "reason": "清晰"})
-    planner = TaskPlanner(llm_client=llm)
-    graph = _build_graph(planner, dialog_manager=None)
+    planner = TaskDecomposer(llm_client=llm)
+    graph = _build_graph(planner, with_checkpointer=True)
 
-    # 模拟 API 层注入：UserMemory/SessionMemory 是不可序列化的对象实例
     class _FakeUserMemory:
         def get_query_preferences(self):
             return {"limit": 10}
@@ -360,7 +247,6 @@ def test_user_memory_via_contextvar_with_checkpointer():
     um_token = current_user_memory.set(um)
     sm_token = current_session_memory.set(sm)
     try:
-        # 带 checkpointer invoke，不应抛 'not msgpack serializable'
         result = graph.invoke({"user_query": "查苹果销售额", "query_id": "q9"}, config)
         assert result["plan_result"]["verdict"] == "execute"
         assert result.get("final_sql") == "SELECT * FROM t"
@@ -370,20 +256,17 @@ def test_user_memory_via_contextvar_with_checkpointer():
 
 
 # ============================================================================
-# 场景 10：带 checkpointer 时 decision 子图的 fix_loop 不报序列化错（回归）
+# 场景 6：带 checkpointer 时 decision 子图的 fix_loop 不报序列化错（回归）
 # ============================================================================
 def test_decision_fix_loop_not_in_state_with_checkpointer():
-    """回归：真实 bug——SQLFixLoop 是 Python 对象，若放进 decision 子图 sub_input state，
-    会被 checkpointer 序列化报 'not msgpack serializable: SQLFixLoop'。
-    改用 ContextVar 传递后，checkpointer 不应报错，且 SmartFix 能拿到 fix_loop。"""
+    """回归：fix_loop 是 Python 对象，checkpointer 不应报错"""
     from src.api.streaming import current_fix_loop
 
     llm = _make_llm_mock({"verdict": "execute", "intent_type": "single",
                           "subqueries": ["查苹果销售额"], "reason": "清晰"})
-    planner = TaskPlanner(llm_client=llm)
-    graph = _build_graph(planner, dialog_manager=None)
+    planner = TaskDecomposer(llm_client=llm)
+    graph = _build_graph(planner, with_checkpointer=True)
 
-    # 模拟 per-db 的 fix_loop（不可序列化对象）
     class _FakeFixLoop:
         def run(self, *a, **kw):
             return {"fixed_sql": "SELECT 1", "success": True}
@@ -393,8 +276,11 @@ def test_decision_fix_loop_not_in_state_with_checkpointer():
     config = {"configurable": {"thread_id": "t10"}}
     fl_token = current_fix_loop.set(fl)
     try:
-        # 带 checkpointer invoke 到 decision，不应抛 'not msgpack serializable'
         result = graph.invoke({"user_query": "查苹果销售额", "query_id": "q10"}, config)
         assert result["plan_result"]["verdict"] == "execute"
     finally:
         current_fix_loop.reset(fl_token)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

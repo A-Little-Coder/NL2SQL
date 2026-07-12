@@ -28,7 +28,6 @@ class IRGraphState(TypedDict, total=False):
     schema_columns: List[Any]
     keyword_columns_map: Dict[str, List[str]]
     retrieved_context: Any         # 最终 RetrievedContext
-    conversation_history: List[Dict[str, Any]]  # 会话历史（由主图注入，辅助 follow-up 理解）
 
 
 def build_ir_graph(retriever):
@@ -46,15 +45,12 @@ def build_ir_graph(retriever):
     from src.retrieval.information_retrieval import RetrievedContext
 
     def node_extract_keywords(state: IRGraphState) -> Dict[str, Any]:
-        """节点：关键词提取（支持 follow-up 会话历史注入）
+        """节点：关键词提取（Rewrite 前置后，query 已是完整语义，无需会话历史）
 
         extract_keywords 返回 List[KeywordGroup]，每组包含 phrase + terms（扁平化的同义词）。
         这里同时输出扁平化的 flat_terms 供 LSH 值检索使用。
         """
-        keyword_groups = retriever.extract_keywords(
-            state["user_query"],
-            conversation_history=state.get("conversation_history", []),
-        )
+        keyword_groups = retriever.extract_keywords(state["user_query"])
         flat_terms: List[str] = []
         for g in keyword_groups:
             flat_terms.extend(getattr(g, "terms", []) or [])

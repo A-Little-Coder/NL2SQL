@@ -1,53 +1,33 @@
 # ============================================================================
 # Clarification 模块的 Prompt 模板（反问机制，决策 9-15）
 # ============================================================================
-# 集中管理 task_planner.py / result_summarizer.py 中的 LLM prompt：
-#   - TASK_PLANNER_PROMPT       意图理解 + 三选一裁决（EXECUTE/CLARIFY/REJECT）
-#   - RESULT_SUMMARIZER_PROMPT  多子查询结果汇总（决策 15）
+# 集中管理 task_decomposer.py / result_summarizer.py 中的 LLM prompt：
+#   - TASK_DECOMPOSER_PROMPT   意图拆解（EXECUTE 单意图/多意图）
+#   - RESULT_SUMMARIZER_PROMPT 多子查询结果汇总（决策 15）
 #
-# 设计依据：
-#   - 决策 9：反问前移到 IR 之前，作为意图理解层
-#   - 决策 10：反问粒度由 LLM 自适应（粗/细）
-#   - 决策 15：总结模块按需调用，数据表用结构摘要降 token
+# v2 变更：删除 CLARIFY 裁决规则，TaskDecomposer 只做意图拆解。
 # ============================================================================
 
 from langchain_core.prompts import ChatPromptTemplate
 
 
 # ---------------------------------------------------------------------------
-# TaskPlanner：三选一裁决（EXECUTE / CLARIFY / REJECT）
+# TaskDecomposer：意图拆解（EXECUTE 单意图/多意图）
 # ---------------------------------------------------------------------------
-TASK_PLANNER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "你是数据库问数意图理解专家，只输出 JSON。"),
-    ("user", """分析用户的问数请求，做三选一裁决：EXECUTE（执行）/ CLARIFY（反问澄清）/ REJECT（拒答）。
+TASK_DECOMPOSER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "你是数据库查询意图理解专家，只输出 JSON。"),
+    ("user", """分析用户的查询，判断是单意图还是多意图。
 
-## 裁决规则
+裁决规则：
 
-### EXECUTE（意图清晰，可执行）
-- 实体、度量、维度、时间范围基本明确
+### EXECUTE（执行）
 - **单意图**：一句话只问一件事 → intent_type="single"，subqueries 长度为 1
-- **多意图**：一句话含多个独立问数意图 → intent_type="multi"，分解为多个子查询
-  - 例："查苹果的销售额和利润" → ["查苹果的销售额", "查苹果的利润"]
-  - 例："查销售额，再对比去年" → ["查销售额", "对比销售额与去年同期"]
-  - **保持语义完整**：不要把一个完整意图拆碎（如"各科成绩"不要拆成"各科"+"成绩"）
+- **多意图**：一句话含多个独立查询意图 → intent_type="multi"，分解为多个子查询
+  - 例："查询苹果的销售额和利润" → ["查询苹果的销售额", "查询苹果的利润"]
+  - 例："查询销售额，再对比去年" → ["查询销售额", "对比销售额与去年同期"]
+  - **保持语义完整**：不要把一个完整意图拆碎（如"各科成绩"不拆成"各科"+"成绩"）
 
-### CLARIFY（表述有歧义，需反问）
-- **实体多义**：实体可能指多种事物（如"苹果"指公司还是水果）
-- **粒度不明**：度量/维度表述模糊（如"最近"指多久、"销量"含哪些）
-- **缺失关键限定**：缺时间/范围/类别等必要维度
-- 生成 clarify_question（中文，针对具体歧义；粗/细粒度自适应）
-- 在 ambiguities 标注歧义实体及其候选解释
-
-### REJECT（拒答）
-- **越权写操作**：查询包含 INSERT/UPDATE/DELETE/DROP/CREATE/ALTER 等写操作意图
-- **超出数据范围**：问及完全不属于数据库业务域的内容
-- **无法理解**：纯闲聊或无意义输入
-- 填 reject_reason（中文，说明为何拒答）
-
-## 已有澄清上下文（若有）
-{clarified_context}
-
-## 用户请求
+## 用户查询
 {user_query}
 
 ## 数据库范围（仅参考，可能为空）
@@ -55,12 +35,9 @@ TASK_PLANNER_PROMPT = ChatPromptTemplate.from_messages([
 
 请返回 JSON：
 {{
-  "verdict": "execute" | "clarify" | "reject",
+  "verdict": "execute",
   "intent_type": "single" | "multi",
   "subqueries": ["子查询1", "子查询2"],
-  "ambiguities": [{{"entity": "歧义实体", "candidates": ["解释1", "解释2"]}}],
-  "clarify_question": "反问问题（verdict=clarify 时填，否则空字符串）",
-  "reject_reason": "拒答原因（verdict=reject 时填，否则空字符串）",
   "reason": "裁决理由（简短）"
 }}"""),
 ])

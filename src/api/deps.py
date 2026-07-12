@@ -143,31 +143,26 @@ def init_globals(data_dir: Optional[str] = None) -> None:
         max_cache_size=200,
     )
 
-    # 6. 反问机制（决策 9-15）：按 config/clarification.yaml 启用
-    task_planner = None
-    dialog_manager = None
+    # 6. 反问机制（Rewrite 子图 v2 接管反问，此处只初始化 TaskDecomposer 和 ResultSummarizer）
+    task_decomposer = None
+    dialog_manager = None  # 保留参数兼容，v2 不再使用
     checkpointer = None
     summarizer = None
     try:
-        from src.clarification.config import is_enabled, get_max_rounds, get_decline_keywords
-        from src.clarification.task_planner import TaskPlanner
-        from src.clarification.dialog import DialogManager
+        from src.clarification.config import is_enabled, get_max_rounds
+        from src.clarification.task_decomposer import TaskDecomposer
         from src.clarification.result_summarizer import ResultSummarizer
         from langgraph.checkpoint.memory import InMemorySaver
 
         if is_enabled():
-            task_planner = TaskPlanner(llm_client=llm_client, max_clarify_rounds=get_max_rounds())
-            dialog_manager = DialogManager(
-                max_rounds=get_max_rounds(),
-                decline_keywords=get_decline_keywords(),
-            )
-            checkpointer = InMemorySaver()  # 全局单例，interrupt 恢复依赖
+            task_decomposer = TaskDecomposer(llm_client=llm_client)
+            checkpointer = InMemorySaver()  # 全局单例，interrupt 恢复依赖（Rewrite 子图反问用）
             summarizer = ResultSummarizer(llm_client=llm_client)  # 多意图结果汇总（决策 15）
-            logger.info(f"反问机制已启用: max_rounds={get_max_rounds()}")
+            logger.info(f"TaskDecomposer 已启用")
         else:
-            logger.info("反问机制未启用（clarification.enabled=false）")
+            logger.info("TaskDecomposer 未启用")
     except Exception as e:
-        logger.warning(f"反问机制初始化失败，主图退化为无反问模式: {e}")
+        logger.warning(f"TaskDecomposer 初始化失败，主图退化为无 TaskDecomposer 模式: {e}")
 
     # 7. 装配 Globals
     _globals = Globals(
@@ -182,7 +177,7 @@ def init_globals(data_dir: Optional[str] = None) -> None:
         session_retriever=session_retriever,
         data_dir=data_dir,
         memory_dir=memory_dir,
-        task_planner=task_planner,
+        task_decomposer=task_decomposer,
         dialog_manager=dialog_manager,
         checkpointer=checkpointer,
         summarizer=summarizer,

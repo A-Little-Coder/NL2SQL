@@ -267,7 +267,7 @@ def test_health_endpoint(patched_app):
 # ── 反问 interrupt 测试（决策 12）──────────────────────────────
 
 class _InterruptGraph:
-    """模拟 task_planner 触发 interrupt：yield __interrupt__ 后结束（图挂起）"""
+    """模拟 task_decomposer 触发 interrupt：yield __interrupt__ 后结束（图挂起）"""
 
     def stream(self, initial_state, **kwargs):
         # 模拟 LangGraph interrupt 挂起的 update

@@ -42,9 +42,9 @@ from src.graph.state import create_initial_state
 def _should_write_session_turn(accumulated: Dict[str, Any]) -> bool:
     """判断本次请求是否应写入会话历史（fix-keyword-history-pollution）
 
-    仅当非反问挂起且产出了最终 SQL 且非 SmartFix 失败时才写会话。
-    拒答 / fail-fast 早退 / SmartFix 失败（即使有 final_sql）的轮次
-    不入会话，避免无结果历史污染后续 follow-up 的关键词提取与理解。
+    以下情况写入会话：
+    1. 非反问挂起且产出了最终 SQL 且非 SmartFix 失败
+    2. Rewrite 拒答（有 rewrite_rejection_reason）时也写入，供后续轮次理解
 
     Args:
         accumulated: graph.stream 累积的最终 state 片段
@@ -54,6 +54,9 @@ def _should_write_session_turn(accumulated: Dict[str, Any]) -> bool:
     """
     if accumulated.get("__interrupted__"):
         return False
+    # Rewrite 拒答也写入会话历史
+    if accumulated.get("rewrite_rejection_reason"):
+        return True
     return bool(accumulated.get("final_sql")) and not accumulated.get("fix_failed")
 
 router = APIRouter()
@@ -102,6 +105,7 @@ async def query_endpoint(
 
     SSE 事件类型：
         stage           节点开始/结束     {node, status: started/done, ...}
+        rewrite         查询改写         {rewritten_query, rewrite_reason, rewrite_round}
         cache_check     历史命中检测      {hit, source, confidence, cached_sql}
         llm_thinking    qwen3 思考链片段  {node, text}
         keywords        IR 关键词提取    {groups}
@@ -292,6 +296,8 @@ async def query_endpoint(
                         turn_data["error"] = accumulated["error"]
                     if accumulated.get("rejection_reason"):
                         turn_data["rejection_reason"] = accumulated["rejection_reason"]
+                    if accumulated.get("rewrite_rejection_reason"):
+                        turn_data["rewrite_rejection_reason"] = accumulated["rewrite_rejection_reason"]
                     final_result = accumulated.get("final_result")
                     if isinstance(final_result, (list, tuple)) and final_result:
                         first = final_result[0]

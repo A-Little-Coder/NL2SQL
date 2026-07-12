@@ -165,12 +165,10 @@ def test_main_graph_clarification_skipped_by_default():
     graph = build_main_graph(retr, sel, gen, fix, dec)
 
     state = create_initial_state(user_query="x")
-    state["clarification_done"] = False  # 故意设 False
     result = graph.invoke(state)
 
-    # 节点会重新置回 True 让流程继续
-    assert result["clarification_done"] is True
-    assert result["final_sql"]
+    # v2 TaskDecomposer 不再设 clarification_done，但 final_sql 应正常输出
+    assert result.get("final_sql")
 
 
 def test_main_graph_state_initial_values():
@@ -422,7 +420,7 @@ def test_main_graph_cache_hit_confirm_reject_fallback():
 
 
 def test_main_graph_cache_miss_skips_value_rewrite_confirm():
-    """cache 未命中 -> 不进 value_rewrite/cache_confirm，直接 task_planner -> run_single_query"""
+    """cache 未命中 -> 不进 value_rewrite/cache_confirm，直接 task_decomposer -> run_single_query"""
     from src.graph import build_main_graph, create_initial_state
     from src.memory.history_cache import CacheResult
 

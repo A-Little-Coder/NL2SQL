@@ -34,7 +34,7 @@ except ImportError:
     interrupt = None  # type: ignore
 
 from src.graph.state import NL2SQLState
-from src.clarification.dialog import DialogManager
+# from src.rewrite.rewrite_graph import make_rewrite_node  # 延迟导入，避免循环依赖
 
 # 流式 SSE 基础设施（决策 50）；导入失败时退化为静默
 try:
@@ -515,11 +515,12 @@ def make_ir_node(retriever) -> Callable[[NL2SQLState], Dict[str, Any]]:
 
     def node(state: NL2SQLState) -> Dict[str, Any]:
         qid = state.get("query_id", "")
+        # 使用改写后的 query（如果有），否则使用原始 query
+        query_to_use = state.get("rewritten_query") or state["user_query"]
         sub = retriever.build_graph()
         result = sub.invoke({
-            "user_query": state["user_query"],
+            "user_query": query_to_use,
             "database_filter": state.get("database_filter"),
-            "conversation_history": state.get("conversation_history", []),
         })
         keywords = result.get("keywords", [])
         ctx = result.get("retrieved_context")
@@ -627,110 +628,42 @@ def _summarize_schema(ctx) -> dict:
         return {"keyword_groups": []}
 
 
-def make_task_planner_node(task_planner, dialog_manager=None) -> Callable[[NL2SQLState], Dict[str, Any]]:
+def make_task_decomposer_node(task_decomposer) -> Callable[[NL2SQLState], Dict[str, Any]]:
     """
-    构造 TaskPlanner 节点（决策 9-13）：IR 之前的意图理解 + 三选一裁决
+    构造 TaskDecomposer 节点（v2 精简版）：IR 之前的意图拆解
 
-    三选一：
-      - EXECUTE：意图清晰 → 写 subqueries，放行执行
-      - CLARIFY：表述歧义 → 调 DialogManager.ask() interrupt 暂停等用户回答
-                  → resume 后在节点内带澄清上下文重新 plan，直到定论或达上限/拒答
-      - REJECT：拒答 → 设 rejection_reason，主图走 END
-
-    设计：CLARIFY 的"重新裁决"在节点内完成（while 循环），不依赖条件边回环，
-    避免额外的 state 字段。条件边只按 verdict 分流（reject→END / 其余→ir）。
+    只做 EXECUTE 单意图/多意图分解，不再有 CLARIFY/REJECT 功能
+    （Rewrite 子图已处理所有改写/反问/拒答需求）。
 
     Args:
-        task_planner: TaskPlanner 实例（None 时退化为直接 EXECUTE 单意图）
-        dialog_manager: DialogManager 实例（CLARIFY 时用；None 时无法反问，CLARIFY 降级执行）
+        task_decomposer: TaskDecomposer 实例（None 时退化为直接 EXECUTE 单意图）
     """
 
     def node(state: NL2SQLState) -> Dict[str, Any]:
         qid = state.get("query_id", "")
         user_query = state["user_query"]
-        round_now = state.get("clarify_round", 0)
         trace = state.get("trace_log", [])
 
-        # task_planner 未启用 → 直接 EXECUTE 单意图（向后兼容）
-        if task_planner is None:
+        # task_decomposer 未启用 → 直接 EXECUTE 单意图（向后兼容）
+        if task_decomposer is None:
             return {
                 "plan_result": {"verdict": "execute", "intent_type": "single"},
                 "subqueries": [user_query],
-                "clarification_done": True,
-                "trace_log": trace + ["[TaskPlanner] disabled, single execute"],
+                "trace_log": trace + ["[TaskDecomposer] disabled, single execute"],
             }
 
-        # 1. 首次裁决
-        clarified = None
-        plan = task_planner.plan(
+        # 调用 TaskDecomposer 做意图拆解
+        plan = task_decomposer.plan(
             user_query=user_query,
-            conversation_history=state.get("conversation_history", []),
             db_id=state.get("database_filter"),
-            clarified=clarified,
         )
 
-        # 2. CLARIFY 循环：interrupt 反问 → 带回答重新 plan，直到定论/达上限/拒答
-        while plan.verdict == "clarify":
-            # dialog_manager 未提供 → 无法反问，降级执行
-            if dialog_manager is None:
-                logger.warning(f"[qid={qid}] CLARIFY 但无 DialogManager，降级执行")
-                plan = None
-                break
-
-            # 调 interrupt（首次挂起；resume 返回用户回答或 DECLINED/MAX_REACHED 信号）
-            answer = dialog_manager.ask(
-                clarify_question=plan.clarify_question,
-                clarify_round=round_now,
-                ambiguities=plan.ambiguities,
-            )
-
-            # 达上限 / 拒答 → 降级执行（用原始 query 最佳猜测）
-            if DialogManager.is_declined_signal(answer):
-                logger.info(f"[qid={qid}] 反问结束({answer})，降级执行")
-                trace = trace + [f"[TaskPlanner] clarify ended: {answer}"]
-                emit_safe("clarification", {"verdict": "clarify_ended", "signal": answer})
-                plan = None
-                break
-
-            # 用户有效回答 → 轮次 +1，带回答重新 plan
-            round_now += 1
-            clarified = answer
-            trace = trace + [f"[TaskPlanner] clarified round {round_now}: {answer[:50]}"]
-            emit_safe("clarification", {"verdict": "clarify", "answer": answer, "round": round_now})
-            plan = task_planner.plan(
-                user_query=user_query,
-                conversation_history=state.get("conversation_history", []),
-                db_id=state.get("database_filter"),
-                clarified=clarified,
-            )
-
-        # 3. 汇总输出
-        out: Dict[str, Any] = {"clarify_round": round_now}
-
-        # 降级执行（plan 被 None 化：无 dialog 或反问结束）
-        if plan is None or plan.verdict == "clarify":
-            out["plan_result"] = {"verdict": "execute", "intent_type": "single", "degraded": True}
-            out["subqueries"] = [user_query]
-            out["clarification_done"] = True
-            out["trace_log"] = trace + ["[TaskPlanner] degraded execute"]
-            return out
-
+        # 汇总输出
+        out: Dict[str, Any] = {}
         out["plan_result"] = plan.to_dict()
-        out["clarify_question"] = plan.clarify_question
-
-        # REJECT → 拒答（拒答信息走 error 事件 + rejection_reason，不发 clarification）
-        if plan.verdict == "reject":
-            out["rejection_reason"] = plan.reject_reason
-            out["error"] = f"拒答: {plan.reject_reason}"
-            out["clarification_done"] = True
-            out["trace_log"] = trace + [f"[TaskPlanner] reject: {plan.reject_reason}"]
-            return out
-
-        # EXECUTE → 写 subqueries 放行（意图信息随 stage done 透传，不发 clarification）
         out["subqueries"] = plan.subqueries or [user_query]
-        out["clarification_done"] = True
         out["trace_log"] = trace + [
-            f"[TaskPlanner] execute ({plan.intent_type}): {len(out['subqueries'])} subqueries"
+            f"[TaskDecomposer] execute ({plan.intent_type}): {len(out['subqueries'])} subqueries"
         ]
         return out
 
@@ -1142,7 +1075,7 @@ def build_main_graph(
     answerability_checker=None,
     history_cache=None,
     memory_updater=None,
-    task_planner=None,
+    task_decomposer=None,
     dialog_manager=None,
     checkpointer=None,
     orchestrator=None,
@@ -1151,11 +1084,11 @@ def build_main_graph(
     llm_client=None,
 ):
     """
-    构造并编译 NL2SQL 主图（refactor-single-query-graph 后瘦身版 + harden-history-cache）
+    构造并编译 NL2SQL 主图（rewrite-before-cache v2 重构版）
 
-    主图只负责「分流 + 记忆」：history_cache → (value_rewrite → cache_confirm / task_planner) →
-    (run_single_query | run_subqueries | END) → memory_update。
-    单查询流水线 ir/ss/cg/execution/decision 已下沉到 single_query_graph。
+    主图入口：START → pre_reject → rewrite → history_cache → (value_rewrite → cache_confirm /
+    task_decomposer) → (run_single_query | run_subqueries | END) → memory_update。
+    pre_reject 硬性检测写操作/空查询，rewrite 子图改写后的完整语义 query 进入 cache 检测，提高匹配率。
 
     Args:
         retriever/selector/generator/fix_loop/decider: Agent 实例（用于在
@@ -1163,14 +1096,14 @@ def build_main_graph(
         answerability_checker: AnswerabilityChecker 实例（决策 23，可选）
         history_cache: HistoryCache 实例（决策 30，可选；None 时跳过）
         memory_updater: MemoryUpdater 实例（决策 29，可选；None 时跳过）
-        task_planner: TaskPlanner 实例（决策 9，可选；None 时退化为直接 EXECUTE 单意图）
-        dialog_manager: DialogManager 实例（决策 12/13，可选；CLARIFY 反问用）
+        task_decomposer: TaskDecomposer 实例（可选；None 时退化为直接 EXECUTE 单意图）
+        dialog_manager: 已弃用（v2 保留参数兼容，不再使用）
         checkpointer: LangGraph checkpointer（决策 12；interrupt 必需，None 时不启用持久化）
         orchestrator: SubqueryOrchestrator 实例（决策 14，可选；多意图串行编排）
         summarizer: ResultSummarizer 实例（决策 15，可选；多结果汇总）
         single_query_graph: 已编译的单查询流水线图（refactor-single-query-graph）。
             None 时内部用 retriever/selector/... 自动编译，向后兼容旧调用方式。
-        llm_client: LLM 客户端实例（供 value_rewrite 使用，应与 HistoryCache 同一个）
+        llm_client: LLM 客户端实例（供 rewrite/value_rewrite 使用）
 
     Returns:
         CompiledGraph: 已编译主图，可调用 .invoke(initial_state)
@@ -1189,14 +1122,20 @@ def build_main_graph(
 
     graph = StateGraph(NL2SQLState)
 
-    # 节点：历史命中检测（START 之后）
+    # 节点：前置拒答检测（pre_reject：START 之后第一个节点，硬性检测，不调 LLM）
+    from src.rewrite.pre_reject import make_pre_reject_node
+    graph.add_node("pre_reject", _wrap_node("pre_reject", make_pre_reject_node()))
+    # 节点：Rewrite 子图（rewrite-before-cache v2：指代消解 + 改写 + 反问澄清）
+    from src.rewrite.rewrite_subgraph import make_rewrite_node
+    graph.add_node("rewrite", _wrap_node("rewrite", make_rewrite_node(llm_client=llm_client)))
+    # 节点：历史命中检测（Rewrite 之后）
     graph.add_node("history_cache", _wrap_node("history_cache", make_history_cache_node(history_cache)))
     # 节点：ValueRewrite（harden-history-cache：值参数改写）
     graph.add_node("value_rewrite", _wrap_node("value_rewrite", make_value_rewrite_node(llm_client)))
     # 节点：CacheConfirm（harden-history-cache：用户确认复用）
     graph.add_node("cache_confirm", _wrap_node("cache_confirm", make_cache_confirm_node()))
-    # 节点：TaskPlanner 意图理解（决策 9，IR 之前）
-    graph.add_node("task_planner", _wrap_node("task_planner", make_task_planner_node(task_planner, dialog_manager)))
+    # 节点：TaskDecomposer 任务拆解（v2 精简版：仅意图拆解，无反问/拒答）
+    graph.add_node("task_decomposer", _wrap_node("task_decomposer", make_task_decomposer_node(task_decomposer)))
     # 节点：单查询流水线（ir/ss/cg/execution/decision 下沉至此，refactor-single-query-graph）
     graph.add_node("run_single_query", _wrap_node("run_single_query", make_run_single_query_node(single_query_graph)))
 
@@ -1207,21 +1146,38 @@ def build_main_graph(
     # 记忆自动学习（流水线之后，END 之前）
     graph.add_node("memory_update", _wrap_node("memory_update", make_memory_update_node(memory_updater)))
 
-    # 入口 → history_cache
-    graph.add_edge(START, "history_cache")
+    # 入口 → pre_reject（v2：前置拒答检测）
+    graph.add_edge(START, "pre_reject")
+
+    # 前置拒答检测条件分支：
+    #   reject → END（拒答，但该轮写入会话历史供下轮使用）
+    #   pass   → rewrite（进入 Rewrite 子图进行改写）
+    def route_after_pre_reject(state: NL2SQLState) -> str:
+        if state.get("rewrite_rejection_reason"):
+            return END
+        return "rewrite"
+
+    graph.add_conditional_edges(
+        "pre_reject",
+        route_after_pre_reject,
+        {"rewrite": "rewrite", END: END},
+    )
+
+    # Rewrite 子图 → history_cache（改写后的完整 query 去命中缓存）
+    graph.add_edge("rewrite", "history_cache")
 
     # HistoryCache 条件分支（harden-history-cache）：
     #   命中 → value_rewrite → cache_confirm → run_single_query
-    #   未命中 → task_planner
+    #   未命中 → task_decomposer
     def route_after_cache(state: NL2SQLState) -> str:
         if state.get("cache_hit", False):
             return "value_rewrite"
-        return "task_planner"
+        return "task_decomposer"
 
     graph.add_conditional_edges(
         "history_cache",
         route_after_cache,
-        {"task_planner": "task_planner", "value_rewrite": "value_rewrite"},
+        {"task_decomposer": "task_decomposer", "value_rewrite": "value_rewrite"},
     )
 
     # value_rewrite → cache_confirm
@@ -1229,22 +1185,19 @@ def build_main_graph(
     # cache_confirm → run_single_query
     graph.add_edge("cache_confirm", "run_single_query")
 
-    # TaskPlanner 三选一条件分支（决策 9/14）：
-    #   REJECT → END（拒答）
+    # TaskDecomposer 二选一条件分支（决策 9/14）：
     #   EXECUTE single → run_single_query（单查询流水线）
     #   EXECUTE multi → run_subqueries（多意图 orchestrator 串行编排）
-    def route_after_planner(state: NL2SQLState) -> str:
+    def route_after_decomposer(state: NL2SQLState) -> str:
         plan = state.get("plan_result") or {}
-        if plan.get("verdict") == "reject":
-            return END
         if plan.get("intent_type") == "multi" and len(state.get("subqueries", [])) > 1:
             return "run_subqueries"
         return "run_single_query"
 
     graph.add_conditional_edges(
-        "task_planner",
-        route_after_planner,
-        {"run_single_query": "run_single_query", "run_subqueries": "run_subqueries", END: END},
+        "task_decomposer",
+        route_after_decomposer,
+        {"run_single_query": "run_single_query", "run_subqueries": "run_subqueries"},
     )
 
     # 单查询路径：run_single_query → memory_update
@@ -1254,7 +1207,7 @@ def build_main_graph(
     graph.add_edge("aggregate_results", "memory_update")
     graph.add_edge("memory_update", END)
 
-    # 决策 12：启用 task_planner 反问时必须配 checkpointer（interrupt 恢复依赖它）
+    # 决策 12：启用 task_decomposer 反问时必须配 checkpointer（interrupt 恢复依赖它）
     if checkpointer is not None:
         return graph.compile(checkpointer=checkpointer).with_config(run_name="nl2sql-pipeline")
     return graph.compile().with_config(run_name="nl2sql-pipeline")

@@ -73,7 +73,7 @@ class Globals:
     memory_dir: str  # memory/ 根目录，用于定位记忆存储文件
     session_retriever: Any = None
     # 反问机制（决策 9-15）；None 时不启用反问，主图退化为直接 EXECUTE
-    task_planner: Any = None
+    task_decomposer: Any = None
     dialog_manager: Any = None
     checkpointer: Any = None  # InMemorySaver 单例，interrupt 恢复依赖
     summarizer: Any = None    # ResultSummarizer，多意图结果汇总（决策 15）
@@ -237,7 +237,7 @@ class DbContextPool:
 
         # 多意图编排器（决策 14）：持有同一 single_query_graph 实例串行编排
         orchestrator = None
-        if g.task_planner is not None:
+        if g.task_decomposer is not None:
             try:
                 from src.clarification.subquery_orchestrator import SubqueryOrchestrator
                 orchestrator = SubqueryOrchestrator(single_query_graph)
@@ -253,7 +253,7 @@ class DbContextPool:
             answerability_checker=g.answerability_checker,
             history_cache=g.history_cache,
             memory_updater=g.memory_updater,
-            task_planner=g.task_planner,
+            task_decomposer=g.task_decomposer,
             dialog_manager=g.dialog_manager,
             checkpointer=g.checkpointer,
             orchestrator=orchestrator,

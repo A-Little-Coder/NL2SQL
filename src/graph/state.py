@@ -23,6 +23,13 @@ class NL2SQLState(TypedDict, total=False):
         user_id: 用户标识（用于 UserMemory，Phase 2 启用）
         database_filter: 限定检索的数据库 db_id（可空）
 
+        # ===== Rewrite 改写环节（rewrite-before-cache v2）=====
+        rewritten_query: 改写后的完整查询（空字符串表示未改写/无需改写）
+        rewrite_round: 改写轮次（0=未改写，1=第一次改写，2=第二次改写）
+        rewrite_rejection_reason: 前置拒答检测拒答原因
+        rewrite_reason: 改写说明
+        clarify_context: 用户补充信息（反问回答，Rewrite 子图用）
+
         # ===== IR 产出 =====
         keywords: LLM 提取的关键词列表
         retrieved_context: RetrievedContext 实例（IR 综合结果）
@@ -63,7 +70,7 @@ class NL2SQLState(TypedDict, total=False):
         trace_log: 各节点产生的轨迹日志（便于调试）
 
         # ===== 会话历史（由 API 层/调用方注入）=====
-        conversation_history: 当前会话最近轮次
+        conversation_history: 当前会话最近轮次（由 API 层注入，最多5轮）
         cache_hit: 历史命中标记
         cached_sql: 命中的缓存 SQL
         cache_source: 命中来源
@@ -86,6 +93,13 @@ class NL2SQLState(TypedDict, total=False):
     user_id: str
     database_filter: Optional[str]
     query_id: str  # 单次请求的全局 ID（uuid4().hex[:12]，由 API 层生成；离线/CLI 可留空）
+
+    # ===== Rewrite 改写环节（rewrite-before-cache v2）=====
+    rewritten_query: str           # 改写后的完整查询（空字符串表示未改写/无需改写）
+    rewrite_round: int             # 改写轮次（0=未改写，1=第一次改写，2=第二次改写）
+    rewrite_reason: str            # 改写说明
+    rewrite_rejection_reason: Optional[str]  # 前置拒答检测拒答原因
+    clarify_context: Optional[str]   # 用户补充信息（反问回答，Rewrite 子图用）
 
     # ===== IR =====
     keywords: List[str]
@@ -184,6 +198,11 @@ def create_initial_state(
         user_id=user_id,
         database_filter=database_filter,
         query_id=query_id,
+        rewritten_query="",
+        rewrite_round=0,
+        rewrite_reason="",
+        rewrite_rejection_reason=None,
+        clarify_context=None,
         keywords=[],
         retrieved_context=None,
         clarification_count=0,
