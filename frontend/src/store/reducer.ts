@@ -133,13 +133,25 @@ export function reduceSseEvent(turn: Turn, event: SseEvent): Turn {
           source: d.source,
           confidence: d.confidence,
           cachedSql: d.cached_sql,
+          matchedMetricName: d.matched_metric_name ?? null,
+          historicalQuery: d.historical_query ?? null,
         },
       };
       if (d.hit) {
         // 缓存命中短路：仅点亮 cache 节点
+        // 摘要按 source 区分：长期记忆显示指标名、会话历史显示历史 query
+        let label: string;
+        if (d.source === 'metric_definition') {
+          label = d.matched_metric_name ? `长期记忆·${d.matched_metric_name}` : '长期记忆';
+        } else if (d.source === 'session_history') {
+          const q = d.historical_query ?? '';
+          label = q ? `会话历史·${q.length > 12 ? q.slice(0, 12) + '…' : q}` : '会话历史';
+        } else {
+          label = '缓存命中';
+        }
         timeline = upsert(timeline, 'cache', {
           status: 'done',
-          summary: `缓存命中 · ${d.source} · conf=${fmtConf(d.confidence)}`,
+          summary: `${label} · conf=${fmtConf(d.confidence)}`,
         });
       }
       break;

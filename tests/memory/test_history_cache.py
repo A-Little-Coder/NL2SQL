@@ -524,3 +524,91 @@ class TestPromptBuilding:
         assert "销售额" in formatted
         assert "总销售" in formatted
         assert "SELECT SUM(amount)" in formatted
+
+
+# ── Test: matched_metric_name 反查（D1） ─────────────────────
+
+class TestMatchedMetricName:
+    """HistoryCache 命中 metric_definition 时按 cached_sql 反查指标名"""
+
+    def test_metric_hit_reverse_lookup_name(self, metric_definitions):
+        """命中 metric_definition 且 cached_sql 匹配 sql_pattern 时，反查到指标名"""
+        mock = MockLLMClient({
+            "can_reuse": True,
+            "source": "metric_definition",
+            "cached_sql": "SELECT SUM(amount) FROM sales",
+            "confidence": 0.9,
+            "matched_turn_index": None,
+            "reason": "匹配指标「销售额」",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="查一下总销售额",
+            session_history=[],
+            metric_definitions=metric_definitions,
+        )
+        assert result.hit is True
+        assert result.source == "metric_definition"
+        assert result.matched_metric_name == "销售额"
+
+    def test_metric_hit_normalize_match(self, metric_definitions):
+        """反查应归一化匹配（忽略大小写 / 首尾空白 / 末尾分号）"""
+        mock = MockLLMClient({
+            "can_reuse": True,
+            "source": "metric_definition",
+            "cached_sql": " select SUM(amount) from sales ; ",  # 大小写+首尾空白+分号
+            "confidence": 0.9,
+            "matched_turn_index": None,
+            "reason": "匹配指标",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="总销售额",
+            session_history=[],
+            metric_definitions=metric_definitions,
+        )
+        assert result.hit is True
+        assert result.matched_metric_name == "销售额"
+
+    def test_metric_hit_reverse_lookup_fail(self, metric_definitions):
+        """命中 metric_definition 但 cached_sql 不匹配任何 sql_pattern 时，matched_metric_name 为 None"""
+        mock = MockLLMClient({
+            "can_reuse": True,
+            "source": "metric_definition",
+            "cached_sql": "SELECT COUNT(*) FROM orders",  # 与指标 sql_pattern 不匹配
+            "confidence": 0.9,
+            "matched_turn_index": None,
+            "reason": "匹配某指标",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="订单数",
+            session_history=[],
+            metric_definitions=metric_definitions,
+        )
+        assert result.hit is True
+        assert result.matched_metric_name is None
+
+    def test_session_history_hit_has_no_metric_name(self):
+        """命中 session_history 时 matched_metric_name 应为 None"""
+        mock = MockLLMClient({
+            "can_reuse": True,
+            "source": "session_history",
+            "cached_sql": "SELECT SUM(amount) FROM sales WHERE product='Apple'",
+            "confidence": 0.9,
+            "matched_turn_index": 1,
+            "reason": "命中历史",
+        })
+        cache = HistoryCache(mock, min_confidence=0.8)
+        result = cache.check(
+            user_query="查询苹果的销售额",
+            session_history=[
+                {"turn_index": 1, "user_query": "查询苹果的销售额", "final_sql": "SELECT SUM(amount) FROM sales WHERE product='Apple'"},
+            ],
+            metric_definitions=[
+                {"name": "销售额", "description": "SUM", "sql_pattern": "SELECT SUM(amount) FROM sales", "confidence": 0.9},
+            ],
+        )
+        assert result.hit is True
+        assert result.source == "session_history"
+        assert result.matched_metric_name is None

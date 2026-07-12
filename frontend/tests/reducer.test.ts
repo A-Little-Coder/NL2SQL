@@ -24,7 +24,64 @@ describe('reduceSseEvent', () => {
     expect(t.clarification).toBeNull();
   });
 
-  test('cache 命中短路：点亮 cache 节点，details.cache 填充', () => {
+  test('cache 命中 metric_definition 带指标名：摘要显示"长期记忆·{name}"', () => {
+    let t = createTurn('t1', 'q');
+    t = reduceSseEvent(
+      t,
+      ev({
+        type: 'cache_check',
+        data: { query_id: 'q1', hit: true, source: 'metric_definition', confidence: 0.92, cached_sql: 'SELECT SUM(amount) FROM sales', recalled: 0, matched_metric_name: '销售额', historical_query: null },
+      }),
+    );
+    expect(t.details.cache?.hit).toBe(true);
+    expect(t.details.cache?.matchedMetricName).toBe('销售额');
+    const node = t.timeline.find((n) => n.type === 'cache');
+    expect(node).toBeTruthy();
+    expect(node?.summary).toBe('长期记忆·销售额 · conf=0.92');
+  });
+
+  test('cache 命中 metric_definition 无指标名：摘要显示"长期记忆"', () => {
+    let t = createTurn('t1', 'q');
+    t = reduceSseEvent(
+      t,
+      ev({
+        type: 'cache_check',
+        data: { query_id: 'q1', hit: true, source: 'metric_definition', confidence: 0.92, cached_sql: 'SELECT 1', recalled: 0, matched_metric_name: null, historical_query: null },
+      }),
+    );
+    const node = t.timeline.find((n) => n.type === 'cache');
+    expect(node?.summary).toBe('长期记忆 · conf=0.92');
+  });
+
+  test('cache 命中 session_history 带历史 query：摘要显示"会话历史·{query}"', () => {
+    let t = createTurn('t1', 'q');
+    t = reduceSseEvent(
+      t,
+      ev({
+        type: 'cache_check',
+        data: { query_id: 'q1', hit: true, source: 'session_history', confidence: 0.95, cached_sql: 'SELECT 1', recalled: 1, matched_metric_name: null, historical_query: '查询苹果的销售额' },
+      }),
+    );
+    expect(t.details.cache?.historicalQuery).toBe('查询苹果的销售额');
+    const node = t.timeline.find((n) => n.type === 'cache');
+    expect(node?.summary).toBe('会话历史·查询苹果的销售额 · conf=0.95');
+  });
+
+  test('cache 命中 session_history 超 12 字截断', () => {
+    let t = createTurn('t1', 'q');
+    const longQuery = '查询华东区今年各门店的销售额排名情况';
+    t = reduceSseEvent(
+      t,
+      ev({
+        type: 'cache_check',
+        data: { query_id: 'q1', hit: true, source: 'session_history', confidence: 0.9, cached_sql: 'SELECT 1', recalled: 1, matched_metric_name: null, historical_query: longQuery },
+      }),
+    );
+    const node = t.timeline.find((n) => n.type === 'cache');
+    expect(node?.summary).toBe(`会话历史·${longQuery.slice(0, 12)}… · conf=0.90`);
+  });
+
+  test('cache 命中未知 source：摘要回退"缓存命中"', () => {
     let t = createTurn('t1', 'q');
     t = reduceSseEvent(
       t,
@@ -33,8 +90,8 @@ describe('reduceSseEvent', () => {
         data: { query_id: 'q1', hit: true, source: 'history', confidence: 0.9, cached_sql: 'SELECT 1', recalled: 0 },
       }),
     );
-    expect(t.details.cache?.hit).toBe(true);
-    expect(t.timeline.find((n) => n.type === 'cache')).toBeTruthy();
+    const node = t.timeline.find((n) => n.type === 'cache');
+    expect(node?.summary).toBe('缓存命中 · conf=0.90');
   });
 
   test('cache 未命中不点亮 cache 节点', () => {

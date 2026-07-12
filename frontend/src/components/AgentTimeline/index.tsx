@@ -12,7 +12,7 @@
  * props: { turn: Turn }
  * store 依赖：selectNode（通过 useChatStore.getState() 直读，避免重渲染）
  */
-import { Timeline } from 'antd';
+import { Timeline, Popover, Button } from 'antd';
 import {
   DatabaseOutlined,
   SearchOutlined,
@@ -147,9 +147,38 @@ export default function AgentTimeline({ turn }: { turn: Turn }) {
           <span style={{ fontWeight: isSelected ? 600 : 500, marginRight: 6 }}>
             {label}
           </span>
-          <span style={{ color: '#666', fontSize: 13 }}>
+          <span
+            style={{ color: '#666', fontSize: 13 }}
+            title={node.type === 'cache' && turn.details.cache ? `source=${turn.details.cache.source}` : undefined}
+          >
             {node.summary || (node.status === 'active' ? '进行中…' : '')}
           </span>
+          {node.type === 'cache' &&
+            turn.details.cache?.source === 'metric_definition' &&
+            turn.details.cache?.matchedMetricName && (
+              <Popover
+                title="长期记忆指标"
+                content={
+                  <div style={{ maxWidth: 360 }}>
+                    <div style={{ marginBottom: 4 }}>
+                      <b>指标名：</b>
+                      {turn.details.cache.matchedMetricName}
+                    </div>
+                    <div>
+                      <b>复用 SQL：</b>
+                      <pre style={{ margin: '4px 0 0', whiteSpace: 'pre-wrap', fontSize: 12, background: '#f5f5f5', padding: 8, borderRadius: 4 }}>
+                        {turn.details.cache.cachedSql ?? ''}
+                      </pre>
+                    </div>
+                  </div>
+                }
+                trigger="click"
+              >
+                <Button type="link" size="small" style={{ padding: '0 4px', height: 'auto' }} onClick={(e) => e.stopPropagation()}>
+                  查看
+                </Button>
+              </Popover>
+            )}
         </div>
       ),
     };

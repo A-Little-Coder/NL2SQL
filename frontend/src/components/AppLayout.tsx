@@ -35,14 +35,18 @@ export function CollapsedBar({
   return (
     <div
       style={{
-        width: '100%',
-        height: '100%',
+        position: 'fixed',
+        top: 64,
+        width: 40,
+        height: 'calc(100vh - 64px)',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
         background: '#fafafa',
         borderRight: side === 'left' ? '1px solid #f0f0f0' : 'none',
         borderLeft: side === 'right' ? '1px solid #f0f0f0' : 'none',
+        zIndex: 1000,
+        ...(side === 'left' ? { left: 0 } : { right: 0 }),
       }}
     >
       <Button
@@ -53,6 +57,32 @@ export function CollapsedBar({
         title={side === 'left' ? '展开会话侧栏' : '展开详情检查器'}
       />
     </div>
+  );
+}
+
+/** 展开态折叠按钮（D3）：边栏内顶部角落，点击调 panel.collapse()，与 CollapsedBar 对称 */
+export function CollapseButton({
+  side,
+  onCollapse,
+}: {
+  side: 'left' | 'right';
+  onCollapse: () => void;
+}) {
+  return (
+    <Button
+      type="text"
+      size="small"
+      icon={side === 'left' ? <MenuFoldOutlined /> : <MenuUnfoldOutlined />}
+      onClick={onCollapse}
+      aria-label={side === 'left' ? '折叠会话侧栏' : '折叠详情检查器'}
+      title={side === 'left' ? '折叠会话侧栏' : '折叠详情检查器'}
+      style={{
+        position: 'absolute',
+        top: 8,
+        zIndex: 10,
+        ...(side === 'left' ? { right: 8 } : { left: 8 }),
+      }}
+    />
   );
 }
 
@@ -138,11 +168,12 @@ export default function AppLayout() {
               <CollapsedBar side="left" onExpand={() => leftRef.current?.expand()} />
             ) : (
               <div className="sider-inner">
+                <CollapseButton side="left" onCollapse={() => leftRef.current?.collapse()} />
                 <SessionSidebar />
               </div>
             )}
           </Panel>
-          <PanelResizeHandle className="resize-handle" />
+          <PanelResizeHandle className="resize-handle" style={leftCollapsed ? { pointerEvents: 'none' } : undefined} />
 
           {/* 中栏：对话 / 用户记忆 */}
           <Panel>
@@ -167,7 +198,7 @@ export default function AppLayout() {
             </Content>
           </Panel>
 
-          <PanelResizeHandle className="resize-handle" />
+          <PanelResizeHandle className="resize-handle" style={rightCollapsed ? { pointerEvents: 'none' } : undefined} />
           {/* 右栏：详情检查器 */}
           <Panel
             ref={rightRef}
@@ -182,6 +213,7 @@ export default function AppLayout() {
               <CollapsedBar side="right" onExpand={() => rightRef.current?.expand()} />
             ) : (
               <div className="sider-inner">
+                <CollapseButton side="right" onCollapse={() => rightRef.current?.collapse()} />
                 <DetailInspector />
               </div>
             )}

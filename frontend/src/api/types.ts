@@ -169,6 +169,10 @@ export interface CacheCheckEvent {
     cached_sql: string | null;
     recalled: number;
     historical_sql_refs?: unknown[];
+    /** 命中 metric_definition 时的指标名（反查失败为 null） */
+    matched_metric_name?: string | null;
+    /** 命中 session_history 时的历史 query（无命中为 null） */
+    historical_query?: string | null;
   };
 }
 

@@ -71,6 +71,8 @@ export interface TurnDetails {
     source: string;
     confidence: number;
     cachedSql: string | null;
+    matchedMetricName?: string | null;
+    historicalQuery?: string | null;
   };
   ir?: { keywordGroups: KeywordGroupDetail[] };
   schemaFinalize?: { joinEdges: number; bridgeTables: number };

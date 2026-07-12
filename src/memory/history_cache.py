@@ -22,6 +22,7 @@ class CacheResult:
     source: Optional[str] = None  # "session_history" | "metric_definition"
     confidence: float = 0.0
     historical_query: Optional[str] = None  # 命中的历史 query（仅 source=session_history 时有效）
+    matched_metric_name: Optional[str] = None  # 命中的指标名（仅 source=metric_definition 时有效，反查失败为 None）
 
 
 # Prompt 已迁移至 src/memory/prompts.py
@@ -92,7 +93,7 @@ class HistoryCache:
             # 历史缓存检测属于"准实时"场景：直接走 invoke 而不是 stream
             # （响应快 + 不需要 SSE 推送 + 不需要思考链：规则明确，输出固定）
             data = self._llm.invoke(messages, as_json=True, thinking=False, run_name="cache-check")
-            result = self._parse_response(data, session_history)
+            result = self._parse_response(data, session_history, metric_definitions)
         except Exception:
             # LLM 调用失败时安全降级：不走缓存
             return CacheResult(hit=False)
@@ -129,7 +130,7 @@ class HistoryCache:
             lines.append(f"{name}({desc}): {pattern}")
         return "\n".join(lines)
 
-    def _parse_response(self, response, session_history: List[Dict[str, Any]]) -> CacheResult:
+    def _parse_response(self, response, session_history: List[Dict[str, Any]], metric_definitions: Optional[List[Dict[str, Any]]] = None) -> CacheResult:
         """解析 LLM 返回的 JSON 结果"""
         try:
             if isinstance(response, str):
@@ -164,12 +165,24 @@ class HistoryCache:
                             historical_query = turn.get("user_query", turn.get("historical_query"))
                             break
 
+            # 命中 metric_definition 时，按 cached_sql 反查指标名（归一化匹配）
+            # metric_definitions 是确定有限集，反查比 LLM 返回指标名更可靠；反查失败为 None
+            matched_metric_name = None
+            if hit and source == "metric_definition" and cached_sql:
+                norm_metric = lambda s: str(s).strip().rstrip(";").strip().lower()
+                for m in (metric_definitions or []):
+                    pattern = m.get("sql_pattern")
+                    if pattern and norm_metric(pattern) == norm_metric(cached_sql):
+                        matched_metric_name = m.get("name")
+                        break
+
             return CacheResult(
                 hit=hit,
                 cached_sql=data.get("cached_sql"),
                 source=source,
                 confidence=data.get("confidence", 0.0),
                 historical_query=historical_query,
+                matched_metric_name=matched_metric_name,
             )
         except (ValueError, TypeError, KeyError):
             return CacheResult(hit=False)

@@ -10,7 +10,7 @@
  */
 import { describe, test, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
-import { CollapsedBar } from '../src/components/AppLayout';
+import { CollapsedBar, CollapseButton } from '../src/components/AppLayout';
 
 describe('CollapsedBar 折叠展开条（D7）', () => {
   test('左栏折叠条渲染展开按钮，点击触发 onExpand', () => {
@@ -25,5 +25,21 @@ describe('CollapsedBar 折叠展开条（D7）', () => {
     const onExpand = vi.fn();
     render(<CollapsedBar side="right" onExpand={onExpand} />);
     expect(screen.getByRole('button', { name: /展开详情检查器/ })).toBeInTheDocument();
+  });
+});
+
+describe('CollapseButton 展开态折叠按钮（D3）', () => {
+  test('左栏折叠按钮渲染，点击触发 onCollapse', () => {
+    const onCollapse = vi.fn();
+    render(<CollapseButton side="left" onCollapse={onCollapse} />);
+    const btn = screen.getByRole('button', { name: /折叠会话侧栏/ });
+    fireEvent.click(btn);
+    expect(onCollapse).toHaveBeenCalledTimes(1);
+  });
+
+  test('右栏折叠按钮标题为详情检查器', () => {
+    const onCollapse = vi.fn();
+    render(<CollapseButton side="right" onCollapse={onCollapse} />);
+    expect(screen.getByRole('button', { name: /折叠详情检查器/ })).toBeInTheDocument();
   });
 });

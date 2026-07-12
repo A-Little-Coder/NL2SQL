@@ -191,6 +191,8 @@ def make_history_cache_node(history_cache) -> Callable[[NL2SQLState], Dict[str, 
             "cached_sql": result.cached_sql,
             "recalled": len(recalled_refs),
             "historical_sql_refs": historical_sql_refs,
+            "matched_metric_name": result.matched_metric_name,
+            "historical_query": result.historical_query,
         })
         return out
 
