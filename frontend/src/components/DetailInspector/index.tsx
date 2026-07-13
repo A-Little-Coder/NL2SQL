@@ -2,7 +2,8 @@
  * 节点详情检查器（任务 9.1-9.3 + 10.1-10.2，决策 D5）
  *
  * 职责：
- * - 从 store.turns 取"当前 turn"（最后一个 turn，最近活跃），turns 为空显示空态
+ * - 从 store.turns 取"当前 turn"：inspectorTurnId 锁定时看该 turn，否则最后一个 turn
+ *   （change clarify-choice-inspector-cancel，跨轮可回看）；turns 为空显示空态
  * - 确定显示哪个节点详情（D5）：
  *   · turn.selectedNode === null  -> 自动跟随最新节点（timeline 最后一个节点的 type）
  *   · turn.selectedNode !== null  -> 锁定显示该 type 的节点详情
@@ -18,6 +19,7 @@
 import { useEffect, useRef } from 'react';
 import {
   Alert,
+  Button,
   Card,
   Collapse,
   Descriptions,
@@ -73,6 +75,7 @@ const STATUS_TAG: Record<
   done: { color: 'success', text: '已完成' },
   error: { color: 'error', text: '错误' },
   awaiting_clarification: { color: 'warning', text: '等待反问回答' },
+  cancelled: { color: 'default', text: '已取消' },
 };
 
 // ---------------------------------------------------------------------------
@@ -483,9 +486,9 @@ function ErrorDetail({ turn }: { turn: Turn }) {
   if (!turn.error) return <NoDetail />;
   return (
     <Alert
-      type={turn.rejection ? 'warning' : 'error'}
+      type={turn.cancelled ? 'info' : turn.rejection ? 'warning' : 'error'}
       showIcon
-      message={turn.rejection ? '拒答' : '错误'}
+      message={turn.cancelled ? '已取消' : turn.rejection ? '拒答' : '错误'}
       description={turn.error}
     />
   );
@@ -705,10 +708,26 @@ function renderDetail(turn: Turn, type: TimelineNodeType) {
 // 主组件
 // ---------------------------------------------------------------------------
 export default function DetailInspector() {
-  // 取最后一个 turn 作为"当前 turn"（最近活跃）
   const turns = useChatStore((s) => s.turns);
-  const currentTurn: Turn | undefined =
-    turns.length > 0 ? turns[turns.length - 1] : undefined;
+  const inspectorTurnId = useChatStore((s) => s.inspectorTurnId);
+  const releaseInspector = useChatStore((s) => s.releaseInspector);
+  // inspectorTurnId 锁定时看该 turn，否则自动跟随最新（change clarify-choice-inspector-cancel）
+  const currentTurn: Turn | undefined = (() => {
+    if (turns.length === 0) return undefined;
+    if (inspectorTurnId) {
+      const pinned = turns.find((t) => t.turnId === inspectorTurnId);
+      if (pinned) return pinned;
+    }
+    return turns[turns.length - 1];
+  })();
+  // 是否锁定在非最新轮（用于显示"返回最新"按钮）
+  const isPinnedToOld =
+    !!currentTurn &&
+    !!inspectorTurnId &&
+    currentTurn.turnId !== turns[turns.length - 1].turnId;
+  const pinnedTurnIndex = currentTurn
+    ? turns.findIndex((t) => t.turnId === currentTurn.turnId) + 1
+    : 0;
 
   // ---- 空态：无 turn ----
   if (!currentTurn) {
@@ -804,6 +823,17 @@ export default function DetailInspector() {
               </Tag>
             )}
           </div>
+          {/* 锁定在非最新轮时显示"返回最新"（change clarify-choice-inspector-cancel） */}
+          {isPinnedToOld && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <Tag icon={<LockOutlined />} color="purple">
+                已锁定到第 {pinnedTurnIndex} 轮
+              </Tag>
+              <Button size="small" type="link" onClick={releaseInspector} style={{ padding: 0 }}>
+                返回最新
+              </Button>
+            </div>
+          )}
         </div>
       </Card>
 

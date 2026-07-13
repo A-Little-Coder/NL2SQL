@@ -5,8 +5,9 @@
  * - 仅当 turn.status==='awaiting_clarification' && turn.clarification 时渲染；否则 return null
  * - 内联气泡（AntD Alert，不用 Modal）展示：
  *   - turn.clarification.question（反问问题）
- *   - turn.clarification.ambiguities（可选项，渲染为可点击的 Tag/按钮，点击即作为答案提交）
- *   - 一个 Input 允许用户自定义回答
+ *   - turn.clarification.kind 决定渲染（change clarify-choice-inspector-cancel）：
+ *     confirm=二选一按钮(无输入框) / choice=按钮组+输入框 / open=纯输入框(回退兼容 ambiguities)
+ *   - 选项点击即提交对应 value；输入框提交原文
  *   - 显示当前 round（"第 N 轮反问"）
  * - 用户作答 -> 调 useQueryStream().sendResume({ answer, sessionId, userId, dbId, turnId })
  * - 提交后显示 loading（resume 流进行中）；支持多轮（round 递增，每次按当前 turn.clarification 渲染）
@@ -41,7 +42,10 @@ export default function ClarificationBubble({ turn }: { turn: Turn }) {
     return null;
   }
 
-  const { question, ambiguities, round } = turn.clarification;
+  const { question, ambiguities, round, kind, options } = turn.clarification;
+  // 结构化反问类型（change clarify-choice-inspector-cancel）：缺失按 'open' 兜底
+  const effectiveKind = kind ?? 'open';
+  const hasOptions = !!options && options.length > 0;
 
   /**
    * 提交回答触发 resume 续流
@@ -92,42 +96,77 @@ export default function ClarificationBubble({ turn }: { turn: Turn }) {
           </Text>
           {/* 反问问题 */}
           <Text strong>{question}</Text>
-          {/* 可选项：点击即作为答案提交 */}
-          {ambiguities && ambiguities.length > 0 && (
-            <div>
-              <Text type="secondary" style={{ fontSize: 12, marginRight: 8 }}>
-                可选答案：
-              </Text>
-              {ambiguities.map((opt) => (
-                <Tag
-                  key={opt}
-                  style={{ cursor: 'pointer', marginBottom: 4 }}
-                  color="blue"
-                  onClick={() => doResume(opt)}
+
+          {/* confirm 类型：二选一主按钮，无输入框（change clarify-choice-inspector-cancel） */}
+          {effectiveKind === 'confirm' && hasOptions ? (
+            <Space style={{ marginTop: 4 }}>
+              {options!.map((opt) => (
+                <Button
+                  key={opt.value}
+                  type={opt.value === 'yes' ? 'primary' : 'default'}
+                  onClick={() => doResume(opt.value)}
+                  disabled={submitting}
                 >
-                  {opt}
-                </Tag>
+                  {opt.label}
+                </Button>
               ))}
-            </div>
+            </Space>
+          ) : (
+            <>
+              {/* choice/open：选项按钮（优先 options，回退 ambiguities 兼容旧后端） */}
+              {hasOptions ? (
+                <div style={{ marginTop: 4 }}>
+                  <Text type="secondary" style={{ fontSize: 12, marginRight: 8 }}>
+                    可选答案：
+                  </Text>
+                  {options!.map((opt) => (
+                    <Tag
+                      key={opt.value}
+                      style={{ cursor: 'pointer', marginBottom: 4 }}
+                      color="blue"
+                      onClick={() => doResume(opt.value)}
+                    >
+                      {opt.label}
+                    </Tag>
+                  ))}
+                </div>
+              ) : ambiguities && ambiguities.length > 0 ? (
+                <div>
+                  <Text type="secondary" style={{ fontSize: 12, marginRight: 8 }}>
+                    可选答案：
+                  </Text>
+                  {ambiguities.map((opt) => (
+                    <Tag
+                      key={opt}
+                      style={{ cursor: 'pointer', marginBottom: 4 }}
+                      color="blue"
+                      onClick={() => doResume(opt)}
+                    >
+                      {opt}
+                    </Tag>
+                  ))}
+                </div>
+              ) : null}
+              {/* 自定义回答输入框（choice/open 有；confirm 已在上分支渲染无输入框） */}
+              <Space.Compact style={{ width: '100%', marginTop: 4 }}>
+                <Input
+                  placeholder="输入你的回答…"
+                  value={answer}
+                  onChange={(e) => setAnswer(e.target.value)}
+                  onPressEnter={() => doResume(answer)}
+                  disabled={submitting}
+                />
+                <Button
+                  type="primary"
+                  icon={<SendOutlined />}
+                  onClick={() => doResume(answer)}
+                  disabled={!answer.trim() || submitting}
+                >
+                  提交
+                </Button>
+              </Space.Compact>
+            </>
           )}
-          {/* 自定义回答输入框 */}
-          <Space.Compact style={{ width: '100%', marginTop: 4 }}>
-            <Input
-              placeholder="输入你的回答…"
-              value={answer}
-              onChange={(e) => setAnswer(e.target.value)}
-              onPressEnter={() => doResume(answer)}
-              disabled={submitting}
-            />
-            <Button
-              type="primary"
-              icon={<SendOutlined />}
-              onClick={() => doResume(answer)}
-              disabled={!answer.trim() || submitting}
-            >
-              提交
-            </Button>
-          </Space.Compact>
         </Space>
       }
     />

@@ -345,6 +345,10 @@ export interface ClarificationEvent {
     ambiguities: string[];
     round: number;
     awaiting_answer: boolean;
+    /** 结构化反问类型（change clarify-choice-inspector-cancel）；缺失时前端按 'open' 兜底 */
+    kind?: 'confirm' | 'choice' | 'open' | null;
+    /** confirm/choice 类型的可选项；点击即提交 value */
+    options?: { label: string; value: string }[];
   };
 }
 

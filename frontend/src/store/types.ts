@@ -7,7 +7,7 @@
 import type { SseEvent } from '@/api/types';
 
 /** 时间轴节点状态 */
-export type NodeStatus = 'pending' | 'active' | 'done' | 'error';
+export type NodeStatus = 'pending' | 'active' | 'done' | 'error' | 'cancelled';
 
 /**
  * 时间轴节点类型（对应推理阶段）。
@@ -61,7 +61,8 @@ export type TurnStatus =
   | 'streaming'
   | 'done'
   | 'error'
-  | 'awaiting_clarification';
+  | 'awaiting_clarification'
+  | 'cancelled';
 
 /** 单条候选 SQL 执行结果 */
 export interface ExecutionResult {
@@ -153,6 +154,10 @@ export interface Clarification {
   question: string;
   ambiguities: string[];
   round: number;
+  /** 结构化反问类型（change clarify-choice-inspector-cancel）；缺失按 'open' */
+  kind?: 'confirm' | 'choice' | 'open' | null;
+  /** confirm/choice 类型的可选项 */
+  options?: { label: string; value: string }[];
 }
 
 /** done 事件携带的决策路径/修复信息 */
@@ -190,6 +195,8 @@ export interface Turn {
   doneMeta?: DoneMeta;
   /** 拒答标记 */
   rejection?: boolean;
+  /** 用户取消标记（change clarify-choice-inspector-cancel） */
+  cancelled?: boolean;
   /** 错误信息 */
   error?: string;
 }

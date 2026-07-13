@@ -5,7 +5,8 @@
  * - sendQuery：发送初始查询，生成新 turnId，事件 reduce 进该 Turn
  * - sendResume：携带 resume=<回答> 续流，事件并入同一 turnId（D4）
  *
- * 网络错误降级为合成 error 事件并入 Turn；AbortController 支持取消。
+ * 网络错误降级为合成 error 事件并入 Turn；cancel() abort fetch 并 cancelTurn 置 cancelled
+ * 终态（修复僵尸 streaming，change clarify-choice-inspector-cancel）。
  */
 import { useCallback, useRef } from 'react';
 import type { QueryRequest, SseEvent } from '@/api/types';
@@ -30,10 +31,13 @@ interface SendResumeParams {
 
 export function useQueryStream() {
   const abortRef = useRef<AbortController | null>(null);
+  // 当前在途流的 turnId（cancel 时据此 cancelTurn，change clarify-choice-inspector-cancel）
+  const turnIdRef = useRef<string | null>(null);
 
   /** 发送初始查询，返回新生成的 turnId */
   const sendQuery = useCallback(async ({ query, sessionId, userId, dbId }: SendQueryParams): Promise<string> => {
     const turnId = genTurnId();
+    turnIdRef.current = turnId;
     const store = useChatStore.getState();
     store.startTurn(turnId, query);
 
@@ -66,6 +70,7 @@ export function useQueryStream() {
 
   /** 发送 resume 续流，事件并入同一 turnId（D4） */
   const sendResume = useCallback(async ({ answer, sessionId, userId, dbId, turnId }: SendResumeParams): Promise<void> => {
+    turnIdRef.current = turnId;
     useChatStore.getState().resumeTurn(turnId);
 
     const body: QueryRequest = {
@@ -92,10 +97,15 @@ export function useQueryStream() {
     }
   }, []);
 
-  /** 取消当前流 */
+  /** 取消当前流：abort fetch + cancelTurn 置终态（修复僵尸 streaming，change clarify-choice-inspector-cancel） */
   const cancel = useCallback(() => {
     abortRef.current?.abort();
     abortRef.current = null;
+    const tid = turnIdRef.current;
+    if (tid) {
+      useChatStore.getState().cancelTurn(tid);
+    }
+    turnIdRef.current = null;
   }, []);
 
   return { sendQuery, sendResume, cancel };

@@ -46,6 +46,8 @@ interface ChatState {
   currentSessionId: string | null;
   // ---- 轮次（当前会话）----
   turns: Turn[];
+  /** 检查器锁定的 turnId（change clarify-choice-inspector-cancel）；null=自动跟随最新 turn */
+  inspectorTurnId: string | null;
   // ---- 用户记忆 ----
   userMemory: UserMemoryResponse | null;
   userMetrics: MetricDefinitionResponse | null;
@@ -71,8 +73,12 @@ interface ChatState {
   applyEvent: (turnId: string, event: SseEvent) => void;
   /** resume 前把 Turn 状态恢复为 streaming（保留已有 timeline） */
   resumeTurn: (turnId: string) => void;
-  /** 设置检查器选中节点（null=自动跟随最新，D5） */
+  /** 设置检查器选中节点（null=自动跟随最新，D5）；同时 pin 检查器到该 turn（change clarify-choice-inspector-cancel） */
   selectNode: (turnId: string, node: TimelineNodeType | null) => void;
+  /** 解除检查器 turn 锁定，恢复自动跟随最新（change clarify-choice-inspector-cancel） */
+  releaseInspector: () => void;
+  /** 用户取消在途请求：Turn 进 cancelled 终态，时间轴追加"用户已取消"节点（change clarify-choice-inspector-cancel） */
+  cancelTurn: (turnId: string) => void;
   /** 从会话历史 SessionTurn[] 构造 Turn[]（简化：仅 userQuery/finalSql/result） */
   setHistoryTurns: (turns: SessionTurn[]) => void;
 }
@@ -85,6 +91,7 @@ export const useChatStore = create<ChatState>((set) => ({
   sessions: [],
   currentSessionId: null,
   turns: [],
+  inspectorTurnId: null,
   userMemory: null,
   userMetrics: null,
   loadingDb: false,
@@ -122,9 +129,38 @@ export const useChatStore = create<ChatState>((set) => ({
 
   selectNode: (turnId, node) =>
     set((state) => ({
+      // node===null（点已选中节点解除锁定）-> inspectorTurnId 也置 null，恢复全自动跟随
+      // node!=null -> pin 检查器到该 turn（change clarify-choice-inspector-cancel）
+      inspectorTurnId: node === null ? null : turnId,
       turns: state.turns.map((t) =>
         t.turnId === turnId ? { ...t, selectedNode: node } : t,
       ),
+    })),
+
+  releaseInspector: () => set({ inspectorTurnId: null }),
+
+  cancelTurn: (turnId) =>
+    set((state) => ({
+      turns: state.turns.map((t) => {
+        if (t.turnId !== turnId) return t;
+        const cancelNode = { type: 'error' as const, status: 'done' as const, summary: '用户已取消' };
+        // 把所有 active 节点置为 cancelled（灰色停止旋转），避免取消后节点一直转
+        let timeline = t.timeline.map((n) =>
+          n.status === 'active' ? { ...n, status: 'cancelled' as const } : n,
+        );
+        const idx = timeline.findIndex((n) => n.type === 'error');
+        timeline = idx >= 0
+          ? timeline.map((n, i) => (i === idx ? { ...n, ...cancelNode } : n))
+          : [...timeline, cancelNode];
+        return {
+          ...t,
+          status: 'cancelled' as const,
+          cancelled: true,
+          rejection: false,
+          error: '用户已取消请求',
+          timeline,
+        };
+      }),
     })),
 
   setHistoryTurns: (historyTurns) =>

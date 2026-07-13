@@ -75,3 +75,31 @@ describe('AgentTimeline cache 节点命中展示', () => {
     expect(screen.queryByRole('button', { name: '查看' })).toBeNull();
   });
 });
+
+describe('AgentTimeline 拒绝复用后不短路隐藏 ir/ss/cg', () => {
+  test('cache 命中但 cacheConfirm.approved=false：ir/cg 节点正常显示', () => {
+    const turn = createTurn('t1', '查询');
+    turn.details = {
+      ...turn.details,
+      cache: {
+        hit: true,
+        source: 'session_history',
+        confidence: 0.9,
+        cachedSql: 'SELECT 1',
+        matchedMetricName: null,
+        historicalQuery: 'old',
+      },
+      cacheConfirm: { approved: false, userChoice: 'no', historicalQuery: 'old', userQuery: '查询' },
+    };
+    turn.timeline = [
+      { type: 'cache', status: 'done', summary: '会话历史·old · conf=0.90' },
+      { type: 'cache_confirm', status: 'done', summary: '✗' },
+      { type: 'ir', status: 'done', summary: '关键词 2 组' },
+      { type: 'cg', status: 'done', summary: '3 候选 SQL' },
+    ];
+    render(<AgentTimeline turn={turn} />);
+    // 拒绝复用后走完整链路，ir/cg 节点应可见（不被 cacheHit 短路过滤）
+    expect(screen.getByText(/关键词 2 组/)).toBeInTheDocument();
+    expect(screen.getByText(/3 候选 SQL/)).toBeInTheDocument();
+  });
+});

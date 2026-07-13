@@ -163,6 +163,43 @@ class TestCacheConfirmNode(unittest.TestCase):
         self.assertEqual(out.get("trace_log", [])[0], "prev log")
         self.assertIn("CacheConfirm", out.get("trace_log", [])[1])
 
+    # ---- change clarify-choice-inspector-cancel：结构化 kind/options + yes/no ----
+
+    def test_payload_has_kind_and_options(self):
+        """interrupt payload 含 kind=confirm 与 2 项 options（是/否）。"""
+        self.mock_interrupt.return_value = "yes"
+        node = make_cache_confirm_node()
+        node({"user_query": "q", "cached_sql": "SELECT 1"})
+        payload = self.mock_interrupt.call_args[0][0]
+        self.assertEqual(payload["kind"], "confirm")
+        self.assertEqual(len(payload["options"]), 2)
+        values = [o["value"] for o in payload["options"]]
+        self.assertIn("yes", values)
+        self.assertIn("no", values)
+
+    def test_user_choice_yes_approves(self):
+        """user_choice="yes" -> approved=True（结构化 value 优先）。"""
+        self.mock_interrupt.return_value = "yes"
+        node = make_cache_confirm_node()
+        out = node({"user_query": "q", "cache_hit": True, "cached_sql": "SELECT 1"})
+        self.assertTrue(out["cache_confirm_approved"])
+
+    def test_user_choice_no_rejects(self):
+        """user_choice="no" -> approved=False + cache_hit=False + cached_sql=None。"""
+        self.mock_interrupt.return_value = "no"
+        node = make_cache_confirm_node()
+        out = node({"user_query": "q", "cache_hit": True, "cached_sql": "SELECT 1"})
+        self.assertFalse(out["cache_confirm_approved"])
+        self.assertFalse(out["cache_hit"])
+        self.assertIsNone(out["cached_sql"])
+
+    def test_non_standard_value_falls_back_to_set_match(self):
+        """user_choice="是"（非 yes/no）-> 回退字符串集合匹配，approved=True（兼容旧前端）。"""
+        self.mock_interrupt.return_value = "是"
+        node = make_cache_confirm_node()
+        out = node({"user_query": "q", "cache_hit": True, "cached_sql": "SELECT 1"})
+        self.assertTrue(out["cache_confirm_approved"])
+
 
 if __name__ == "__main__":
     unittest.main()

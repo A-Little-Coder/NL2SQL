@@ -44,6 +44,7 @@ try:
         get_user_memory_ctx,
         get_session_memory_ctx,
         current_fix_loop,
+        current_cancel_event,
     )
 except Exception:  # pragma: no cover - 无 API 模块时（如离线脚本）
     current_node = None  # type: ignore
@@ -58,6 +59,7 @@ except Exception:  # pragma: no cover - 无 API 模块时（如离线脚本）
         return None
 
     current_fix_loop = None  # type: ignore
+    current_cancel_event = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +88,16 @@ def _is_graph_interrupt(e: BaseException) -> bool:
     return type(e).__name__ == "GraphInterrupt"
 
 
+class CancelRequested(Exception):
+    """请求被用户取消时，_wrap_node 在节点边界抛出的控制流异常（非错误）。
+
+    change clarify-choice-inspector-cancel：主图 stream 在 run_single_query（invoke
+    子图）期间阻塞，看不到子图内部节点边界，cancel_event 检查不生效。故由 _wrap_node
+    在每个节点（含子图节点）开始前检查 cancel_event（经 ContextVar），set 则抛本异常
+    终止图。run_graph 据此不 emit error。
+    """
+
+
 def _wrap_node(node_name: str, fn: Callable[[NL2SQLState], Dict[str, Any]]):
     """给节点函数包一层：进入时发 stage started，退出时发 stage done
 
@@ -98,6 +110,12 @@ def _wrap_node(node_name: str, fn: Callable[[NL2SQLState], Dict[str, Any]]):
         if current_node is not None:
             token = current_node.set(node_name)
         qid = state.get("query_id", "") if isinstance(state, dict) else ""
+        # 节点开始前检查取消信号（change clarify-choice-inspector-cancel）：
+        # 含子图节点（ir/ss/cg/...），set 则抛 CancelRequested 终止图，不 emit error
+        cancel_evt = current_cancel_event.get(None) if current_cancel_event is not None else None
+        if cancel_evt is not None and cancel_evt.is_set():
+            logger.info(f"[qid={qid}] [stage] node={node_name} 跳过（请求已取消）")
+            raise CancelRequested()
         logger.info(f"[qid={qid}] [stage] node={node_name} status=started")
         emit_safe("stage", {"node": node_name, "status": "started"})
         try:
@@ -327,10 +345,17 @@ def make_cache_confirm_node() -> Callable[[NL2SQLState], Dict[str, Any]]:
 {sql_to_show}"""
 
         # 构造 interrupt payload（兼容 query.py 中的 clarification 事件处理）
+        # kind/options 结构化反问（change clarify-choice-inspector-cancel）：
+        #   confirm 类型 -> 前端渲染二选一按钮，点击发 value("yes"/"no")，告别字符串匹配
         payload = {
             "question": confirm_question,
             "ambiguities": [],
             "round": 1,
+            "kind": "confirm",
+            "options": [
+                {"label": "是，复用", "value": "yes"},
+                {"label": "否，重新生成", "value": "no"},
+            ],
         }
 
         # 调用 interrupt
@@ -346,8 +371,15 @@ def make_cache_confirm_node() -> Callable[[NL2SQLState], Dict[str, Any]]:
 
         user_choice = interrupt(payload)
 
-        # 解析用户选择
-        approved = str(user_choice).strip() in {"复用", "reuse", "yes", "是", "1", "y", "确认", "Y", "YES"}
+        # 解析用户选择（change clarify-choice-inspector-cancel）：
+        #   结构化 value 优先（"yes"/"no"），旧前端/自定义输入回退字符串集合匹配兜底
+        choice_str = str(user_choice).strip()
+        if choice_str == "yes":
+            approved = True
+        elif choice_str == "no":
+            approved = False
+        else:
+            approved = choice_str in {"复用", "reuse", "yes", "是", "1", "y", "确认", "Y", "YES"}
 
         out: Dict[str, Any] = {
             "cache_confirm_approved": approved,

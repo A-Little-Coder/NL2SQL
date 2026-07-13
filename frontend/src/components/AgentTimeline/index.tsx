@@ -25,6 +25,7 @@ import {
   TableOutlined,
   CloseCircleOutlined,
   LoadingOutlined,
+  LockOutlined,
   ClockCircleOutlined,
   SafetyOutlined,
   AuditOutlined,
@@ -88,6 +89,8 @@ function statusColor(status: NodeStatus): string {
       return 'green';
     case 'error':
       return 'red';
+    case 'cancelled':
+      return 'gray';
     default:
       return 'gray';
   }
@@ -103,17 +106,26 @@ function nodeDot(node: TimelineNode): ReactNode {
   if (node.status === 'error') {
     return <span style={{ color: '#ff4d4f' }}>{icon}</span>;
   }
+  // cancelled 状态用灰色图标（停止旋转，表示该节点因取消未完成）
+  if (node.status === 'cancelled') {
+    return <span style={{ color: '#999' }}>{icon}</span>;
+  }
   return icon;
 }
 
 export default function AgentTimeline({ turn }: { turn: Turn }) {
   const selectedNode = turn.selectedNode;
   const cacheHit = turn.details.cache?.hit === true;
+  // 用户在 cache_confirm 选择「重新生成」(approved=false) -> 否定复用，后端走完整 ir/ss/cg 链路；
+  // 此时不应短路隐藏这些节点（change clarify-choice-inspector-cancel）
+  const cacheRejected = turn.details.cacheConfirm?.approved === false;
+  // 本轮是否被检查器锁定（change clarify-choice-inspector-cancel）
+  const isPinned = useChatStore((s) => s.inspectorTurnId) === turn.turnId;
 
   // 缓存命中短路（8.3）：保留前置检查/改写/值改写/确认等辅助节点 + cache + result + error，
-  // 跳过 ir/ss/answerability/cg/execution/decision（cache 命中时这些被短路）
+  // 跳过 ir/ss/answerability/cg/execution/decision（cache 命中且用户确认复用时这些被短路）
   let nodes = turn.timeline;
-  if (cacheHit) {
+  if (cacheHit && !cacheRejected) {
     nodes = turn.timeline.filter(
       (n) =>
         n.type === 'pre_reject' ||
@@ -214,9 +226,16 @@ export default function AgentTimeline({ turn }: { turn: Turn }) {
   });
 
   return (
-    <Timeline
-      items={items}
-      style={{ marginTop: 8, marginBottom: 0 }}
-    />
+    <div>
+      {isPinned && (
+        <div style={{ fontSize: 12, color: '#722ed1', marginBottom: 2 }}>
+          <LockOutlined /> 检查器正查看此轮
+        </div>
+      )}
+      <Timeline
+        items={items}
+        style={{ marginTop: 8, marginBottom: 0 }}
+      />
+    </div>
   );
 }

@@ -78,6 +78,11 @@ current_session_memory: ContextVar[Optional[Any]] = ContextVar(
 current_fix_loop: ContextVar[Optional[Any]] = ContextVar(
     "current_fix_loop", default=None
 )
+# 请求级取消信号（change clarify-choice-inspector-cancel）：threading.Event，
+# _wrap_node 在每个节点（含子图节点）开始前检查，set 则抛 CancelRequested 终止图
+current_cancel_event: ContextVar[Optional[Any]] = ContextVar(
+    "current_cancel_event", default=None
+)
 
 
 def get_user_memory_ctx() -> Optional[Any]:

@@ -10,6 +10,7 @@
  *   - 发送时调 useQueryStream().sendQuery({ query, sessionId, userId, dbId })
  *   - currentSessionId 为空时先 createSession 拿到 session_id 再发送（场景 6.5）
  *   - selectedDbId 为空时提示"请先选择数据库"
+ *   - sending 且最新轮 streaming 时，发送按钮变体为"停止"（abort + cancelTurn，change clarify-choice-inspector-cancel）
  * - 冷库加载提示（任务 15.8）：store.loadingDb 为 true 时在 streaming Turn 下方显示文案
  * - streaming 中的 Turn 显示加载指示
  * - 自动滚动到底部（新 turn 或新事件时）
@@ -31,6 +32,7 @@ import {
 } from 'antd';
 import {
   SendOutlined,
+  StopOutlined,
   UserOutlined,
   RobotOutlined,
   LoadingOutlined,
@@ -76,8 +78,9 @@ function AssistantCard({ turn, loadingDb }: { turn: Turn; loadingDb: boolean }) 
   const isStreaming = turn.status === 'streaming';
   const isAwaiting = turn.status === 'awaiting_clarification';
   const isError = turn.status === 'error';
-  // rejection 或 error 状态均不渲染结果表（8.4）
-  const showResult = !!turn.result && !isError && !turn.rejection;
+  const isCancelled = turn.status === 'cancelled';
+  // rejection 或 error 状态均不渲染结果表（8.4）；cancelled 也不渲染（change clarify-choice-inspector-cancel）
+  const showResult = !!turn.result && !isError && !turn.rejection && !isCancelled;
   // 冷库加载提示仅在当前流式 Turn 下显示
   const showLoadingDbHint = loadingDb && isStreaming;
 
@@ -124,6 +127,17 @@ function AssistantCard({ turn, loadingDb }: { turn: Turn; loadingDb: boolean }) 
           />
         )}
 
+        {/* 已取消提示（change clarify-choice-inspector-cancel） */}
+        {isCancelled && (
+          <Alert
+            type="info"
+            showIcon
+            message="已取消"
+            description="用户已取消该请求"
+            style={{ marginTop: 8 }}
+          />
+        )}
+
         {/* 反问期间不渲染结果表（spec: 反问期间不展示最终结果） */}
         {showResult && !isAwaiting && (
           <div style={{ marginTop: 12 }}>
@@ -143,7 +157,7 @@ export default function Conversation() {
   const loadingDb = useChatStore((s) => s.loadingDb);
   const setCurrentSessionId = useChatStore((s) => s.setCurrentSessionId);
 
-  const { sendQuery } = useQueryStream();
+  const { sendQuery, cancel } = useQueryStream();
 
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -153,6 +167,10 @@ export default function Conversation() {
   const turnsLen = turns.length;
   const lastTimelineLen = turnsLen > 0 ? turns[turnsLen - 1].timeline.length : 0;
   const lastTurnStatus = turnsLen > 0 ? turns[turnsLen - 1].status : '';
+  // 停止按钮在最新轮 streaming 期间显示（覆盖初始请求 sendQuery 与反问续流 sendResume，
+  // 后者不经过 handleSend、sending 为 false，故以 turn 的 streaming 态为准）；
+  // 反问等待/已完成/已取消/拒答时不显示（change clarify-choice-inspector-cancel）
+  const canStop = lastTurnStatus === 'streaming';
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [turnsLen, lastTimelineLen, lastTurnStatus]);
@@ -189,6 +207,11 @@ export default function Conversation() {
     } finally {
       setSending(false);
     }
+  };
+
+  /** 停止在途请求：abort fetch + cancelTurn（change clarify-choice-inspector-cancel） */
+  const handleStop = () => {
+    cancel();
   };
 
   /** 输入框按键：Enter 发送，Shift+Enter 换行 */
@@ -234,15 +257,26 @@ export default function Conversation() {
             disabled={sending}
             style={{ borderRadius: '6px 0 0 6px', resize: 'none' }}
           />
-          <Button
-            type="primary"
-            icon={sending ? <LoadingOutlined /> : <SendOutlined />}
-            onClick={() => void handleSend()}
-            disabled={sending || !input.trim()}
-            style={{ height: 'auto', borderRadius: '0 6px 6px 0' }}
-          >
-            发送
-          </Button>
+          {canStop ? (
+            <Button
+              danger
+              icon={<StopOutlined />}
+              onClick={handleStop}
+              style={{ height: 'auto', borderRadius: '0 6px 6px 0' }}
+            >
+              停止
+            </Button>
+          ) : (
+            <Button
+              type="primary"
+              icon={<SendOutlined />}
+              onClick={() => void handleSend()}
+              disabled={sending || !input.trim()}
+              style={{ height: 'auto', borderRadius: '0 6px 6px 0' }}
+            >
+              发送
+            </Button>
+          )}
         </Space.Compact>
         {!selectedDbId && (
           <Text type="warning" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>

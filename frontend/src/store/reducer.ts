@@ -98,6 +98,11 @@ function fmtConf(c: number | null | undefined): string {
  * 把一个 SSE 事件 reduce 进 Turn，返回新 Turn（不可变）。
  */
 export function reduceSseEvent(turn: Turn, event: SseEvent): Turn {
+  // cancelled turn 不再处理后续事件（change clarify-choice-inspector-cancel）：
+  // 避免 abort 后已 buffer 的事件继续往 timeline 追加节点（"点停止后又接着跑"）
+  if (turn.status === 'cancelled') {
+    return turn;
+  }
   // 记录 server query_id（仅日志，不改主键）
   const next: Turn = { ...turn, queryId: event.data.query_id ?? turn.queryId };
   let timeline = next.timeline;
@@ -426,6 +431,8 @@ export function reduceSseEvent(turn: Turn, event: SseEvent): Turn {
         question: d.question,
         ambiguities: d.ambiguities,
         round: d.round,
+        kind: d.kind ?? null,
+        options: d.options ?? [],
       };
       next.status = 'awaiting_clarification';
       timeline = upsert(timeline, 'clarify', {
@@ -478,7 +485,7 @@ export function reduceSseEvent(turn: Turn, event: SseEvent): Turn {
       };
       if (d.awaiting_clarification) {
         next.status = 'awaiting_clarification';
-      } else if (next.status !== 'error') {
+      } else if (next.status !== 'error' && next.status !== 'cancelled') {
         next.status = 'done';
       }
       break;

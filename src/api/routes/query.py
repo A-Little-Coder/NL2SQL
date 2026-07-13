@@ -20,10 +20,11 @@ import asyncio
 import contextvars
 import json
 import os
+import threading
 from typing import Any, AsyncGenerator, Dict
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
 from starlette.responses import StreamingResponse
 
@@ -31,11 +32,13 @@ from src.api.deps import get_db_pool, get_session_manager, get_user_memory
 from src.api.schemas import QueryRequest
 from src.api.streaming import (
     StreamEmitter,
+    current_cancel_event,
     current_emitter,
     current_user_memory,
     current_session_memory,
     current_fix_loop,
 )
+from src.graph.main_graph import CancelRequested
 from src.graph.state import create_initial_state
 
 
@@ -98,6 +101,7 @@ def _with_qid(data: Dict[str, Any], query_id: str) -> Dict[str, Any]:
 @router.post("/query")
 async def query_endpoint(
     body: QueryRequest,
+    request: Request,
     pool=Depends(get_db_pool),
     session_manager=Depends(get_session_manager),
 ):
@@ -173,6 +177,10 @@ async def query_endpoint(
         # 累积 graph.stream 的 update（用于事后构造 result/done 事件）
         accumulated: Dict[str, Any] = {}
 
+        # 取消信号（change clarify-choice-inspector-cancel）：后台线程在节点边界检查；
+        # 客户端断开时 event_stream 置位，run_graph 在当前节点完成后退出
+        cancel_event = threading.Event()
+
         def run_graph() -> None:
             """在线程中执行 graph.stream，每个 update 推 graph_update 内部事件"""
             # §8.1.7：构造 LangSmith config（路径 A 之上的请求级追踪）
@@ -195,6 +203,7 @@ async def query_endpoint(
             um_token = current_user_memory.set(user_memory)
             sm_token = current_session_memory.set(session)
             fl_token = current_fix_loop.set(db_ctx.fix_loop) if db_ctx.fix_loop else None
+            ce_token = current_cancel_event.set(cancel_event)
             try:
                 # 决策 12：resume 请求用 Command(resume=...) 恢复挂起的图；首次用 initial_state
                 from langgraph.types import Command
@@ -209,6 +218,9 @@ async def query_endpoint(
                                 "question": clarify_ctx.get("question", "") if isinstance(clarify_ctx, dict) else str(clarify_ctx),
                                 "ambiguities": clarify_ctx.get("ambiguities", []) if isinstance(clarify_ctx, dict) else [],
                                 "round": clarify_ctx.get("round", 1) if isinstance(clarify_ctx, dict) else 1,
+                                # 结构化反问（change clarify-choice-inspector-cancel）
+                                "kind": clarify_ctx.get("kind") if isinstance(clarify_ctx, dict) else None,
+                                "options": clarify_ctx.get("options", []) if isinstance(clarify_ctx, dict) else [],
                                 "awaiting_answer": True,
                             })
                         accumulated["__interrupted__"] = True
@@ -217,6 +229,12 @@ async def query_endpoint(
                     for _, node_output in update.items():
                         if isinstance(node_output, dict):
                             accumulated.update(node_output)
+                    # 节点边界取消检查（change clarify-choice-inspector-cancel）
+                    if cancel_event.is_set():
+                        logger.info(f"[query_id={query_id}] 收到取消信号，在节点边界退出 graph.stream")
+                        break
+            except CancelRequested:
+                logger.info(f"[query_id={query_id}] 图被取消（节点边界终止）")
             except Exception as e:
                 logger.exception(f"[query_id={query_id}] graph.stream 异常")
                 emitter.emit("error", {"error": str(e)})
@@ -226,6 +244,7 @@ async def query_endpoint(
                 current_session_memory.reset(sm_token)
                 if fl_token is not None:
                     current_fix_loop.reset(fl_token)
+                current_cancel_event.reset(ce_token)
                 # sentinel 表示线程结束
                 try:
                     loop.call_soon_threadsafe(queue.put_nowait, sentinel)
@@ -248,6 +267,11 @@ async def query_endpoint(
                         queue.get(), timeout=_HEARTBEAT_INTERVAL
                     )
                 except asyncio.TimeoutError:
+                    # 客户端断开检测（change clarify-choice-inspector-cancel）
+                    if await request.is_disconnected():
+                        logger.info(f"[query_id={query_id}] 心跳时检测到客户端断开，触发取消")
+                        cancel_event.set()
+                        break
                     # 心跳：SSE 注释行
                     yield ": heartbeat\n\n"
                     continue
@@ -259,13 +283,24 @@ async def query_endpoint(
                 try:
                     yield _format_sse(evt["type"], evt.get("data", {}))
                 except Exception as e:
-                    logger.warning(f"序列化 SSE 事件失败: {e}, evt={evt}")
+                    # yield 发送失败 = 客户端已断开（change clarify-choice-inspector-cancel）：
+                    # 旧逻辑仅 warning 会吞掉断连异常、循环继续 yield，子图继续跑。
+                    # 改为触发 cancel_event，让后台线程在节点边界退出
+                    logger.info(f"[query_id={query_id}] SSE 发送失败（客户端可能断开），触发取消: {e}")
+                    cancel_event.set()
+                    break
 
             # 等待后台任务结束（拿异常）
             try:
                 await task
             except Exception as e:
                 yield _format_sse("error", _with_qid({"error": str(e)}, query_id))
+
+            # 取消时跳过 result/done 推送（连接已断，无人接收），直接结束生成器（change clarify-choice-inspector-cancel）
+            # finally 仍会执行 cancel_event.set() 与 pool.release()
+            if cancel_event.is_set():
+                logger.info(f"[query_id={query_id}] 已取消，跳过 result/done 推送")
+                return
 
             # 推送最终 result（反问挂起时不推 result/rejection，前端已收 clarification 事件，等 resume）
             if accumulated.get("__interrupted__"):
@@ -329,7 +364,14 @@ async def query_endpoint(
                 f"decision_path={done_payload['decision_path']!r}"
             )
 
+        except (asyncio.CancelledError, GeneratorExit):
+            # 客户端断开时 Starlette 取消生成器（change clarify-choice-inspector-cancel）
+            logger.info(f"[query_id={query_id}] SSE 生成器被取消（客户端断开），触发后台线程取消")
+            cancel_event.set()
+            raise
         finally:
+            # 兜底置位 cancel_event，确保后台线程在节点边界退出（change clarify-choice-inspector-cancel）
+            cancel_event.set()
             # 无论如何 release（refcount -= 1）
             try:
                 pool.release(body.db_id)
