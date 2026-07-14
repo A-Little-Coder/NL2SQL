@@ -42,6 +42,9 @@ conda-env.yaml
 # Memory runtime data (chroma 向量库 / 用户记忆 / 会话存储，运行时生成，自动重建)
 /memory/
 
+# Event cache (展示层事件流缓存，change session-restore-event-cache，运行时生成)
+/event_cache/
+
 # Vector store
 vector_store/
 

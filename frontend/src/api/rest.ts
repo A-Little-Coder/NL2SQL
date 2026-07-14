@@ -12,6 +12,7 @@ import type {
   HealthResponse,
   MetricDefinitionResponse,
   SessionHistoryResponse,
+  SessionListPageResponse,
   SessionListResponse,
   TableListResponse,
   UserMemoryResponse,
@@ -75,9 +76,9 @@ export const createSession = (body: CreateSessionRequest) =>
   });
 
 /** GET /api/v1/sessions?user_id=xxx —— 列出用户会话（updated_at 降序） */
-export const listSessions = (userId: string) =>
-  request<SessionListResponse>(
-    `${BASE}/sessions?user_id=${encodeURIComponent(userId)}`,
+export const listSessions = (userId: string, page: number = 0, size: number = 20) =>
+  request<SessionListPageResponse>(
+    `${BASE}/sessions?user_id=${encodeURIComponent(userId)}&page=${page}&size=${size}`,
   );
 
 /** GET /api/v1/sessions/{id}/history?user_id=xxx —— 获取会话历史轮次 */

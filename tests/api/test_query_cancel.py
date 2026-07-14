@@ -43,6 +43,7 @@ def patched_app(tmp_path, monkeypatch):
             return {}
 
     monkeypatch.setattr(deps, "_session_manager", sm)
+    monkeypatch.setattr(deps, "_event_cache", MagicMock())
     monkeypatch.setattr(
         deps, "_globals", MagicMock(data_dir=str(tmp_path), memory_dir=str(tmp_path / "memory"))
     )

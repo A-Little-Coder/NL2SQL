@@ -28,7 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
 from starlette.responses import StreamingResponse
 
-from src.api.deps import get_db_pool, get_session_manager, get_user_memory
+from src.api.deps import get_db_pool, get_event_cache, get_session_manager, get_user_memory
 from src.api.schemas import QueryRequest
 from src.api.streaming import (
     StreamEmitter,
@@ -43,11 +43,10 @@ from src.graph.state import create_initial_state
 
 
 def _should_write_session_turn(accumulated: Dict[str, Any]) -> bool:
-    """判断本次请求是否应写入会话历史（fix-keyword-history-pollution）
+    """判断本次请求是否应写入会话历史
 
-    以下情况写入会话：
-    1. 非反问挂起且产出了最终 SQL 且非 SmartFix 失败
-    2. Rewrite 拒答（有 rewrite_rejection_reason）时也写入，供后续轮次理解
+    所有非反问挂起的轮次均写入（包括失败/拒答轮次），
+    写入时附带 reuse_eligible 标记供消费方读时过滤。
 
     Args:
         accumulated: graph.stream 累积的最终 state 片段
@@ -57,10 +56,7 @@ def _should_write_session_turn(accumulated: Dict[str, Any]) -> bool:
     """
     if accumulated.get("__interrupted__"):
         return False
-    # Rewrite 拒答也写入会话历史
-    if accumulated.get("rewrite_rejection_reason"):
-        return True
-    return bool(accumulated.get("final_sql")) and not accumulated.get("fix_failed")
+    return True
 
 router = APIRouter()
 
@@ -104,6 +100,7 @@ async def query_endpoint(
     request: Request,
     pool=Depends(get_db_pool),
     session_manager=Depends(get_session_manager),
+    event_cache=Depends(get_event_cache),
 ):
     """核心查询接口 — SSE 流式响应（决策 50）
 
@@ -176,6 +173,14 @@ async def query_endpoint(
 
         # 累积 graph.stream 的 update（用于事后构造 result/done 事件）
         accumulated: Dict[str, Any] = {}
+        # D2: 捕获所有已发出的 SSE 事件，turn done 时写入 event_cache 供前端重放恢复
+        captured_events: list = []
+        # D5: 新查询（非 resume）开始时清除旧反问暂存（放弃未完成的 pending）
+        if not is_resume:
+            try:
+                event_cache.clear_pending(body.user_id, body.session_id)
+            except Exception as e:
+                logger.warning(f"[query_id={query_id}] event_cache clear_pending 失败: {e}")
 
         # 取消信号（change clarify-choice-inspector-cancel）：后台线程在节点边界检查；
         # 客户端断开时 event_stream 置位，run_graph 在当前节点完成后退出
@@ -281,7 +286,10 @@ async def query_endpoint(
 
                 # 普通事件
                 try:
-                    yield _format_sse(evt["type"], evt.get("data", {}))
+                    evt_type = evt["type"]
+                    evt_data = evt.get("data", {})
+                    captured_events.append({"type": evt_type, "data": evt_data})
+                    yield _format_sse(evt_type, evt_data)
                 except Exception as e:
                     # yield 发送失败 = 客户端已断开（change clarify-choice-inspector-cancel）：
                     # 旧逻辑仅 warning 会吞掉断连异常、循环继续 yield，子图继续跑。
@@ -305,15 +313,27 @@ async def query_endpoint(
             # 推送最终 result（反问挂起时不推 result/rejection，前端已收 clarification 事件，等 resume）
             if accumulated.get("__interrupted__"):
                 logger.info(f"[query_id={query_id}] 反问挂起，等待用户回答（resume）")
+                # D5: 暂存 query 阶段事件流到 pending，等 resume 完成时合并为完整 turn
+                try:
+                    event_cache.store_turn_events(
+                        body.user_id, body.session_id, captured_events,
+                        is_pending=True, user_query=body.query,
+                    )
+                except Exception as e:
+                    logger.warning(f"[query_id={query_id}] event_cache 暂存 pending 失败: {e}")
             else:
                 rejection = accumulated.get("rejection_reason")
                 if rejection:
-                    yield _format_sse("error", _with_qid({"error": rejection, "rejection": True}, query_id))
+                    err_data = _with_qid({"error": rejection, "rejection": True}, query_id)
+                    captured_events.append({"type": "error", "data": err_data})
+                    yield _format_sse("error", err_data)
                 elif accumulated.get("final_sql"):
-                    yield _format_sse("result", _with_qid({
+                    res_data = _with_qid({
                         "sql": accumulated["final_sql"],
                         "result": _serialize(accumulated.get("final_result")),
-                    }, query_id))
+                    }, query_id)
+                    captured_events.append({"type": "result", "data": res_data})
+                    yield _format_sse("result", res_data)
 
             # 更新会话历史
             # 更新会话历史（反问挂起时跳过，等 resume 完成后再写）
@@ -326,6 +346,9 @@ async def query_endpoint(
                         "final_sql": accumulated.get("final_sql", ""),
                         "cache_hit": accumulated.get("cache_hit", False),
                         "db_id": body.db_id,
+                        "reuse_eligible": bool(accumulated.get("final_sql"))
+                                         and not accumulated.get("fix_failed")
+                                         and not accumulated.get("rejection_reason"),
                     }
                     if accumulated.get("error"):
                         turn_data["error"] = accumulated["error"]
@@ -355,6 +378,17 @@ async def query_endpoint(
                 "fix_rounds_used": accumulated.get("fix_rounds_used", 0),
                 "last_error": accumulated.get("last_error"),
             }, query_id)
+            # D2/D5: turn 完成写入 event_cache 事件流（含 done；resume 场景自动合并 pending）
+            # 在 yield done 之前执行，确保即使客户端收到 done 后断开也能落盘
+            captured_events.append({"type": "done", "data": done_payload})
+            if _should_write_session_turn(accumulated):
+                try:
+                    event_cache.store_turn_events(
+                        body.user_id, body.session_id, captured_events,
+                        is_pending=False, user_query=body.query,
+                    )
+                except Exception as e:
+                    logger.warning(f"[query_id={query_id}] event_cache 写入事件流失败: {e}")
             yield _format_sse("done", done_payload)
 
             logger.info(

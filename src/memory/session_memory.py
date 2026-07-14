@@ -75,6 +75,7 @@ class SessionMemory:
         "result_meta",          # 仅元信息（行数、列名），不含真实数据
         "clarification_round",  # Phase 2 反问轮次
         "final_result_sample",  # Prompt 展示用样例（测试 / Phase 2）
+        "reuse_eligible",       # 该轮 SQL 是否可被 history_cache 复用
     }
 
     def add_turn(self, turn_data: Dict[str, Any]):

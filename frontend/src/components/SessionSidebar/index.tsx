@@ -16,7 +16,7 @@
  * store 依赖：sessions / currentSessionId / userId / setSessions / setCurrentSessionId / setHistoryTurns
  * api 依赖：listSessions / createSession / getSessionHistory / deleteSession
  */
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, type UIEvent } from 'react';
 import {
   Button,
   Empty,
@@ -30,7 +30,7 @@ import {
 } from 'antd';
 import { DeleteOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import { createSession, deleteSession, getSessionHistory, listSessions } from '@/api/rest';
-import type { ErrorResponse, SessionSummary } from '@/api/types';
+import type { ErrorResponse, SessionEventsTurn, SessionSummary, SessionTurn } from '@/api/types';
 import { useChatStore } from '@/store/useChatStore';
 
 const { Text } = Typography;
@@ -80,30 +80,66 @@ export default function SessionSidebar() {
   const setSessions = useChatStore((s) => s.setSessions);
   const setCurrentSessionId = useChatStore((s) => s.setCurrentSessionId);
   const setHistoryTurns = useChatStore((s) => s.setHistoryTurns);
+  const setTurnsFromEvents = useChatStore((s) => s.setTurnsFromEvents);
+  const cacheCurrentTurns = useChatStore((s) => s.cacheCurrentTurns);
+  const loadCachedTurns = useChatStore((s) => s.loadCachedTurns);
 
   // ---- 本地加载态 ----
   const [loadingList, setLoadingList] = useState(false);
   const [creating, setCreating] = useState(false);
   const [loadingHistoryId, setLoadingHistoryId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  // D9: 分页惰性加载状态（按 shard，每页 ≤20 会话）
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
 
   /** 拉取会话列表（user_id 变化或手动刷新时调用） */
   const refreshSessions = useCallback(
     async (uid: string) => {
       setLoadingList(true);
       try {
-        const res = await listSessions(uid);
+        const res = await listSessions(uid, 0);
         setSessions(res.sessions ?? []);
+        setPage(0);
+        setHasMore(res.has_more ?? false);
       } catch (err) {
         const msg = err instanceof Error ? err.message : '加载会话列表失败';
         message.error(msg);
         setSessions([]);
+        setHasMore(false);
       } finally {
         setLoadingList(false);
       }
     },
     [setSessions],
   );
+
+  /** D9: 加载下一页（滚动到底触发） */
+  const loadMore = useCallback(async () => {
+    if (loadingMore || !hasMore) return;
+    setLoadingMore(true);
+    try {
+      const nextPage = page + 1;
+      const res = await listSessions(userId, nextPage);
+      setSessions([...sessions, ...(res.sessions ?? [])]);
+      setPage(nextPage);
+      setHasMore(res.has_more ?? false);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '加载更多会话失败';
+      message.error(msg);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [userId, page, hasMore, loadingMore, sessions, setSessions]);
+
+  /** D9: 列表滚动到底触发加载下一页 */
+  const handleScroll = (e: UIEvent<HTMLDivElement>) => {
+    const { scrollTop, clientHeight, scrollHeight } = e.currentTarget;
+    if (scrollHeight - scrollTop - clientHeight < 50) {
+      loadMore();
+    }
+  };
 
   // userId 变化时重新拉取会话列表
   useEffect(() => {
@@ -115,6 +151,8 @@ export default function SessionSidebar() {
     setCreating(true);
     try {
       const res = await createSession({ user_id: userId });
+      // D7: 缓存当前会话 turns 后再切换
+      if (currentSessionId) cacheCurrentTurns(currentSessionId);
       setCurrentSessionId(res.session_id);
       // 新建后清空当前对话区轮次（避免显示上一会话历史）
       setHistoryTurns([]);
@@ -126,13 +164,20 @@ export default function SessionSidebar() {
     } finally {
       setCreating(false);
     }
-  }, [userId, setCurrentSessionId, setHistoryTurns, refreshSessions]);
+  }, [userId, currentSessionId, cacheCurrentTurns, setCurrentSessionId, setHistoryTurns, refreshSessions]);
 
   /** 点击会话项：加载历史轮次到对话区 + 切换 currentSessionId */
   const handleSelect = useCallback(
     async (sessionId: string) => {
       // 点击当前已选中会话不重复加载
       if (sessionId === currentSessionId) return;
+      // D7: 切换前缓存当前会话 turns（含完整行数据）
+      if (currentSessionId) cacheCurrentTurns(currentSessionId);
+      // D7: 切回优先用内存缓存（完整行兜底）
+      if (loadCachedTurns(sessionId)) {
+        setCurrentSessionId(sessionId);
+        return;
+      }
       setLoadingHistoryId(sessionId);
       try {
         const res = await getSessionHistory(sessionId, userId);
@@ -140,7 +185,12 @@ export default function SessionSidebar() {
           message.error(res.error || '加载历史失败');
           return;
         }
-        setHistoryTurns(res.turns ?? []);
+        // D2: 按 source 区分事件流重放（新会话）/ 摘要简化重建（老会话）
+        if (res.source === 'events' && res.has_events) {
+          setTurnsFromEvents(res.turns as SessionEventsTurn[]);
+        } else {
+          setHistoryTurns((res.turns as SessionTurn[]) ?? []);
+        }
         setCurrentSessionId(sessionId);
       } catch (err) {
         const msg = err instanceof Error ? err.message : '加载历史失败';
@@ -149,7 +199,7 @@ export default function SessionSidebar() {
         setLoadingHistoryId(null);
       }
     },
-    [userId, currentSessionId, setHistoryTurns, setCurrentSessionId],
+    [userId, currentSessionId, cacheCurrentTurns, loadCachedTurns, setTurnsFromEvents, setHistoryTurns, setCurrentSessionId],
   );
 
   /** 删除会话：成功后从 sessions 移除；若删的是当前会话则切首个或清空 */
@@ -174,7 +224,11 @@ export default function SessionSidebar() {
             try {
               const hist = await getSessionHistory(next.session_id, userId);
               if (!isErrorResponse(hist)) {
-                setHistoryTurns(hist.turns ?? []);
+                if (hist.source === 'events' && hist.has_events) {
+                  setTurnsFromEvents(hist.turns as SessionEventsTurn[]);
+                } else {
+                  setHistoryTurns((hist.turns as SessionTurn[]) ?? []);
+                }
                 setCurrentSessionId(next.session_id);
               } else {
                 setCurrentSessionId(null);
@@ -199,7 +253,7 @@ export default function SessionSidebar() {
         setDeletingId(null);
       }
     },
-    [userId, sessions, currentSessionId, setSessions, setCurrentSessionId, setHistoryTurns],
+    [userId, sessions, currentSessionId, setSessions, setCurrentSessionId, setHistoryTurns, setTurnsFromEvents],
   );
 
   // ---- 渲染 ----
@@ -226,7 +280,7 @@ export default function SessionSidebar() {
       </div>
 
       {/* 列表区：加载态 / 空态 / 列表 */}
-      <div style={{ flex: 1, overflow: 'auto' }}>
+      <div style={{ flex: 1, overflow: 'auto' }} onScroll={handleScroll}>
         {loadingList && sessions.length === 0 ? (
           <div style={{ textAlign: 'center', padding: 24 }}>
             <Spin tip="加载会话列表…" />
@@ -313,6 +367,11 @@ export default function SessionSidebar() {
               );
             }}
           />
+        )}
+        {loadingMore && (
+          <div style={{ textAlign: 'center', padding: 12 }}>
+            <Spin size="small" tip="加载更多…" />
+          </div>
         )}
       </div>
     </div>

@@ -83,6 +83,7 @@ def patched_app(tmp_path, monkeypatch):
 
     # 注入到 deps
     monkeypatch.setattr(deps, "_session_manager", sm)
+    monkeypatch.setattr(deps, "_event_cache", MagicMock())
     monkeypatch.setattr(deps, "_db_pool", mock_pool)
     monkeypatch.setattr(deps, "_globals", MagicMock(data_dir=str(tmp_path), memory_dir=str(tmp_path / "memory")))
     monkeypatch.setattr(deps, "_user_memory_cache", {})

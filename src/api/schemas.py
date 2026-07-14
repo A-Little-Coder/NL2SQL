@@ -65,9 +65,24 @@ class SessionSummary(BaseModel):
 
 
 class SessionHistoryResponse(BaseModel):
-    """会话历史响应"""
+    """会话历史响应
+
+    source="events"：turns 为事件流形态 [{turn_index, events:[...]}]（新会话，前端重放还原完整 Turn）
+    source="summary"：turns 为摘要形态 SessionTurn[]（老会话回落 session_memory，前端简化重建）
+    """
     session_id: str
     turns: List[Dict[str, Any]]
+    source: str = "summary"
+    has_events: bool = False
+
+
+class SessionListPageResponse(BaseModel):
+    """会话列表分页响应（按 shard 分页，每页 ≤20 会话，最新 shard 在前）"""
+    user_id: str
+    page: int
+    size: int
+    has_more: bool
+    sessions: List[SessionSummary]
 
 
 class UserMemoryResponse(BaseModel):

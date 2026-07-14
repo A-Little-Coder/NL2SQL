@@ -183,7 +183,13 @@ def make_history_cache_node(history_cache) -> Callable[[NL2SQLState], Dict[str, 
             )
 
         recalled_history = [ref.to_turn() for ref in recalled_refs]
-        check_history = recalled_history or conversation_history
+        # fallback 路径过滤：仅 reuse_eligible=True 的轮次可作复用候选
+        # 旧数据缺 reuse_eligible 字段时按 bool(final_sql) 推导（旧闸门下 final_sql 非空即成功）
+        eligible_turns = [
+            t for t in conversation_history
+            if t.get("reuse_eligible", bool(t.get("final_sql")))
+        ]
+        check_history = recalled_history or eligible_turns
 
         result = history_cache.check(
             user_query=state["user_query"],

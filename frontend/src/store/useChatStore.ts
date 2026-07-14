@@ -9,6 +9,7 @@ import { create } from 'zustand';
 import type {
   DatabaseInfo,
   MetricDefinitionResponse,
+  SessionEventsTurn,
   SessionSummary,
   SessionTurn,
   SseEvent,
@@ -46,6 +47,8 @@ interface ChatState {
   currentSessionId: string | null;
   // ---- 轮次（当前会话）----
   turns: Turn[];
+  /** 按会话缓存的 turns（D7，同次会话内切回用完整行兜底） */
+  turnsBySession: Record<string, Turn[]>;
   /** 检查器锁定的 turnId（change clarify-choice-inspector-cancel）；null=自动跟随最新 turn */
   inspectorTurnId: string | null;
   // ---- 用户记忆 ----
@@ -79,11 +82,17 @@ interface ChatState {
   releaseInspector: () => void;
   /** 用户取消在途请求：Turn 进 cancelled 终态，时间轴追加"用户已取消"节点（change clarify-choice-inspector-cancel） */
   cancelTurn: (turnId: string) => void;
-  /** 从会话历史 SessionTurn[] 构造 Turn[]（简化：仅 userQuery/finalSql/result） */
+  /** 从会话历史 SessionTurn[] 构造 Turn[]（简化：仅 userQuery/finalSql/result；老会话摘要回落） */
   setHistoryTurns: (turns: SessionTurn[]) => void;
+  /** 从事件流重放还原 Turn[]（D2，新会话；reducer 零改动） */
+  setTurnsFromEvents: (turns: SessionEventsTurn[]) => void;
+  /** 缓存当前会话的 turns（D7，切换离开前调用） */
+  cacheCurrentTurns: (sessionId: string) => void;
+  /** 从缓存加载会话 turns，返回是否命中（D7，切回时优先调用） */
+  loadCachedTurns: (sessionId: string) => boolean;
 }
 
-export const useChatStore = create<ChatState>((set) => ({
+export const useChatStore = create<ChatState>((set, get) => ({
   userId: 'default',
   viewMode: 'chat',
   dbList: [],
@@ -91,6 +100,7 @@ export const useChatStore = create<ChatState>((set) => ({
   sessions: [],
   currentSessionId: null,
   turns: [],
+  turnsBySession: {},
   inspectorTurnId: null,
   userMemory: null,
   userMetrics: null,
@@ -202,4 +212,31 @@ export const useChatStore = create<ChatState>((set) => ({
         return turn;
       }),
     }),
+
+  setTurnsFromEvents: (eventsTurns) => {
+    const turns: Turn[] = eventsTurns.map((et): Turn => {
+      const turn = createTurn(`history-${et.turn_index}`, et.user_query ?? '');
+      const reduced = et.events.reduce((t, evt) => reduceSseEvent(t, evt), turn);
+      // D4: 检测 result 事件存储侧截断标记（__truncated__），供 ResultTable 显示"历史快照·前20行"提示
+      const resultTruncated = et.events.some(
+        (e) => e.type === 'result' && (e.data as Record<string, unknown> | undefined)?.__truncated__,
+      );
+      return { ...reduced, resultTruncated };
+    });
+    set({ turns, inspectorTurnId: null });
+  },
+
+  cacheCurrentTurns: (sessionId) =>
+    set((state) => ({
+      turnsBySession: { ...state.turnsBySession, [sessionId]: state.turns },
+    })),
+
+  loadCachedTurns: (sessionId) => {
+    const cached = get().turnsBySession[sessionId];
+    if (cached) {
+      set({ turns: cached, inspectorTurnId: null });
+      return true;
+    }
+    return false;
+  },
 }));

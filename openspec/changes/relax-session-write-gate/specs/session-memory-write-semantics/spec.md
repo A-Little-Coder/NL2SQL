@@ -6,9 +6,9 @@
 触发条件：所有非反问挂起的轮次均写入，写入时附带 `reuse_eligible` 标记，消费方按需读时过滤。
 被拒答或未产出 SQL 的轮次仍写入（改写模块需要可见），但标记为 `reuse_eligible=False`。
 
-## Requirements
+## MODIFIED Requirements
 
-### Requirement: Unsuccessful Turns Written to Session
+### Requirement: Unsuccessful Turns Not Written to Session
 API 路由在请求完成后写会话历史（`session.add_turn`）时，SHALL **写入所有轮次**（除反问挂起外），
 写入时 SHALL 计算并附加 `reuse_eligible` 标记。
 写入条件：`__interrupted__` 为假（反问挂起不写，等 resume 完成后再写完整轮次）。
@@ -39,7 +39,7 @@ API 路由在请求完成后写会话历史（`session.add_turn`）时，SHALL *
 - **WHEN** 请求触发反问 interrupt（`accumulated.__interrupted__` 为真）
 - **THEN** 该请求 SHALL NOT 调用 `session.add_turn`（行为与变更前一致）
 
-### Requirement: Consumers Filter by reuse_eligible
+### Requirement: No Impact to History Consumers
 会话历史消费方（task_planner 的 follow-up 理解、memory_updater 的记忆学习、history_cache 的历史 SQL 复用）SHALL 按 `reuse_eligible` 读时过滤，而非依赖写时拦截。`reuse_eligible=False` 的轮次 SHALL NOT 被 history_cache 纳入复用候选。改写模块（Rewrite 子图）SHALL 能看到所有轮次（含 `reuse_eligible=False`），用于指代消解。
 
 #### Scenario: history_cache 过滤不可复用轮次

@@ -35,6 +35,7 @@ from src.memory.session_recall import (
     SessionRecallConfig,
 )
 from src.memory.session_manager import SessionManager
+from src.memory.event_cache import EventCacheStore
 from src.memory.user_memory import UserMemory
 from src.preprocessing.schema_vectorizer import SchemaVectorizer
 from src.preprocessing.vector_store import VectorStoreManager
@@ -51,6 +52,7 @@ from utils.llm_client import LLMClient
 _globals: Optional[Globals] = None
 _session_manager: Optional[SessionManager] = None
 _db_pool: Optional[DbContextPool] = None
+_event_cache: Optional[EventCacheStore] = None
 
 # UserMemory 进程级 LRU
 _user_memory_cache: Dict[str, UserMemory] = {}
@@ -69,7 +71,7 @@ def init_globals(data_dir: Optional[str] = None) -> None:
     Args:
         data_dir: data/ 根目录绝对路径。None 时取项目根的 data/。
     """
-    global _globals, _session_manager, _db_pool
+    global _globals, _session_manager, _db_pool, _event_cache
 
     if data_dir is None:
         # 默认项目根的 data/
@@ -143,6 +145,11 @@ def init_globals(data_dir: Optional[str] = None) -> None:
         max_cache_size=200,
     )
 
+    # 5.5 展示存储层（event_cache，独立于复用层 data/sessions，服务前端展示恢复）
+    _event_cache = EventCacheStore(
+        base_dir=str(Path(__file__).parent.parent.parent / "event_cache"),
+    )
+
     # 6. 反问机制（Rewrite 子图 v2 接管反问，此处只初始化 TaskDecomposer 和 ResultSummarizer）
     task_decomposer = None
     dialog_manager = None  # 保留参数兼容，v2 不再使用
@@ -190,12 +197,13 @@ def init_globals(data_dir: Optional[str] = None) -> None:
 
 def shutdown_globals() -> None:
     """lifespan shutdown 钩子：释放所有 DbContext"""
-    global _db_pool, _globals, _session_manager
+    global _db_pool, _globals, _session_manager, _event_cache
     if _db_pool is not None:
         _db_pool.close_all()
     _db_pool = None
     _globals = None
     _session_manager = None
+    _event_cache = None
     _user_memory_cache.clear()
 
 
@@ -219,6 +227,13 @@ def get_session_manager() -> SessionManager:
     if _session_manager is None:
         raise RuntimeError("SessionManager 未初始化，请先调用 init_globals()")
     return _session_manager
+
+
+def get_event_cache() -> EventCacheStore:
+    """展示存储层单例（服务前端会话切换恢复）"""
+    if _event_cache is None:
+        raise RuntimeError("EventCacheStore 未初始化，请先调用 init_globals()")
+    return _event_cache
 
 
 def get_user_memory(user_id: str) -> UserMemory:

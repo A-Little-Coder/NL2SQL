@@ -216,6 +216,16 @@ SessionMemory v2 的 demo 存储实现为：
 | Conversation Store | `data/session_memory_v2/` JSON 文件 | 存 query/final_sql 等无结果历史对话 |
 | 融合排序 | 本地 RRF | 允许单路召回，最终按 RRF 阈值过滤 |
 
+### 展示存储层（event_cache）
+
+除复用层 SessionMemory 外，系统另有独立的**展示存储层** `event_cache/`（与 `data/` 平级），服务前端会话切换后的展示恢复：
+
+- 按 `{user_id}/shard_xxxx/{session_id}.json` 三级组织，按会话 `created_at` 分片，每 shard 目录 ≤20 会话。
+- 每会话一文件存该会话全部 turn 的 **SSE 事件流**；前端切换会话再切回时，将事件流喂给 `reduceSseEvent` 重放，还原完整 Turn（时间轴/候选/决策/结果/检查器细节）。
+- `result` 事件行数据存储层截断为前 20 行（实时推送仍为完整行）；前端同次会话内切回优先用内存缓存（完整行），刷新/重开走重放（20 行 + "历史快照"提示）。
+- 与 `SessionMemory` 复用层物理分离，`history_cache` 复用判断与混合召回零影响。
+- 老会话（无事件流）回落 `SessionMemory` 摘要简化重建。
+
 相关配置：
 
 | 环境变量 | 默认值 | 说明 |

@@ -36,6 +36,12 @@ export default function ResultTable({ turn }: { turn: Turn }) {
     <div style={{ marginTop: 12 }}>
       {/* SQL 代码块置于表格上方 */}
       <SqlBlock sql={sql} />
+      {/* D4: 历史重放来源且结果被截断为 20 行时提示 */}
+      {turn.resultTruncated && (
+        <div style={{ margin: '8px 0', fontSize: 12, color: '#faad14' }}>
+          历史快照·前20行 · 数据可能已变更，如需最新结果请重新查询
+        </div>
+      )}
       {/* 结果表格，分页默认 10/页；空结果显示"无数据" */}
       <Table<Record<string, unknown>>
         columns={columns}

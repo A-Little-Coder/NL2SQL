@@ -185,6 +185,8 @@ export interface Turn {
   thinking: Record<string, string>;
   /** 最终结果 */
   result: { sql: string; rows: Record<string, unknown>[] } | null;
+  /** D4: 历史重放来源且结果行被截断为 20 行（存储侧标记），供 ResultTable 显示快照提示 */
+  resultTruncated?: boolean;
   /** 状态机 */
   status: TurnStatus;
   /** 检查器当前显示节点，null=自动跟随最新（D5） */

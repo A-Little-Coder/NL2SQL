@@ -67,16 +67,26 @@ export interface SessionSummary {
   turn_count: number;
 }
 
-/** 会话列表响应（GET /api/v1/sessions?user_id=xxx） */
+/** 会话列表响应（GET /api/v1/sessions?user_id=xxx，旧全量形态，保留兼容） */
 export interface SessionListResponse {
   user_id: string;
   sessions: SessionSummary[];
 }
 
+/** 会话列表分页响应（GET /api/v1/sessions?user_id=xxx&page=0&size=20，按 created_at 分片，最新 shard 在前） */
+export interface SessionListPageResponse {
+  user_id: string;
+  page: number;
+  size: number;
+  has_more: boolean;
+  sessions: SessionSummary[];
+}
+
 /**
- * 会话历史单轮（GET /api/v1/sessions/{id}/history 中的 turns 元素）
+ * 会话历史单轮（GET /api/v1/sessions/{id}/history 中 source="summary" 的 turns 元素）
  *
  * 后端 turn_data 结构（见 query.py session.add_turn）：宽松类型，字段非全部必填。
+ * 老会话回落 session_memory 摘要时用此形态，前端简化重建。
  */
 export interface SessionTurn {
   user_query?: string;
@@ -90,10 +100,28 @@ export interface SessionTurn {
   [key: string]: unknown;
 }
 
-/** 会话历史响应 */
+/**
+ * 会话历史事件流单轮（source="events" 的 turns 元素）
+ *
+ * 新会话走 event_cache 事件流，前端 reduceSseEvent 重放还原完整 Turn。
+ * events 为该 turn 发出过的全部 SSE 事件序列（result 事件 rows 已截断 20 行）。
+ */
+export interface SessionEventsTurn {
+  turn_index: number;
+  timestamp?: string;
+  /** 用户原始查询（重放时还原对话气泡；resume 场景取 query 阶段的 query） */
+  user_query?: string;
+  events: SseEvent[];
+}
+
+/** 会话历史响应（source 区分事件流 / 摘要两种形态） */
 export interface SessionHistoryResponse {
   session_id: string;
-  turns: SessionTurn[];
+  /** "events"=事件流重放（新会话）；"summary"=摘要简化重建（老会话） */
+  source?: 'events' | 'summary';
+  /** 是否有事件流可重放 */
+  has_events?: boolean;
+  turns: SessionTurn[] | SessionEventsTurn[];
 }
 
 /** 通用错误响应 */

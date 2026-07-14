@@ -29,5 +29,7 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: './tests/setup.ts',
     css: false,
+    // e2e/ 是 Playwright 测试（npm run e2e），不归 vitest 收集
+    exclude: ['node_modules', 'dist', 'e2e'],
   },
 });
