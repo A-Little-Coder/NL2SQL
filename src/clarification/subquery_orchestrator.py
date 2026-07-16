@@ -99,7 +99,7 @@ class SubqueryOrchestrator:
         Returns:
             List[SubqueryResult]：每个子查询的结果（失败隔离，不中断）
         """
-        shared_state = shared_state or {}
+        shared_state = {**(shared_state or {}), "_multi_intent": True}  # 多意图标记：权限节点全无权直接拒答，不反问
         results: List[SubqueryResult] = []
 
         for idx, subq in enumerate(subqueries):

@@ -1,5 +1,7 @@
-## Requirements
+## Purpose
 
+Define the session memory hybrid recall mechanism for indexing and retrieving historical queries with user-scoped isolation.
+## Requirements
 ### Requirement: Session-scoped successful query indexing
 The system SHALL index only successful historical queries for SessionMemory recall. Each indexed query MUST include the original query text, embedding, final SQL, user id, session id, database id, turn id, conversation id, success flag, and creation timestamp.
 
@@ -87,3 +89,11 @@ The system SHALL preserve only historical query and final SQL as weak reference 
 #### Scenario: Weak reference is used by SQL generation
 - **WHEN** SQL generation receives historical SQL references
 - **THEN** it SHALL treat them as optional style or metric references and MUST NOT use tables or columns outside the currently selected schema
+
+### Requirement: 历史复用按 user_id 隔离
+系统 SHALL 在历史缓存向量检索时按 user_id metadata 过滤，仅召回当前用户自己的历史 turn，保证不同用户的历史 SQL 不被交叉复用。
+
+#### Scenario: 跨用户历史不复用
+- **WHEN** 用户 B 发起与用户 A 历史查询相似的问句
+- **THEN** 向量检索仅命中 B 自己的历史，不返回 A 的 SQL 作为缓存复用候选
+

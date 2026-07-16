@@ -72,6 +72,7 @@ class Globals:
     data_dir: str  # data/ 根目录，用于定位 db 文件
     memory_dir: str  # memory/ 根目录，用于定位记忆存储文件
     session_retriever: Any = None
+    policy_store: Any = None  # table-field-acl 权限策略存储
     # 反问机制（决策 9-15）；None 时不启用反问，主图退化为直接 EXECUTE
     task_decomposer: Any = None
     dialog_manager: Any = None
@@ -233,6 +234,7 @@ class DbContextPool:
             fix_loop=fix_loop,
             decider=g.decider,
             answerability_checker=g.answerability_checker,
+            policy_store=g.policy_store,
         )
 
         # 多意图编排器（决策 14）：持有同一 single_query_graph 实例串行编排
@@ -260,6 +262,7 @@ class DbContextPool:
             summarizer=g.summarizer,
             single_query_graph=single_query_graph,
             llm_client=g.llm_client,
+            policy_store=g.policy_store,
         )
 
         return DbContext(

@@ -1,5 +1,7 @@
-## ADDED Requirements
+## Purpose
 
+Define the structured clarification interaction protocol between the NL2SQL backend and frontend, supporting confirm/choice/open kind types with options for permission_choice, cache_confirm, and general clarification scenarios.
+## Requirements
 ### Requirement: clarification 事件携带结构化 kind 与 options
 
 clarification SSE 事件 SHALL 携带 `kind`（`"confirm" | "choice" | "open"`）字段。`kind` 为 `confirm` 或 `choice` 时，事件 SHALL 携带 `options: {label: string, value: string}[]`（至少 2 项）。`kind` 缺失时前端 MUST 按兼容降级为 `"open"` 处理。`ambiguities` 字段保留以向后兼容，`kind` 存在时前端 MUST 以 `kind`/`options` 为渲染权威来源。
@@ -69,3 +71,15 @@ clarification SSE 事件 SHALL 携带 `kind`（`"confirm" | "choice" | "open"`�
 - **WHEN** resume 携带 `user_choice="是"`（旧前端或自定义输入，非 `"yes"`/`"no"`）
 - **THEN** 后端回退字符串集合匹配，`"是"` 命中集合，`approved=true`
 - **AND** 兜底逻辑保证旧客户端仍可复用
+
+### Requirement: permission_choice 反问类型
+系统 SHALL 支持 permission_choice 类型反问，用于权限全无权场景：携带"脱敏继续"与"放弃"两个选项 tag，复用现有 interrupt/resume 机制与前端 tag UI。用户选择后 SHALL 通过 resume 提交 value（mask 或 reject）恢复图执行。
+
+#### Scenario: 全无权弹出脱敏选择 tag
+- **WHEN** 权限节点判定某关键词召回字段全部无权限
+- **THEN** 下发 kind 为 permission_choice 的 clarification 事件，含"脱敏继续""放弃"两个选项
+
+#### Scenario: resume 携带脱敏选择恢复
+- **WHEN** 用户点选"脱敏继续"
+- **THEN** resume 请求携带 value 为 mask，图恢复并按脱敏路径继续执行
+

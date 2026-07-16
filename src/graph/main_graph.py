@@ -1134,6 +1134,7 @@ def build_main_graph(
     summarizer=None,
     single_query_graph=None,
     llm_client=None,
+    policy_store=None,
 ):
     """
     构造并编译 NL2SQL 主图（rewrite-before-cache v2 重构版）
@@ -1170,6 +1171,7 @@ def build_main_graph(
             fix_loop=fix_loop,
             decider=decider,
             answerability_checker=answerability_checker,
+            policy_store=policy_store,
         )
 
     graph = StateGraph(NL2SQLState)
@@ -1188,8 +1190,10 @@ def build_main_graph(
     graph.add_node("cache_confirm", _wrap_node("cache_confirm", make_cache_confirm_node()))
     # 节点：TaskDecomposer 任务拆解（v2 精简版：仅意图拆解，无反问/拒答）
     graph.add_node("task_decomposer", _wrap_node("task_decomposer", make_task_decomposer_node(task_decomposer)))
-    # 节点：单查询流水线（ir/ss/cg/execution/decision 下沉至此，refactor-single-query-graph）
-    graph.add_node("run_single_query", _wrap_node("run_single_query", make_run_single_query_node(single_query_graph)))
+    # 节点：单查询流水线（ir/ss/permission/cg/execution/decision/mask 下沉至 single_query_graph）
+    # 方案 B：single_query_graph 作为 subgraph 节点编译进主图，子图内 interrupt（权限反问）
+    # 被主图 checkpointer 接管，一次跑完；partial state 自动合并回主图
+    graph.add_node("run_single_query", single_query_graph)
 
     # 多意图编排 + 结果总结（决策 14/15）
     graph.add_node("run_subqueries", _wrap_node("run_subqueries", make_run_subqueries_node(orchestrator)))

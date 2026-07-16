@@ -73,6 +73,9 @@ function mapStageNode(node: string): TimelineNodeType | null {
   if (n === 'ss' || n.includes('schema_select') || n === 'schema_finalize' || n.includes('schema_final')) {
     return 'ss';
   }
+  if (n === 'permission') {
+    return 'permission';
+  }
   if (n === 'cg' || n.includes('generation') || n.includes('generate')) {
     return 'cg';
   }
@@ -361,9 +364,30 @@ export function reduceSseEvent(turn: Turn, event: SseEvent): Turn {
       };
       timeline = upsert(timeline, 'answerability', {
         status: 'done',
-        summary: d.answerable
+        summary: d.answerable === 'true'
           ? `可回答 · conf=${fmtConf(d.confidence)}`
           : `不可回答: ${d.reason}`,
+      });
+      break;
+    }
+
+    case 'permission': {
+      const d = event.data;
+      const removedFields = [...(d.removed_fields || [])];
+      const keepFields = [...(d.keep_fields || [])];
+      details = {
+        ...details,
+        permission: { action: d.action, removedFields, keepFields },
+      };
+      const summaryMap: Record<string, string> = {
+        pass: '权限通过',
+        partial_prune: `拦截剔除: ${removedFields.join('、') || '-'}`,
+        full_deny_mask: `脱敏保留: ${keepFields.join('、') || '-'}`,
+        full_deny_reject: `无权拒答: ${keepFields.join('、') || '-'}`,
+      };
+      timeline = upsert(timeline, 'permission', {
+        status: 'done',
+        summary: summaryMap[d.action] || '权限检查',
       });
       break;
     }

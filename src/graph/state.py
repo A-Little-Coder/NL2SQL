@@ -175,6 +175,9 @@ class NL2SQLState(TypedDict, total=False):
     error: Optional[str]
     trace_log: List[str]
 
+    # ===== table-field-acl 权限管理 =====
+    acl_removed_fields: Optional[List[str]]  # 权限剔除的字段（permission 节点产出，供 trace_log/前台展示"拦截字段"）
+
 
 def create_initial_state(
     user_query: str,

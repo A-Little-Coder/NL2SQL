@@ -1,5 +1,7 @@
-## ADDED Requirements
+## Purpose
 
+Define the frontend UI interactions and display requirements for the NL2SQL application, including detail inspector, timeline, and admin panels.
+## Requirements
 ### Requirement: IR 节点按关键词组聚合展示字段与值召回
 
 IR 详情检查器 SHALL 按关键词组逐组展示：每组含 phrase、同义词 terms、召回字段（带 score）、召回值（带 score）。值召回的组归属 MUST 直接使用后端 `schema_recall` 事件中 `keyword_groups[].values`（已由后端 `source_phrase` 归属），前端 MUST NOT 自行按 `table.column` 猜测归属。
@@ -224,3 +226,11 @@ store SHALL 新增顶层 `inspectorTurnId: string | null`（`null` = 自动跟�
 - **WHEN** 用户点击当前已锁定的节点（`selectedNode` 已是该 type）
 - **THEN** `inspectorTurnId=null` 且该 turn `selectedNode=null`
 - **AND** 检查器恢复全自动跟随最新 turn 的最新节点
+
+### Requirement: 权限管理后台页面
+系统 SHALL 在 frontend 工程提供独立 /admin 路由的权限管理后台，支持员工/角色 CRUD 与表/字段黑名单配置（通配模式），配置后对前台问数即时生效。
+
+#### Scenario: 后台配置黑名单即时生效
+- **WHEN** 管理员在 /admin 新增角色黑名单规则并绑定员工
+- **THEN** 规则持久化到 auth/table_field_acl.db，该员工前台查询即时受规则约束
+

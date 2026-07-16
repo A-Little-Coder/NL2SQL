@@ -31,6 +31,8 @@ from src.graph.main_graph import (
     make_ss_node,
 )
 from src.graph.state import NL2SQLState
+from src.permission.mask_node import make_mask_node
+from src.permission.permission_node import make_permission_node
 
 
 def build_single_query_graph(
@@ -41,6 +43,7 @@ def build_single_query_graph(
     decider,
     answerability_checker=None,
     data_dir: str = None,
+    policy_store=None,
 ):
     """构造并编译单查询流水线图。
 
@@ -62,7 +65,9 @@ def build_single_query_graph(
     # ---- 节点（复用 main_graph 节点工厂 + _wrap_node 装饰，SSE/qid 日志照常）----
     graph.add_node("ir", _wrap_node("ir", make_ir_node(retriever)))
     graph.add_node("ss", _wrap_node("ss", make_ss_node(selector)))
-    # schema_finalize（relocate-join-path-injection）：SS 之后、answerability_check/cg 之前
+    # 权限检查（table-field-acl）：SS 之后、schema_finalize 之前；flag 关闭/无 policy_store 时直通
+    graph.add_node("permission", _wrap_node("permission", make_permission_node(policy_store)))
+    # schema_finalize（relocate-join-path-injection）：权限之后、answerability_check/cg 之前
     graph.add_node("schema_finalize", _wrap_node("schema_finalize", make_schema_finalize_node(retriever, data_dir=data_dir)))
     if answerability_checker is not None:
         graph.add_node(
@@ -72,6 +77,8 @@ def build_single_query_graph(
     graph.add_node("cg", _wrap_node("cg", make_cg_node(generator)))
     graph.add_node("execution", _wrap_node("execution", make_execution_node(fix_loop)))
     graph.add_node("decision", _wrap_node("decision", make_decision_node(decider, fix_loop=fix_loop)))
+    # 脱敏（table-field-acl）：decision 之后、END 之前；flag 关闭/无 policy_store 时直通
+    graph.add_node("mask", _wrap_node("mask", make_mask_node(policy_store)))
 
     # ---- 入口：history_cache 命中短路（跳过 ir/ss/cg 直奔 execution）----
     def route_start(state: NL2SQLState) -> str:
@@ -85,7 +92,18 @@ def build_single_query_graph(
 
     # ---- ir → ss → schema_finalize（固定边）----
     graph.add_edge("ir", "ss")
-    graph.add_edge("ss", "schema_finalize")
+    graph.add_edge("ss", "permission")
+
+    # permission 后：rejection_reason（拒答）-> END，否则 -> schema_finalize
+    def route_after_permission(state: NL2SQLState) -> str:
+        if state.get("rejection_reason"):
+            return END
+        return "schema_finalize"
+
+    graph.add_conditional_edges(
+        "permission", route_after_permission,
+        {"schema_finalize": "schema_finalize", END: END},
+    )
 
     # ---- schema_finalize 后：无 schema → END；有 schema → answerability_check（启用时）/ cg ----
     # 注：ss 未选出 schema 时，schema_finalize 也收不到有效 schema，故 fail-fast 仍在此守卫。
@@ -123,6 +141,7 @@ def build_single_query_graph(
 
     # ---- execution → decision → END ----
     graph.add_edge("execution", "decision")
-    graph.add_edge("decision", END)
+    graph.add_edge("decision", "mask")
+    graph.add_edge("mask", END)
 
     return graph.compile().with_config(run_name="single-query")

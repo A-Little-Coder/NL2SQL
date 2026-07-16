@@ -32,6 +32,7 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   LockOutlined,
+  QuestionCircleOutlined,
   ThunderboltOutlined,
   WarningOutlined,
 } from '@ant-design/icons';
@@ -57,6 +58,7 @@ const NODE_LABEL: Record<TimelineNodeType, string> = {
   ir: '信息检索',
   ss: 'Schema 选择',
   schema_empty: '未匹配表',
+  permission: '权限检查',
   answerability: '可回答性检查',
   cg: '候选生成',
   execution: 'SQL 执行',
@@ -258,13 +260,17 @@ function AnswerabilityDetail({ turn }: { turn: Turn }) {
   return (
     <Descriptions column={1} size="small" bordered>
       <Descriptions.Item label="是否可回答">
-        {a.answerable ? (
-          <Tag icon={<CheckCircleOutlined />} color="success">
-            可回答
-          </Tag>
-        ) : (
+        {a.answerable === 'false' ? (
           <Tag icon={<CloseCircleOutlined />} color="error">
             不可回答
+          </Tag>
+        ) : a.answerable === 'uncertain' ? (
+          <Tag icon={<QuestionCircleOutlined />} color="warning">
+            不确定
+          </Tag>
+        ) : (
+          <Tag icon={<CheckCircleOutlined />} color="success">
+            可回答
           </Tag>
         )}
       </Descriptions.Item>
@@ -554,6 +560,36 @@ function SchemaEmptyDetail({ turn }: { turn: Turn }) {
   );
 }
 
+/** 权限检查节点（table-field-acl）：展示拦截/保留字段 */
+function PermissionDetail({ turn }: { turn: Turn }) {
+  const p = turn.details.permission;
+  if (!p) return <NoDetail />;
+  const actionMap: Record<string, { label: string; color: string }> = {
+    pass: { label: '权限通过', color: 'success' },
+    partial_prune: { label: '部分剔除', color: 'warning' },
+    full_deny_mask: { label: '全无权·脱敏继续', color: 'processing' },
+    full_deny_reject: { label: '全无权·拒答', color: 'error' },
+  };
+  const a = actionMap[p.action] || { label: p.action, color: 'default' };
+  return (
+    <Descriptions column={1} size="small" bordered>
+      <Descriptions.Item label="处理结果">
+        <Tag icon={<LockOutlined />} color={a.color}>{a.label}</Tag>
+      </Descriptions.Item>
+      {p.removedFields.length > 0 && (
+        <Descriptions.Item label="拦截剔除字段">
+          {p.removedFields.map((f) => <Tag key={f} color="warning">{f}</Tag>)}
+        </Descriptions.Item>
+      )}
+      {p.keepFields.length > 0 && (
+        <Descriptions.Item label="脱敏保留字段">
+          {p.keepFields.map((f) => <Tag key={f} color="purple">{f}</Tag>)}
+        </Descriptions.Item>
+      )}
+    </Descriptions>
+  );
+}
+
 /** 改写检测节点：按轮次展示检测到的问题 */
 function RewriteDetectDetail({ turn }: { turn: Turn }) {
   const rounds = turn.details.rewriteDetect?.rounds;
@@ -685,6 +721,8 @@ function renderDetail(turn: Turn, type: TimelineNodeType) {
       return <SsDetail turn={turn} />;
     case 'schema_empty':
       return <SchemaEmptyDetail turn={turn} />;
+    case 'permission':
+      return <PermissionDetail turn={turn} />;
     case 'answerability':
       return <AnswerabilityDetail turn={turn} />;
     case 'cg':

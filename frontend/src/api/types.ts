@@ -320,7 +320,7 @@ export interface AnswerabilityEvent {
   type: 'answerability';
   data: {
     query_id: string;
-    answerable: boolean;
+    answerable: 'true' | 'false' | 'uncertain';
     confidence: number | null;
     reason: string;
   };
@@ -415,6 +415,17 @@ export interface DoneEvent {
   };
 }
 
+/** permission：权限节点拦截信息（table-field-acl） */
+export interface PermissionEvent {
+  type: 'permission';
+  data: {
+    query_id?: string;
+    action: 'pass' | 'partial_prune' | 'full_deny_mask' | 'full_deny_reject';
+    removed_fields: string[];
+    keep_fields: string[];
+  };
+}
+
 /** 全部 SSE 事件联合类型 */
 export type SseEvent =
   | StageEvent
@@ -428,6 +439,7 @@ export type SseEvent =
   | SchemaRecallEvent
   | SchemaFinalizeEvent
   | SchemaEmptyEvent
+  | PermissionEvent
   | AnswerabilityEvent
   | SqlCandidatesEvent
   | ExecutionEvent

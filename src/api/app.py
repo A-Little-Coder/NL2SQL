@@ -26,6 +26,7 @@ from src.api.routes import databases as databases_router
 from src.api.routes import query as query_router
 from src.api.routes import session as session_router
 from src.api.routes import user as user_router
+from src.api.routes import admin as admin_router
 from utils.langsmith_bootstrap import log_langsmith_status
 
 
@@ -79,6 +80,7 @@ app.include_router(query_router.router, prefix="/api/v1")
 app.include_router(session_router.router, prefix="/api/v1")
 app.include_router(user_router.router, prefix="/api/v1")
 app.include_router(databases_router.router, prefix="/api/v1")
+app.include_router(admin_router.router, prefix="/api/v1")
 
 
 @app.get("/api/v1/health")

@@ -172,6 +172,16 @@ def init_globals(data_dir: Optional[str] = None) -> None:
         logger.warning(f"TaskDecomposer 初始化失败，主图退化为无 TaskDecomposer 模式: {e}")
 
     # 7. 装配 Globals
+    # 6.5 table-field-acl: 权限策略存储（flag 关闭时节点直通，无副作用）
+    from src.permission.init_auth import init_db as init_auth_db
+    from src.permission.policy_store import PolicyStore
+    auth_db_path = str(Path(__file__).parent.parent.parent / "auth" / "table_field_acl.db")
+    try:
+        init_auth_db(auth_db_path)
+    except Exception as e:
+        logger.warning(f"auth 表结构初始化失败: {e}")
+    policy_store = PolicyStore(db_path=auth_db_path)
+
     _globals = Globals(
         bge_vectorizer=vectorizer,
         vector_store=vector_store,
@@ -188,6 +198,7 @@ def init_globals(data_dir: Optional[str] = None) -> None:
         dialog_manager=dialog_manager,
         checkpointer=checkpointer,
         summarizer=summarizer,
+        policy_store=policy_store,
     )
 
     # 8. DbContextPool
@@ -234,6 +245,15 @@ def get_event_cache() -> EventCacheStore:
     if _event_cache is None:
         raise RuntimeError("EventCacheStore 未初始化，请先调用 init_globals()")
     return _event_cache
+
+
+def get_policy_store():
+    """table-field-acl 权限策略存储单例（供 admin 路由依赖注入）"""
+    if _globals is None:
+        raise RuntimeError("Globals 未初始化，请先调用 init_globals()")
+    if _globals.policy_store is None:
+        raise RuntimeError("PolicyStore 未初始化")
+    return _globals.policy_store
 
 
 def get_user_memory(user_id: str) -> UserMemory:

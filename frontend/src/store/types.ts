@@ -38,6 +38,7 @@ export type TimelineNodeType =
   | 'ir'
   | 'ss'
   | 'schema_empty'
+  | 'permission'
   | 'answerability'
   | 'cg'
   | 'execution'
@@ -129,8 +130,13 @@ export interface TurnDetails {
   ir?: { keywordGroups: KeywordGroupDetail[] };
   schemaFinalize?: { joinEdges: number; bridgeTables: number };
   schemaEmpty?: { reason: string };
+  permission?: {
+    action: 'pass' | 'partial_prune' | 'full_deny_mask' | 'full_deny_reject';
+    removedFields: string[];
+    keepFields: string[];
+  };
   answerability?: {
-    answerable: boolean;
+    answerable: 'true' | 'false' | 'uncertain';
     confidence: number | null;
     reason: string;
   };
