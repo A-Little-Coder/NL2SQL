@@ -43,16 +43,16 @@
 - **AND** 前端重放该事件流得到的 Turn 与实时累积的一致
 
 ### Requirement: 会话列表分页惰性加载
-系统 SHALL 提供按 shard 分页的会话列表接口，每页最多 20 个会话，按 `created_at` 倒序（最新 shard 在前）。前端左栏 SHALL 初始只加载最新一页，向下滚动到底时惰性加载更早一页。
+系统 SHALL 提供按 `created_at` **全局排序后滑动窗口分页**的会话列表接口，每页最多 20 个会话，按 `created_at` 倒序。**`page=0` 始终返回 index 中时间最近的 ≤20 个会话，不因新 shard 创建而跳变。**（注意：shard 写入规则不变——每 shard ≤20 会话、满则开新 shard；仅分页读取逻辑变更。）前端左栏 SHALL 初始只加载最新一页，向下滚动到底时惰性加载更早一页。
 
 #### Scenario: 初始加载最新页
 - **WHEN** 用户打开应用，左栏渲染会话列表
-- **THEN** 仅加载最新 shard 的 ≤20 个会话摘要
-- **AND** 不加载更早 shard 的数据
+- **THEN** 仅加载 index 中 `created_at` 最新的 ≤20 个会话摘要
+- **AND** 不加载更早的数据
 
 #### Scenario: 下拉加载更早页
 - **WHEN** 用户在左栏滚动到底部
-- **THEN** 惰性加载更早 shard 的 ≤20 个会话摘要并追加到列表
+- **THEN** 惰性加载再往前的 ≤20 个会话摘要并追加到列表
 
 ### Requirement: 会话创建双写索引
 `create_session` SHALL 同时在 `session_memory` 建会话与 `event_cache/{uid}/index.json` 登记会话摘要（含 `session_id`/`created_at`/`turn_count`/`updated_at`/`status`/`shard_id`）。`index.json` SHALL 作为会话列表分页的数据源。`turn done` 时 SHALL 更新 `index.json` 中该会话的 `turn_count` 与 `updated_at`。

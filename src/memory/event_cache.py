@@ -239,27 +239,28 @@ class EventCacheStore:
     def list_sessions_paged(
         self, user_id: str, page: int = 0, size: int = SHARD_SIZE
     ) -> Dict[str, Any]:
-        """按 shard 分页返回会话摘要（最新 shard 在前，page=0 为最新 shard）。
+        """按 created_at 全局排序后滑动窗口分页返回会话摘要。
 
         Returns: { page, size, has_more, sessions }
+
+        注意：此方法不依赖 shard 分片边界——无论新 shard 是否刚创建，
+        page=0 始终返回 index 中时间最近的 ≤N 个会话（N≤size）。
+        shard 写入规则不变（每 shard ≤20，满则开新 shard），仅读取逻辑变更。
         """
         index = self._read_index(user_id)
         sessions = index.get("sessions", [])
-        # 按 shard_id 倒序分组（shard_0002 在 shard_0001 前 = 更新）
-        by_shard: Dict[str, List[Dict[str, Any]]] = {}
-        for s in sessions:
-            by_shard.setdefault(s.get("shard_id", ""), []).append(s)
-        shard_order = sorted(by_shard.keys(), reverse=True)
-        if page < 0 or page >= len(shard_order):
+        total = len(sessions)
+        # 全局按 created_at 倒序（已存在的 session 基本有序，Timsort O(n)）
+        all_sorted = sorted(sessions, key=lambda s: s.get("created_at", ""), reverse=True)
+        start = page * size
+        if start >= total:
             return {"page": page, "size": size, "has_more": False, "sessions": []}
-        shard_sessions = by_shard[shard_order[page]]
-        # shard 内按 created_at 倒序
-        shard_sessions = sorted(shard_sessions, key=lambda s: s.get("created_at", ""), reverse=True)
+        end = min(start + size, total)
         return {
             "page": page,
             "size": size,
-            "has_more": page < len(shard_order) - 1,
-            "sessions": shard_sessions,
+            "has_more": end < total,
+            "sessions": all_sorted[start:end],
         }
 
     def get_session_events(self, user_id: str, session_id: str) -> Optional[Dict[str, Any]]:
