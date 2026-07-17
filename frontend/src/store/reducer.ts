@@ -108,6 +108,12 @@ export function reduceSseEvent(turn: Turn, event: SseEvent): Turn {
   }
   // 记录 server query_id（仅日志，不改主键）
   const next: Turn = { ...turn, queryId: event.data.query_id ?? turn.queryId };
+  // queued 事件（multi-session-concurrency）：仅标记排队态，不改时间轴（图尚未开始）
+  if (event.type === 'queued') {
+    return { ...next, queued: true };
+  }
+  // 其余事件：图已开始或已结束，清除排队标记
+  next.queued = false;
   let timeline = next.timeline;
   let details = next.details;
   let thinking = next.thinking;

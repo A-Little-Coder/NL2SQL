@@ -19,6 +19,7 @@ from loguru import logger
 
 from src.api.deps import (
     get_db_pool,
+    get_query_gate,
     init_globals,
     shutdown_globals,
 )
@@ -85,14 +86,19 @@ app.include_router(admin_router.router, prefix="/api/v1")
 
 @app.get("/api/v1/health")
 async def health_check():
-    """健康检查（包含 DbContextPool 状态）"""
+    """健康检查（包含 DbContextPool + 并发闸状态）"""
     try:
         pool = get_db_pool()
         pool_stats = pool.stats()
     except Exception:
         pool_stats = None
+    try:
+        concurrency_stats = get_query_gate().stats()
+    except Exception:
+        concurrency_stats = None
     return {
         "status": "ok",
         "service": "nl2sql",
         "db_pool": pool_stats,
+        "concurrency": concurrency_stats,
     }

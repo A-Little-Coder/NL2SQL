@@ -398,6 +398,18 @@ export interface ErrorEvent {
     error: string;
     node?: string;
     rejection?: boolean;
+    /** 排队超时（multi-session-concurrency）：true 表示并发闸排队超时 */
+    queue_timeout?: boolean;
+  };
+}
+
+/** queued：请求排队等待并发槽位（multi-session-concurrency） */
+export interface QueuedEvent {
+  type: 'queued';
+  data: {
+    query_id: string;
+    /** 排队超时阈值（秒），供前端展示 */
+    queue_timeout?: number;
   };
 }
 
@@ -447,6 +459,7 @@ export type SseEvent =
   | ClarificationEvent
   | ResultEvent
   | ErrorEvent
+  | QueuedEvent
   | DoneEvent;
 
 /** SSE 事件类型字面量联合 */

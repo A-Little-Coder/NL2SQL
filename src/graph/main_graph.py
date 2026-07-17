@@ -20,6 +20,11 @@ NL2SQL 主图：串联 IR → (Clarification) → SS → AnswerabilityCheck → 
      - Decision 后结果不可信 → END（拒答 + 原因）
 
 Clarification 节点本期占位（pass-through），Phase 2 接入。
+
+[multi-session-concurrency D2 不变量] 主图/单查询图均为线性链，单条查询内部 LLM 调用
+串行（候选单次生成、无内部并行），故请求级并发闸（src/api/concurrency_gate.py）等价
+LLM 级闸（1:1）。若未来在此引入查询内并行 LLM 调用，须在 LLMClient 内补
+threading.Semaphore 兜底，否则请求级闸会静默欠数、可能重新 429。
 """
 
 from typing import Any, Callable, Dict, List

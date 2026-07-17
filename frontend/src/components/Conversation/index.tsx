@@ -95,10 +95,10 @@ function AssistantCard({ turn, loadingDb }: { turn: Turn; loadingDb: boolean }) 
         {/* 常驻时间轴 */}
         <AgentTimeline turn={turn} />
 
-        {/* streaming 加载指示 */}
+        {/* streaming 加载指示（multi-session-concurrency：排队态显示"排队中…"） */}
         {isStreaming && (
           <div style={{ marginTop: 8, color: '#1677ff', fontSize: 13 }}>
-            <LoadingOutlined /> 推理进行中…
+            <LoadingOutlined /> {turn.queued ? '排队中…' : '推理进行中…'}
           </div>
         )}
 
@@ -160,22 +160,25 @@ export default function Conversation() {
   const { sendQuery, cancel } = useQueryStream();
 
   const [input, setInput] = useState('');
-  const [sending, setSending] = useState(false);
+  // multi-session-concurrency：当前会话在途态由 store.turns 派生（不再用全局 sending），
+  // 跨会话不互斥；同会话单在途由 isStreaming 拦截发送
+  const isStreaming = turns.some((t) => t.status === 'streaming');
+  const streamingTurnId = turns.find((t) => t.status === 'streaming')?.turnId ?? null;
+  // 防止同一 tick 内重复点击发送（startTurn 同步注册后即由 isStreaming 拦截）
+  const submittingRef = useRef(false);
 
   // 自动滚动到底部（新 turn 或新事件时）
   const bottomRef = useRef<HTMLDivElement>(null);
   const turnsLen = turns.length;
   const lastTimelineLen = turnsLen > 0 ? turns[turnsLen - 1].timeline.length : 0;
   const lastTurnStatus = turnsLen > 0 ? turns[turnsLen - 1].status : '';
-  // 停止按钮在最新轮 streaming 期间显示（覆盖初始请求 sendQuery 与反问续流 sendResume，
-  // 后者不经过 handleSend、sending 为 false，故以 turn 的 streaming 态为准）；
-  // 反问等待/已完成/已取消/拒答时不显示（change clarify-choice-inspector-cancel）
-  const canStop = lastTurnStatus === 'streaming';
+  // 停止按钮：当前会话有在途 Turn 时显示（单会话单在途，覆盖初始请求与反问续流）
+  const canStop = isStreaming;
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [turnsLen, lastTimelineLen, lastTurnStatus]);
 
-  /** 发送查询：处理 session_id 为空时自动创建（场景 6.5） */
+  /** 发送查询：处理 session_id 为空时自动创建（场景 6.5）；单会话单在途 */
   const handleSend = async () => {
     const query = input.trim();
     if (!query) return;
@@ -183,9 +186,9 @@ export default function Conversation() {
       message.warning('请先选择数据库');
       return;
     }
-    if (sending) return;
+    if (isStreaming || submittingRef.current) return; // 单会话单在途
 
-    setSending(true);
+    submittingRef.current = true;
     setInput('');
     try {
       let sessionId = currentSessionId;
@@ -205,20 +208,20 @@ export default function Conversation() {
       const msg = err instanceof Error ? err.message : '发送失败';
       message.error(`发送失败：${msg}`);
     } finally {
-      setSending(false);
+      submittingRef.current = false;
     }
   };
 
-  /** 停止在途请求：abort fetch + cancelTurn（change clarify-choice-inspector-cancel） */
+  /** 停止当前会话在途请求：abort fetch + cancelTurn（不影响其他会话在途流） */
   const handleStop = () => {
-    cancel();
+    if (streamingTurnId) cancel(streamingTurnId);
   };
 
-  /** 输入框按键：Enter 发送，Shift+Enter 换行 */
+  /** 输入框按键：Enter 发送（在途时不触发），Shift+Enter 换行 */
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      void handleSend();
+      if (!isStreaming) void handleSend();
     }
   };
 
@@ -254,7 +257,6 @@ export default function Conversation() {
             onKeyDown={handleKeyDown}
             placeholder={selectedDbId ? '输入问题，Enter 发送，Shift+Enter 换行' : '请先在顶部选择数据库'}
             autoSize={{ minRows: 1, maxRows: 5 }}
-            disabled={sending}
             style={{ borderRadius: '6px 0 0 6px', resize: 'none' }}
           />
           {canStop ? (
@@ -271,7 +273,7 @@ export default function Conversation() {
               type="primary"
               icon={<SendOutlined />}
               onClick={() => void handleSend()}
-              disabled={sending || !input.trim()}
+              disabled={!input.trim()}
               style={{ height: 'auto', borderRadius: '0 6px 6px 0' }}
             >
               发送
@@ -283,7 +285,7 @@ export default function Conversation() {
             请先选择数据库后再发起查询
           </Text>
         )}
-        {sending && (
+        {isStreaming && (
           <div style={{ marginTop: 4 }}>
             <Spin size="small" />
             <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>

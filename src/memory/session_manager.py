@@ -5,6 +5,7 @@
 内部维护 LRU 内存缓存加速热会话访问。
 """
 
+import threading
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -22,36 +23,44 @@ class SessionManager:
         self._cache: Dict[str, SessionMemory] = {}
         # 访问顺序记录（用于 LRU 淘汰）
         self._access_order: List[str] = []
+        # multi-session-concurrency：保护 _cache/_access_order 的复合操作，防止
+        # 并发下 `in` 检查与 `remove` 之间竞态抛 ValueError。RLock 因 _cache_get/_put
+        # 会重入调用 _update_access。
+        self._cache_lock = threading.RLock()
 
     # ── LRU 缓存管理 ─────────────────────────────────────────
 
     def _update_access(self, session_id: str):
         """更新 LRU 访问顺序"""
-        if session_id in self._access_order:
-            self._access_order.remove(session_id)
-        self._access_order.append(session_id)
-        # 淘汰最久未访问
-        while len(self._access_order) > self.max_cache_size:
-            oldest = self._access_order.pop(0)
-            self._cache.pop(oldest, None)
+        with self._cache_lock:
+            if session_id in self._access_order:
+                self._access_order.remove(session_id)
+            self._access_order.append(session_id)
+            # 淘汰最久未访问
+            while len(self._access_order) > self.max_cache_size:
+                oldest = self._access_order.pop(0)
+                self._cache.pop(oldest, None)
 
     def _cache_get(self, session_id: str) -> Optional[SessionMemory]:
         """从缓存获取，命中则更新访问顺序"""
-        mem = self._cache.get(session_id)
-        if mem is not None:
-            self._update_access(session_id)
-        return mem
+        with self._cache_lock:
+            mem = self._cache.get(session_id)
+            if mem is not None:
+                self._update_access(session_id)
+            return mem
 
     def _cache_put(self, session_id: str, mem: SessionMemory):
         """放入缓存"""
-        self._cache[session_id] = mem
-        self._update_access(session_id)
+        with self._cache_lock:
+            self._cache[session_id] = mem
+            self._update_access(session_id)
 
     def _cache_remove(self, session_id: str):
         """从缓存移除"""
-        self._cache.pop(session_id, None)
-        if session_id in self._access_order:
-            self._access_order.remove(session_id)
+        with self._cache_lock:
+            self._cache.pop(session_id, None)
+            if session_id in self._access_order:
+                self._access_order.remove(session_id)
 
     # ── 会话 CRUD ─────────────────────────────────────────────
 

@@ -28,10 +28,11 @@ import {
   Tooltip,
   Typography,
 } from 'antd';
-import { DeleteOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
+import { DeleteOutlined, LoadingOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import { createSession, deleteSession, getSessionHistory, listSessions } from '@/api/rest';
 import type { ErrorResponse, SessionEventsTurn, SessionSummary, SessionTurn } from '@/api/types';
 import { useChatStore } from '@/store/useChatStore';
+import { shallow } from 'zustand/shallow';
 
 const { Text } = Typography;
 
@@ -83,6 +84,8 @@ export default function SessionSidebar() {
   const setTurnsFromEvents = useChatStore((s) => s.setTurnsFromEvents);
   const cacheCurrentTurns = useChatStore((s) => s.cacheCurrentTurns);
   const loadCachedTurns = useChatStore((s) => s.loadCachedTurns);
+  // multi-session-concurrency：派生有在途 Turn 的会话 id（shallow 比较，仅在集合变化时重渲染）
+  const runningIds = useChatStore((s) => s.getRunningSessionIds(), shallow);
 
   // ---- 本地加载态 ----
   const [loadingList, setLoadingList] = useState(false);
@@ -294,6 +297,7 @@ export default function SessionSidebar() {
               const isActive = item.session_id === currentSessionId;
               const isLoadingHistory = loadingHistoryId === item.session_id;
               const isDeleting = deletingId === item.session_id;
+              const isRunning = runningIds.includes(item.session_id);
               return (
                 <List.Item
                   style={{
@@ -349,6 +353,9 @@ export default function SessionSidebar() {
                       <Tag color={statusColor(item.status)} style={{ margin: 0, fontSize: 11 }}>
                         {item.status}
                       </Tag>
+                      {isRunning && (
+                        <LoadingOutlined style={{ fontSize: 12, color: '#1677ff' }} />
+                      )}
                     </div>
                     {/* 第二行：轮次数 + 更新时间 */}
                     <div style={{ fontSize: 11, color: '#888' }}>

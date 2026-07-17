@@ -74,6 +74,11 @@ interface ChatState {
   startTurn: (turnId: string, userQuery: string) => void;
   /** 把 SSE 事件 reduce 进指定 turnId 的 Turn */
   applyEvent: (turnId: string, event: SseEvent) => void;
+  /** multi-session-concurrency：把 SSE 事件 reduce 进指定会话--当前会话更新 turns，
+   *  后台会话更新 turnsBySession（后台会话流不在前台显示也能持续推进） */
+  applyEventToSession: (sessionId: string, turnId: string, event: SseEvent) => void;
+  /** 派生：当前有在途 Turn（status=streaming）的会话 id 列表，供侧栏运行态指示 */
+  getRunningSessionIds: () => string[];
   /** resume 前把 Turn 状态恢复为 streaming（保留已有 timeline） */
   resumeTurn: (turnId: string) => void;
   /** 设置检查器选中节点（null=自动跟随最新，D5）；同时 pin 检查器到该 turn（change clarify-choice-inspector-cancel） */
@@ -129,6 +134,41 @@ export const useChatStore = create<ChatState>((set, get) => ({
         t.turnId === turnId ? reduceSseEvent(t, event) : t,
       ),
     })),
+
+  applyEventToSession: (sessionId, turnId, event) =>
+    set((state) => {
+      if (sessionId === state.currentSessionId) {
+        // 当前会话：更新展示用 turns（turnsBySession[currentId] 在切走时由 cacheCurrentTurns 同步）
+        return {
+          turns: state.turns.map((t) =>
+            t.turnId === turnId ? reduceSseEvent(t, event) : t,
+          ),
+        };
+      }
+      // 后台会话：更新 turnsBySession[sessionId]（无缓存则忽略）
+      const cached = state.turnsBySession[sessionId];
+      if (!cached) return {};
+      return {
+        turnsBySession: {
+          ...state.turnsBySession,
+          [sessionId]: cached.map((t) =>
+            t.turnId === turnId ? reduceSseEvent(t, event) : t,
+          ),
+        },
+      };
+    }),
+
+  getRunningSessionIds: () => {
+    const state = get();
+    const ids = new Set<string>();
+    if (state.currentSessionId && state.turns.some((t) => t.status === 'streaming')) {
+      ids.add(state.currentSessionId);
+    }
+    for (const [sid, ts] of Object.entries(state.turnsBySession)) {
+      if (ts.some((t) => t.status === 'streaming')) ids.add(sid);
+    }
+    return [...ids];
+  },
 
   resumeTurn: (turnId) =>
     set((state) => ({

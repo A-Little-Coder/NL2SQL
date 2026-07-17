@@ -14,6 +14,10 @@
    ``decision_path`` / ``rejection_reason`` / ``error`` 判定成败。
 
 设计见 openspec/changes/refactor-single-query-graph/。
+
+[multi-session-concurrency D2 不变量] 本图为线性链（ir->ss->...->mask），单条查询内部
+LLM 调用串行 -> 请求级并发闸等价 LLM 级闸（1:1）。若未来引入查询内并行 LLM 调用，
+须在 LLMClient 内补 threading.Semaphore 兜底，否则请求级闸会静默欠数、可能重新 429。
 """
 
 from typing import Any

@@ -205,6 +205,8 @@ export interface Turn {
   rejection?: boolean;
   /** 用户取消标记（change clarify-choice-inspector-cancel） */
   cancelled?: boolean;
+  /** 排队态标记（multi-session-concurrency）：收到 queued 事件、图尚未开始时为 true */
+  queued?: boolean;
   /** 错误信息 */
   error?: string;
 }

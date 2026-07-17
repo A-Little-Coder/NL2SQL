@@ -32,6 +32,7 @@
 """
 
 from pathlib import Path
+import threading
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -76,6 +77,20 @@ class EventCacheStore:
 
     def __init__(self, base_dir: str = "event_cache"):
         self._storage = Storage(base_dir)
+        # multi-session-concurrency：按用户 RLock 串行化 index/session 的 read-modify-write，
+        # 防止同用户跨会话并发写导致 index.json 丢更新（单次 atomic_write 防撕裂但不防丢更新）。
+        # 跨用户并发互不阻塞（不同锁）。RLock 因 store_turn_events 会重入调用 register_session。
+        self._user_locks: Dict[str, "threading.RLock"] = {}
+        self._locks_guard = threading.Lock()
+
+    def _user_lock(self, user_id: str) -> "threading.RLock":
+        """获取（或创建）指定用户的 RLock。"""
+        with self._locks_guard:
+            lk = self._user_locks.get(user_id)
+            if lk is None:
+                lk = threading.RLock()
+                self._user_locks[user_id] = lk
+            return lk
 
     # ── 路径工具 ─────────────────────────────────────────────
 
@@ -147,28 +162,29 @@ class EventCacheStore:
 
         幂等：若已登记则直接返回现有 shard_id。
         """
-        ts = created_at or _now_iso()
-        index = self._read_index(user_id)
-        existing = self._find_session_entry(index, session_id)
-        if existing:
-            return existing["shard_id"]
-        shard_id = self._allocate_shard(index)
-        index["sessions"].append({
-            "session_id": session_id,
-            "created_at": ts,
-            "updated_at": ts,
-            "status": "active",
-            "turn_count": 0,
-            "shard_id": shard_id,
-        })
-        self._write_index(user_id, index)
-        self._write_session(user_id, shard_id, session_id, {
-            "session_id": session_id,
-            "created_at": ts,
-            "turns": [],
-            "pending_events": [],
-        })
-        return shard_id
+        with self._user_lock(user_id):
+            ts = created_at or _now_iso()
+            index = self._read_index(user_id)
+            existing = self._find_session_entry(index, session_id)
+            if existing:
+                return existing["shard_id"]
+            shard_id = self._allocate_shard(index)
+            index["sessions"].append({
+                "session_id": session_id,
+                "created_at": ts,
+                "updated_at": ts,
+                "status": "active",
+                "turn_count": 0,
+                "shard_id": shard_id,
+            })
+            self._write_index(user_id, index)
+            self._write_session(user_id, shard_id, session_id, {
+                "session_id": session_id,
+                "created_at": ts,
+                "turns": [],
+                "pending_events": [],
+            })
+            return shard_id
 
     def store_turn_events(
         self,
@@ -186,40 +202,41 @@ class EventCacheStore:
           为一个完整 turn 追加到 turns 并清空 pending；否则直接追加为新 turn。
           result 事件行数据在存储侧截断前 RESULT_ROW_LIMIT 行（D4）。
         """
-        index = self._read_index(user_id)
-        entry = self._find_session_entry(index, session_id)
-        if entry is None:
-            # 未登记兜底：先登记
-            self.register_session(user_id, session_id)
+        with self._user_lock(user_id):
             index = self._read_index(user_id)
             entry = self._find_session_entry(index, session_id)
-        shard_id = entry["shard_id"]
-        data = self._read_session(user_id, shard_id, session_id)
+            if entry is None:
+                # 未登记兜底：先登记（RLock 可重入）
+                self.register_session(user_id, session_id)
+                index = self._read_index(user_id)
+                entry = self._find_session_entry(index, session_id)
+            shard_id = entry["shard_id"]
+            data = self._read_session(user_id, shard_id, session_id)
 
-        if is_pending:
-            data["pending_events"] = _truncate_result_rows(events)
-            data["pending_user_query"] = user_query
-        else:
-            merged: List[Dict[str, Any]] = []
-            merged.extend(data.get("pending_events", []))
-            merged.extend(_truncate_result_rows(events))
-            # user_query 优先取 query 阶段暂存的（resume 场景 body.query 可能为空）
-            uq = data.get("pending_user_query") or user_query
-            turn_index = len(data["turns"]) + 1
-            data["turns"].append({
-                "turn_index": turn_index,
-                "timestamp": _now_iso(),
-                "events": merged,
-                "user_query": uq,
-            })
-            data["pending_events"] = []
-            data["pending_user_query"] = ""
-            # 更新 index 摘要（turn_count / updated_at）
-            entry["turn_count"] = len(data["turns"])
-            entry["updated_at"] = _now_iso()
-            self._write_index(user_id, index)
+            if is_pending:
+                data["pending_events"] = _truncate_result_rows(events)
+                data["pending_user_query"] = user_query
+            else:
+                merged: List[Dict[str, Any]] = []
+                merged.extend(data.get("pending_events", []))
+                merged.extend(_truncate_result_rows(events))
+                # user_query 优先取 query 阶段暂存的（resume 场景 body.query 可能为空）
+                uq = data.get("pending_user_query") or user_query
+                turn_index = len(data["turns"]) + 1
+                data["turns"].append({
+                    "turn_index": turn_index,
+                    "timestamp": _now_iso(),
+                    "events": merged,
+                    "user_query": uq,
+                })
+                data["pending_events"] = []
+                data["pending_user_query"] = ""
+                # 更新 index 摘要（turn_count / updated_at）
+                entry["turn_count"] = len(data["turns"])
+                entry["updated_at"] = _now_iso()
+                self._write_index(user_id, index)
 
-        self._write_session(user_id, shard_id, session_id, data)
+            self._write_session(user_id, shard_id, session_id, data)
 
     def clear_pending(self, user_id: str, session_id: str) -> None:
         """清除会话的 pending_events（新查询开始时放弃旧反问暂存）。
@@ -227,14 +244,15 @@ class EventCacheStore:
         前端语义保证 awaiting_clarification 时只能 resume，但保险起见新 query（非 resume）
         开始时调用，避免残留 pending 误合并到新 turn。
         """
-        index = self._read_index(user_id)
-        entry = self._find_session_entry(index, session_id)
-        if entry is None:
-            return
-        data = self._read_session(user_id, entry["shard_id"], session_id)
-        if data.get("pending_events"):
-            data["pending_events"] = []
-            self._write_session(user_id, entry["shard_id"], session_id, data)
+        with self._user_lock(user_id):
+            index = self._read_index(user_id)
+            entry = self._find_session_entry(index, session_id)
+            if entry is None:
+                return
+            data = self._read_session(user_id, entry["shard_id"], session_id)
+            if data.get("pending_events"):
+                data["pending_events"] = []
+                self._write_session(user_id, entry["shard_id"], session_id, data)
 
     def list_sessions_paged(
         self, user_id: str, page: int = 0, size: int = SHARD_SIZE
@@ -282,17 +300,18 @@ class EventCacheStore:
 
     def delete_session(self, user_id: str, session_id: str) -> bool:
         """删除会话：index 移除 + 删 shard 文件。"""
-        index = self._read_index(user_id)
-        entry = self._find_session_entry(index, session_id)
-        if entry is None:
-            return False
-        shard_id = entry["shard_id"]
-        index["sessions"] = [s for s in index["sessions"] if s.get("session_id") != session_id]
-        self._write_index(user_id, index)
-        f = self._session_file(user_id, shard_id, session_id)
-        try:
-            if f.exists():
-                f.unlink()
-        except OSError as e:
-            logger.warning(f"删除 event_cache 会话文件失败 ({f}): {e}")
-        return True
+        with self._user_lock(user_id):
+            index = self._read_index(user_id)
+            entry = self._find_session_entry(index, session_id)
+            if entry is None:
+                return False
+            shard_id = entry["shard_id"]
+            index["sessions"] = [s for s in index["sessions"] if s.get("session_id") != session_id]
+            self._write_index(user_id, index)
+            f = self._session_file(user_id, shard_id, session_id)
+            try:
+                if f.exists():
+                    f.unlink()
+            except OSError as e:
+                logger.warning(f"删除 event_cache 会话文件失败 ({f}): {e}")
+            return True

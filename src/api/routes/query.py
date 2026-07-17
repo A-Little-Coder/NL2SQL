@@ -28,7 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
 from starlette.responses import StreamingResponse
 
-from src.api.deps import get_db_pool, get_event_cache, get_session_manager, get_user_memory
+from src.api.deps import get_db_pool, get_event_cache, get_query_gate, get_session_manager, get_user_memory
 from src.api.schemas import QueryRequest
 from src.api.streaming import (
     StreamEmitter,
@@ -262,10 +262,75 @@ async def query_endpoint(
         def run_graph_in_ctx():
             ctx.run(run_graph)
 
-        # 启动后台线程
-        task = loop.run_in_executor(None, run_graph_in_ctx)
-
+        # 并发闸槽位与在途任务（finally 据此清理）
+        acquired = False
+        acq_task = None
+        task = None
+        gate = None
         try:
+            # ── 并发闸：获取槽位（multi-session-concurrency，design D1/D6）──
+            # 请求级闸等价 LLM 级闸（依赖 D2 查询内 LLM 串行不变量）。排队期间推 queued
+            # 事件 + 心跳保活；超时返回繁忙提示。不改动 graph / LLMClient 内部结构。
+            try:
+                gate = get_query_gate()
+            except RuntimeError:
+                gate = None  # 未初始化（单测未调 init_globals）时跳过并发闸；生产 lifespan 必初始化
+            if gate is not None and not await gate.try_acquire():
+                # 排队态：先推 queued 事件，再带心跳等待槽位（asyncio.wait 超时不取消任务）
+                yield _format_sse(
+                    "queued", _with_qid({"queue_timeout": gate.queue_timeout}, query_id)
+                )
+                acq_task = asyncio.ensure_future(
+                    gate.acquire(timeout=gate.queue_timeout)
+                )
+                while True:
+                    done, _ = await asyncio.wait(
+                        {acq_task}, timeout=_HEARTBEAT_INTERVAL
+                    )
+                    if acq_task in done:
+                        break
+                    # 仍在排队：心跳保活 + 客户端断开检测
+                    if await request.is_disconnected():
+                        logger.info(f"[query_id={query_id}] 排队期间客户端断开，取消等待")
+                        acq_task.cancel()
+                        try:
+                            await acq_task
+                        except BaseException:
+                            pass
+                        return
+                    yield ": heartbeat\n\n"
+                if not acq_task.result():
+                    # 排队超时：未获槽位 -> 不释放；推 error(queue_timeout) + done 关闭流
+                    logger.info(f"[query_id={query_id}] 排队超时，返回繁忙提示")
+                    err_data = _with_qid(
+                        {
+                            "error": "排队超时，当前服务繁忙，请稍后重试",
+                            "queue_timeout": True,
+                        },
+                        query_id,
+                    )
+                    yield _format_sse("error", err_data)
+                    yield _format_sse(
+                        "done",
+                        _with_qid(
+                            {
+                                "has_result": False,
+                                "awaiting_clarification": False,
+                                "fix_failed": False,
+                                "decision_path": "",
+                                "fix_rounds_used": 0,
+                                "last_error": None,
+                            },
+                            query_id,
+                        ),
+                    )
+                    return
+            if gate is not None:
+                acquired = True
+
+            # 启动后台线程（获得槽位或无闸时直接启动图）
+            task = loop.run_in_executor(None, run_graph_in_ctx)
+
             while True:
                 try:
                     evt = await asyncio.wait_for(
@@ -406,6 +471,19 @@ async def query_endpoint(
         finally:
             # 兜底置位 cancel_event，确保后台线程在节点边界退出（change clarify-choice-inspector-cancel）
             cancel_event.set()
+            # 并发闸：仅当获取过槽位才释放（排队超时/断开未获槽位则不释放）
+            if acquired and gate is not None:
+                try:
+                    await gate.release()
+                except Exception as e:
+                    logger.warning(f"[query_id={query_id}] 并发闸 release 失败: {e}")
+            # 排队等待任务收尾（被取消时可能仍 pending）
+            if acq_task is not None and not acq_task.done():
+                acq_task.cancel()
+                try:
+                    await acq_task
+                except BaseException:
+                    pass
             # 无论如何 release（refcount -= 1）
             try:
                 pool.release(body.db_id)

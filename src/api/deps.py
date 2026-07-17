@@ -24,6 +24,7 @@ from typing import Dict, Optional
 
 from loguru import logger
 
+from src.api.concurrency_gate import ConcurrencyGate
 from src.api.db_pool import DbContextPool, Globals
 from src.decision.self_consistency import SelfConsistencyDecision
 from src.memory.history_cache import HistoryCache
@@ -53,6 +54,7 @@ _globals: Optional[Globals] = None
 _session_manager: Optional[SessionManager] = None
 _db_pool: Optional[DbContextPool] = None
 _event_cache: Optional[EventCacheStore] = None
+_query_gate: Optional[ConcurrencyGate] = None  # 进程内查询并发闸（multi-session-concurrency）
 
 # UserMemory 进程级 LRU
 _user_memory_cache: Dict[str, UserMemory] = {}
@@ -71,7 +73,7 @@ def init_globals(data_dir: Optional[str] = None) -> None:
     Args:
         data_dir: data/ 根目录绝对路径。None 时取项目根的 data/。
     """
-    global _globals, _session_manager, _db_pool, _event_cache
+    global _globals, _session_manager, _db_pool, _event_cache, _query_gate
 
     if data_dir is None:
         # 默认项目根的 data/
@@ -205,16 +207,29 @@ def init_globals(data_dir: Optional[str] = None) -> None:
     _db_pool = DbContextPool(max_size=pool_max_size, globals_=_globals)
     logger.info(f"DbContextPool 初始化: max_size={pool_max_size}")
 
+    # 9. 查询并发闸（multi-session-concurrency，design D1/D6）
+    query_max_concurrency = int(os.getenv("QUERY_MAX_CONCURRENCY", "4"))
+    query_queue_timeout = float(os.getenv("QUERY_QUEUE_TIMEOUT", "60"))
+    _query_gate = ConcurrencyGate(
+        max_concurrency=query_max_concurrency,
+        queue_timeout=query_queue_timeout,
+    )
+    logger.info(
+        f"查询并发闸初始化: max_concurrency={query_max_concurrency}, "
+        f"queue_timeout={query_queue_timeout}s"
+    )
+
 
 def shutdown_globals() -> None:
     """lifespan shutdown 钩子：释放所有 DbContext"""
-    global _db_pool, _globals, _session_manager, _event_cache
+    global _db_pool, _globals, _session_manager, _event_cache, _query_gate
     if _db_pool is not None:
         _db_pool.close_all()
     _db_pool = None
     _globals = None
     _session_manager = None
     _event_cache = None
+    _query_gate = None
     _user_memory_cache.clear()
 
 
@@ -245,6 +260,13 @@ def get_event_cache() -> EventCacheStore:
     if _event_cache is None:
         raise RuntimeError("EventCacheStore 未初始化，请先调用 init_globals()")
     return _event_cache
+
+
+def get_query_gate() -> ConcurrencyGate:
+    """查询并发闸单例（multi-session-concurrency，限同时在飞的 /query 数）"""
+    if _query_gate is None:
+        raise RuntimeError("ConcurrencyGate 未初始化，请先调用 init_globals()")
+    return _query_gate
 
 
 def get_policy_store():
